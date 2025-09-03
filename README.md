@@ -35,3 +35,9 @@ Low Memory Footprint: 5 items per page pagination
 Minimal Data Usage: Optimized for slow connections
 
 For old devices is required a wap gateway kannel , and csd for non gprs devices.
+
+
+Run npm i for installing dependencies
+and run node serverWml.js
+
+optionally use pm2 .
