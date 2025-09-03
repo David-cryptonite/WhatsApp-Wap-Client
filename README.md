@@ -33,3 +33,5 @@ Nokia 7210 Optimized with WBMP image support
 Character Encoding: ISO-8859-1 for old devices
 Low Memory Footprint: 5 items per page pagination
 Minimal Data Usage: Optimized for slow connections
+
+For old devices is required a wap gateway kannel , and csd for non gprs devices.
