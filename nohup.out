@@ -1,0 +1,29 @@
+📱 Loaded 309 contacts from disk
+💬 Loaded 212 chats from disk
+📨 Loaded 3087 messages from disk
+⚙️ Loaded metadata from disk
+✅ Successfully loaded all data from persistent storage
+Server WAP in ascolto su http://localhost:3000
+Accedi a http://localhost:3000/wml/contacts.wml per testare.
+{"level":"info","message":"WhatsApp WML Gateway started on port 3500","timestamp":"2025-08-31T21:27:30.225Z"}
+{"level":"info","message":"Environment: development","timestamp":"2025-08-31T21:27:30.232Z"}
+{"level":"info","message":"WML endpoints available at /wml/","timestamp":"2025-08-31T21:27:30.234Z"}
+{"level":"info","message":"API endpoints available at /api/","timestamp":"2025-08-31T21:27:30.234Z"}
+{"level":30,"time":"2025-08-31T21:27:30.834Z","pid":4043,"hostname":"raspberrypi","class":"baileys","browser":["WhatsApp WML Gateway","Chrome","1.0.0"],"helloMsg":{"clientHello":{"ephemeral":"PXorOR7CRjwMZhUAUYj16nqR4Xgr0XKwugcuBxcUiwU="}},"msg":"connected to WA"}
+{"level":30,"time":"2025-08-31T21:27:30.939Z","pid":4043,"hostname":"raspberrypi","class":"baileys","node":{"username":"393518266934","passive":false,"userAgent":{"platform":"WEB","appVersion":{"primary":2,"secondary":3000,"tertiary":1023223821},"mcc":"000","mnc":"000","osVersion":"0.1","device":"Desktop","osBuildNumber":"0.1","releaseChannel":"RELEASE","localeLanguageIso6391":"en","localeCountryIso31661Alpha2":"US"},"webInfo":{"webSubPlatform":"WEB_BROWSER"},"connectType":"WIFI_UNKNOWN","connectReason":"USER_ACTIVATED","device":8,"pull":true},"msg":"logging in..."}
+{"level":30,"time":"2025-08-31T21:27:31.385Z","pid":4043,"hostname":"raspberrypi","class":"baileys","msg":"handled 0 offline messages/notifications"}
+{"level":30,"time":"2025-08-31T21:27:31.590Z","pid":4043,"hostname":"raspberrypi","class":"baileys","msg":"26 pre-keys found on server"}
+{"level":30,"time":"2025-08-31T21:27:31.651Z","pid":4043,"hostname":"raspberrypi","class":"baileys","msg":"opened connection to WA"}
+{"level":"info","message":"WhatsApp connected successfully!","timestamp":"2025-08-31T21:27:31.661Z"}
+{"level":"info","message":"Received SIGINT. Shutting down gracefully...","timestamp":"2025-08-31T21:27:33.564Z"}
+{"level":"info","message":"Saving all data before shutdown...","timestamp":"2025-08-31T21:27:33.567Z"}
+💾 Saved contacts to disk
+💾 Saved chats to disk
+💾 Saved messages to disk
+💾 Saved meta to disk
+{"level":"info","message":"Data saved successfully","timestamp":"2025-08-31T21:27:33.741Z"}
+{"level":"info","message":"Closing WhatsApp connection...","timestamp":"2025-08-31T21:27:33.741Z"}
+{"level":30,"time":"2025-08-31T21:27:33.743Z","pid":4043,"hostname":"raspberrypi","class":"baileys","msg":"connection closed"}
+{"level":"info","message":"Connection closed. Should reconnect: true","timestamp":"2025-08-31T21:27:33.745Z"}
+{"level":"info","message":"WhatsApp connection closed","timestamp":"2025-08-31T21:27:33.746Z"}
+{"level":"info","message":"Graceful shutdown completed","timestamp":"2025-08-31T21:27:33.747Z"}

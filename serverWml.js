@@ -1,0 +1,9049 @@
+const express = require("express");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage,
+  getContentType,
+  extractMessageContent,
+  delay,
+} = require("@whiskeysockets/baileys");
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+const qrcode = require("qrcode-terminal");
+const QRCode = require("qrcode");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const winston = require("winston");
+const { enhancedInitialSync } = require("./loadChatUtils");
+const PersistentStorage = require("./persistentStorage");
+const sharp = require("sharp");
+
+// Configurazione Whisper
+const ffmpeg = require("ffmpeg-static");
+const { exec } = require("child_process");
+
+// Configurazione Whisper
+let transcriber = null;
+let transcriptionEnabled = false;
+
+// Inizializza il modello Whisper con import dinamico
+async function initWhisperModel() {
+  try {
+    console.log("Initializing Whisper model...");
+
+    // Usa import dinamico per caricare il modulo ESM
+    const { pipeline } = await import("@xenova/transformers");
+
+    // Sostituisci nel tuo codice:
+    transcriber = await pipeline(
+      "automatic-speech-recognition",
+      "Xenova/whisper-tiny",
+      {
+        // ⚡ 39MB
+        quantized: true, // 🔥 Usa 8-bit per ridurre RAM
+        local_files_only: false,
+      }
+    );
+
+    transcriptionEnabled = true;
+    console.log("Whisper model loaded successfully");
+  } catch (error) {
+    console.error("Whisper model initialization failed:", error);
+    transcriptionEnabled = false;
+  }
+}
+
+// Funzione di trascrizione con Whisper - FIXED VERSION
+async function transcribeAudioWithWhisper(audioBuffer) {
+  if (!transcriptionEnabled || !transcriber) {
+    return "Trascrizione non disponibile";
+  }
+
+  const tempOutput = path.join(__dirname, `temp_${Date.now()}.wav`);
+
+  try {
+    console.log("Converting audio to WAV format...");
+
+    // Usa ffmpeg-static
+    const ffmpegPath = require("ffmpeg-static");
+
+    await new Promise((resolve, reject) => {
+      const process = require("child_process").spawn(ffmpegPath, [
+        "-i",
+        "pipe:0", // Input da stdin
+        "-ar",
+        "16000", // Sample rate 16kHz
+        "-ac",
+        "1", // Mono
+        "-c:a",
+        "pcm_s16le", // 16-bit PCM (signed little-endian)
+        "-f",
+        "wav", // Formato WAV
+        "-", // Output su stdout
+      ]);
+
+      const outputStream = require("fs").createWriteStream(tempOutput);
+
+      process.stdin.end(audioBuffer);
+      process.stdout.pipe(outputStream);
+
+      process.on("error", reject);
+      outputStream.on("finish", resolve);
+    });
+
+    console.log("Converting WAV to Float32Array...");
+
+    // Leggi il file WAV e converti in Float32Array
+    const wavBuffer = await fs.promises.readFile(tempOutput);
+
+    // Estrai i dati audio PCM dal file WAV
+    const float32Array = wavBufferToFloat32Array(wavBuffer);
+
+    console.log("Transcribing with Whisper...");
+    const result = await transcriber(float32Array, {
+      language: "it",
+      chunk_length_s: 30,
+      stride_length_s: 5,
+    });
+
+    const transcription = result.text || "Nessuna trascrizione disponibile";
+    console.log("Whisper transcription successful:", transcription);
+    return transcription;
+  } catch (error) {
+    console.error("Transcription failed:", error);
+    return "Errore nella trascrizione";
+  } finally {
+    try {
+      await fs.promises.unlink(tempOutput);
+    } catch (cleanupError) {
+      console.error("Cleanup failed:", cleanupError);
+    }
+  }
+}
+
+// Funzione per convertire WAV buffer in Float32Array
+function wavBufferToFloat32Array(wavBuffer) {
+  // WAV file header is 44 bytes
+  const dataOffset = 44;
+  const audioData = wavBuffer.slice(dataOffset);
+
+  // I dati sono in formato PCM 16-bit signed little-endian
+  const int16Array = new Int16Array(
+    audioData.buffer,
+    audioData.byteOffset,
+    audioData.byteLength / 2
+  );
+
+  // Converti Int16 a Float32 (range -1.0 to 1.0)
+  const float32Array = new Float32Array(int16Array.length);
+  for (let i = 0; i < int16Array.length; i++) {
+    float32Array[i] = int16Array[i] / 32768.0; // 32768 = 2^15
+  }
+
+  return float32Array;
+}
+// Inizializza il modello all'avvio
+initWhisperModel();
+
+const iconv = require("iconv-lite");
+
+const app = express();
+const port = process.env.PORT || 3500;
+const isDev = process.env.NODE_ENV !== "production";
+let sock = null;
+// Production middleware
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Disabled for WML compatibility
+    frameguard: { action: "deny" },
+  })
+);
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isDev ? 1000 : 100, // requests per window
+});
+app.use("/api", limiter);
+
+// Logging
+const logger = winston.createLogger({
+  level: isDev ? "debug" : "info",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: "app.log" }),
+  ],
+});
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
+// Storage with better persistence
+const storage = new PersistentStorage("./data");
+const persistentData = storage.loadAllData();
+
+let messageStore = persistentData.messages;
+let contactStore = persistentData.contacts;
+let chatStore = persistentData.chats;
+let connectionState = "disconnected";
+let isFullySynced = persistentData.meta.isFullySynced;
+let syncAttempts = persistentData.meta.syncAttempts;
+// WML Constants
+const WML_DTD =
+  '<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.3//EN" "http://www.wapforum.org/DTD/wml13.dtd">';
+const WMLSCRIPT_DTD =
+  '<!DOCTYPE wmls PUBLIC "-//WAPFORUM//DTD WMLScript 1.3//EN" "http://www.wapforum.org/DTD/wmls13.dtd">';
+
+// WML Helper Functions
+function esc(s = "") {
+  return String(s).replace(
+    /[&<>"']/g,
+    (c) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      }[c])
+  );
+}
+
+function saveContacts() {
+  storage.queueSave("contacts", contactStore);
+}
+
+function saveChats() {
+  storage.queueSave("chats", chatStore);
+}
+
+function saveMessages() {
+  storage.queueSave("messages", messageStore);
+}
+
+function saveMeta() {
+  const meta = {
+    isFullySynced,
+    syncAttempts,
+    lastSync: new Date().toISOString(),
+    contactsCount: contactStore.size,
+    chatsCount: chatStore.size,
+    messagesCount: messageStore.size,
+  };
+  storage.queueSave("meta", meta);
+}
+
+function saveAll() {
+  saveContacts();
+  saveChats();
+  saveMessages();
+  saveMeta();
+}
+
+function wmlDoc(cards, scripts = "") {
+  const head = scripts
+    ? `<head><meta http-equiv="Cache-Control" content="max-age=0"/>${scripts}</head>`
+    : '<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>';
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>${head}${cards}</wml>`;
+}
+
+function sendWml(res, cards, scripts = "") {
+  // MODIFICA: Imposta il Content-Type corretto per WML
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=UTF-8");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Accept-Ranges", "none");
+  
+  // MODIFICA: Usa la codifica ISO-8859-1 per compatibilità Nokia
+  const wmlContent = wmlDoc(cards, scripts);
+  const encodedBuffer = iconv.encode(wmlContent, 'iso-8859-1');
+  
+  // MODIFICA: Aggiorna il Content-Type per ISO-8859-1
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+  res.send(encodedBuffer);
+}
+
+function card(id, title, inner, ontimer = null) {
+  const timerAttr = ontimer ? ` ontimer="${ontimer}"` : "";
+  return `<card id="${esc(id)}" title="${esc(title)}"${timerAttr}>
+   
+    ${inner}
+  </card>`;
+}
+
+function truncate(s = "", max = 64) {
+  const str = String(s);
+  return str.length > max ? str.slice(0, max - 1) + "…" : str;
+}
+
+function jidFriendly(jid = "") {
+  if (!jid) return "";
+  if (jid.endsWith("@s.whatsapp.net"))
+    return jid.replace("@s.whatsapp.net", "");
+  if (jid.endsWith("@g.us")) return `Group ${jid.slice(0, -5)}`;
+  return jid;
+}
+
+function parseList(str = "") {
+  return String(str)
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function formatJid(raw = "") {
+  const s = String(raw).trim();
+  if (!s) return s;
+  return s.includes("@") ? s : `${s}@s.whatsapp.net`;
+}
+
+function ensureGroupJid(raw = "") {
+  const s = String(raw).trim();
+  if (!s) return s;
+  return s.endsWith("@g.us") ? s : `${s}@g.us`;
+}
+
+function messageText(msg) {
+  try {
+    if (!msg) return "[No message]";
+
+    const c = extractMessageContent(msg?.message);
+    if (!c) return "[Unsupported message]";
+
+    if (c.conversation) return c.conversation || "[Empty message]";
+    if (c.extendedTextMessage?.text)
+      return c.extendedTextMessage.text || "[Empty text]";
+    if (c.imageMessage?.caption) return `[IMG] ${c.imageMessage.caption || ""}`;
+    if (c.videoMessage?.caption) return `[VID] ${c.videoMessage.caption || ""}`;
+    if (c.audioMessage) {
+      const duration = c.audioMessage.seconds || 0;
+      return `[AUDIO ${duration}s]`;
+    }
+    if (c.documentMessage)
+      return `[DOC] ${c.documentMessage.fileName || "Document"}`;
+    if (c.stickerMessage) return "[Sticker]";
+
+    const type = getContentType(msg?.message) || "unknown";
+    return `[${type.toUpperCase()}]`;
+  } catch (error) {
+    console.error("Error in messageText:", error);
+    return "[Error]";
+  }
+  // Final fallback - should never reach here but just in case
+  return "[Unknown message type]";
+}
+function resultCard(
+  title,
+  lines = [],
+  backHref = "/wml/home.wml",
+  autoRefresh = true
+) {
+  const refreshTimer = autoRefresh ? "" : "";
+  const onTimer = autoRefresh ? ` ontimer="${backHref}"` : "";
+
+  const body = `
+    ${refreshTimer}
+    <p><b>${esc(title)}</b></p>
+    ${lines.map((l) => `<p>${esc(l)}</p>`).join("")}
+    <p>
+      <a href="${backHref}" accesskey="0">[0] Back</a> 
+      <a href="/wml/home.wml" accesskey="9">[9] Home</a>
+    </p>
+    <do type="accept" label="OK">
+      <go href="${backHref}"/>
+    </do>
+    <do type="options" label="Menu">
+      <go href="/wml/home.wml"/>
+    </do>
+  `;
+  return `<card id="result" title="${esc(title)}"${onTimer}>${body}</card>`;
+}
+
+function navigationBar() {
+  return `
+    <p>
+      <a href="/wml/home.wml" accesskey="1">[1] Home</a> 
+      <a href="/wml/chats.wml" accesskey="2">[2] Chats</a> 
+      <a href="/wml/contacts.wml" accesskey="3">[3] Contacts</a> 
+      <a href="/wml/send-menu.wml" accesskey="4">[4] Send</a>
+    </p>
+  `;
+}
+
+function searchBox(action, placeholder = "Search...") {
+  return `
+    <p>
+      <input name="q" title="${esc(placeholder)}" size="20" maxlength="50"/>
+      <do type="accept" label="Search">
+        <go href="${action}" method="get">
+          <postfield name="q" value="$(q)"/>
+        </go>
+      </do>
+    </p>
+  `;
+}
+
+// WMLScript functions
+function wmlScript(name, functions) {
+  return `<script src="/wmlscript/${name}.wmls" type="text/vnd.wap.wmlscriptc"/>`;
+}
+
+// WMLScript files endpoint
+app.get("/wmlscript/:filename", (req, res) => {
+  const { filename } = req.params;
+  let script = "";
+
+  res.setHeader("Content-Type", "text/vnd.wap.wmlscript");
+  res.setHeader("Cache-Control", "max-age=3600");
+
+  switch (filename) {
+    case "utils.wmls":
+      script = `
+extern function refresh();
+extern function confirmAction(message);
+extern function showAlert(text);
+
+function refresh() {
+  WMLBrowser.refresh();
+}
+
+function confirmAction(message) {
+  var result = Dialogs.confirm(message, "Confirm", "Yes", "No");
+  return result;
+}
+
+function showAlert(text) {
+  Dialogs.alert(text);
+}
+`;
+      break;
+    case "wtai.wmls":
+      script = `
+extern function makeCall(number);
+extern function sendSMS(number, message);
+extern function addContact(name, number);
+
+function makeCall(number) {
+  WTAVoice.setup("wtai://wp/mc;" + number, "");
+}
+
+function sendSMS(number, message) {
+  WTASMS.send("wtai://wp/ms;" + number + ";" + message, "");
+}
+
+function addContact(name, number) {
+  WTAPhoneBook.write("wtai://wp/ap;" + name + ";" + number, "");
+}
+`;
+      break;
+    default:
+      return res.status(404).send("Script not found");
+  }
+
+  res.send(script);
+});
+
+// Enhanced Home page with WMLScript integration
+app.get(["/wml", "/wml/home.wml"], (req, res) => {
+  const connected = !!sock?.authState?.creds;
+  const scripts = `
+    ${wmlScript("utils")}
+    ${wmlScript("wtai")}
+  `;
+
+  const body = `
+  
+    <p><b>WhatsApp WAP Client</b></p>
+    <p>Status: ${
+      connected ? "<b>Connected</b>" : "<em>Disconnected</em>"
+    }  ${esc(connectionState)}</p>
+    <p>Sync: ${isFullySynced ? "Complete" : "Pending"}  Contacts: ${
+    contactStore.size
+  }  Chats: ${chatStore.size}  Messages: ${messageStore.size}</p>
+    
+  
+    
+    <p><b>Quick Actions:</b></p>
+    <p>
+      <a href="/wml/search.wml" accesskey="1">[1] Search All</a>
+      <a href="/wml/status.wml" accesskey="2">[2] Status</a> 
+      <a href="/wml/qr.wml" accesskey="3">[3] QR Code</a> 
+      <a href="/wml/me.wml" accesskey="4">[4] Profile</a><br/>
+      <a href="/wml/presence.wml" accesskey="5">[5] Presence</a> 
+      <a href="/wml/privacy.wml" accesskey="6">[6] Privacy</a> 
+      <a href="/wml/live-status.wml" accesskey="7">[7] Live Status</a>
+    </p>
+    
+    <p><b>Main Menu:</b></p>
+    <p>
+      <a href="/wml/contacts.wml?page=1&amp;limit=10" accesskey="7">[7] Contacts</a><br/>
+      <a href="/wml/chats.wml?page=1&amp;limit=10" accesskey="8">[8] Chats</a><br/>
+      <a href="/wml/send-menu.wml" accesskey="9">[9] Send Message</a><br/>
+      <a href="/wml/groups.wml" accesskey="*">[*] Groups</a><br/>
+      <a href="/wml/broadcast.wml">[#] Broadcast</a><br/>
+      <a href="/wml/debug.wml">[D] Debug</a><br/>
+      <a href="/wml/logout.wml" accesskey="0">[0] Logout</a><br/>
+    </p>
+    
+    <do type="accept" label="Refresh">
+      <go href="/wml/home.wml"/>
+    </do>
+    <do type="options" label="Status">
+      <go href="/wml/status.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("home", "WhatsApp API", body, "/wml/home.wml"), scripts);
+});
+
+/*
+app.get('/wml/chat.wml', async (req, res) => {
+  const raw = req.query.jid || ''
+  const jid = formatJid(raw)
+  const limit = 10 // Aumentato da 6 a 10 messaggi per pagina
+  const offset = Math.max(0, parseInt(req.query.offset || '0'))
+  const search = (req.query.search || '').trim().toLowerCase()
+
+  // Carica cronologia se mancante
+  if ((!chatStore.get(jid) || chatStore.get(jid).length === 0) && sock) {
+    try { 
+      await loadChatHistory(jid, limit * 5) // carica più messaggi per navigazione
+    } catch (e) { 
+      logger.warn(`Failed to load chat history for ${jid}: ${e.message}`) 
+    }
+  }
+
+  let allMessages = (chatStore.get(jid) || []).slice()
+  
+  // Ordinamento cronologico CRESCENTE (dal più vecchio al più recente)
+  allMessages.sort((a, b) => Number(a.messageTimestamp) - Number(b.messageTimestamp))
+
+  // Applica filtro di ricerca se presente
+  if (search) {
+    allMessages = allMessages.filter(m => (messageText(m) || '').toLowerCase().includes(search))
+  }
+
+  // Per la paginazione con ordinamento crescente, prendiamo gli ultimi messaggi
+  // ma li mostriamo nell'ordine corretto (dal più vecchio al più recente)
+  const totalMessages = allMessages.length
+  const startIndex = Math.max(0, totalMessages - limit - offset)
+  const endIndex = totalMessages - offset
+  const slice = allMessages.slice(startIndex, endIndex)
+
+  const contact = contactStore.get(jid)
+  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
+  const number = jidFriendly(jid)
+
+  // Escape sicuro e rimuove caratteri non ASCII
+  const escWml = text => (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/[^\x20-\x7E]/g, '?')
+
+  let messageList
+  if (slice.length === 0) {
+    messageList = `<p>No messages found.</p>
+      <p>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}" accesskey="2">[Clear Search]</a> |
+        <a href="/wml/chats.wml" accesskey="0">[Back to Chats]</a>
+      </p>`
+  } else {
+    messageList = slice.map((m, idx) => {
+      const who = m.key.fromMe ? 'Me' : chatName
+      const text = truncate(messageText(m), 100)
+      const ts = new Date(Number(m.messageTimestamp) * 1000).toLocaleTimeString('en-GB', {
+        hour: '2-digit', 
+        minute: '2-digit'
+      })
+      const mid = m.key.id
+      
+      return `<p><b>${idx + 1}. ${escWml(who)}</b> (${ts})<br/>
+        ${escWml(text)}<br/>
+        <a href="/wml/msg.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}" accesskey="${Math.min(idx + 1, 9)}">[Actions]</a>
+      </p>`
+    }).join('')
+  }
+
+  // Navigazione corretta per ordinamento crescente
+  const olderOffset = offset + limit
+  const olderLink = olderOffset < totalMessages
+    ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">[2] Older</a>` : ''
+  
+  const newerOffset = Math.max(0, offset - limit)
+  const newerLink = offset > 0
+    ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">[3] Newer</a>` : ''
+
+  // Search form sempre visibile
+  const searchForm = `
+    <p><b>Search Messages:</b></p>
+    <p>
+      <input name="searchQuery" title="Search..." value="${escWml(search)}" size="15" maxlength="50"/>
+      <do type="accept" label="Search">
+        <go href="/wml/chat.wml" method="get">
+          <postfield name="jid" value="${escWml(jid)}"/>
+          <postfield name="search" value="$(searchQuery)"/>
+          <postfield name="offset" value="0"/>
+        </go>
+      </do>
+    </p>
+    ${search ? `<p>Searching: <b>${escWml(search)}</b> | <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">[Clear]</a></p>` : ''}
+  `
+
+  // Indicatori di paginazione migliorati
+  const currentPage = Math.floor(offset / limit) + 1
+  const totalPages = Math.ceil(totalMessages / limit)
+  const paginationInfo = `
+    <p><b>Messages ${Math.max(1, totalMessages - endIndex + 1)}-${totalMessages - startIndex} of ${totalMessages}</b></p>
+    <p>Page ${currentPage}/${totalPages}</p>
+  `
+
+  const body = `
+    <p><b>${escWml(chatName)}</b></p>
+    <p>${escWml(number)} | Total: ${totalMessages} messages</p>
+
+    ${searchForm}
+
+    ${paginationInfo}
+
+    ${messageList}
+
+    <p><b>Navigation:</b></p>
+    <p>${olderLink} ${olderLink && newerLink ? ' | ' : ''} ${newerLink}</p>
+
+    <p><b>Quick Actions:</b></p>
+    <p>
+      <a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">[1] Send Text</a> |
+      <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}" accesskey="4">[4] Contact Info</a>
+      ${number && !jid.endsWith('@g.us') ? ` | <a href="wtai://wp/mc;${number}" accesskey="9">[9] Call</a>` : ''}
+    </p>
+
+    <p>
+      <a href="/wml/chats.wml" accesskey="0">[0] Back to Chats</a> |
+      <a href="/wml/home.wml" accesskey="*">[*] Home</a>
+    </p>
+
+    <do type="accept" label="Send">
+      <go href="/wml/send.text.wml?to=${encodeURIComponent(jid)}"/>
+    </do>
+    <do type="options" label="Refresh">
+      <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${offset}&amp;search=${encodeURIComponent(search)}"/>
+    </do>
+  `
+
+  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=UTF-8')
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
+  res.setHeader('Expires', '0')
+  
+  res.send(`<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <head>
+    <meta http-equiv="Cache-Control" content="max-age=0"/>
+  </head>
+  <card id="chat" title="${escWml(chatName)}">
+    ${body}
+  </card>
+</wml>`)
+})*/
+
+// Enhanced Status page
+app.get("/wml/status.wml", (req, res) => {
+  const connected = !!sock?.authState?.creds;
+  const uptime = Math.floor(process.uptime() / 60);
+
+  const body = `
+    <p><b>System Status</b></p>
+    <p>Connection: ${connected ? "<b>Active</b>" : "<em>Inactive</em>"}</p>
+    <p>State: ${esc(connectionState)}</p>
+    <p>QR Available: ${currentQR ? "Yes" : "No"}</p>
+    <p>Uptime: ${uptime} minutes</p>
+
+    <p>Sync Status: ${
+      isFullySynced ? "<b>Complete</b>" : "<em>In Progress</em>"
+    }</p>
+    <p>Sync Attempts: ${syncAttempts}</p>
+    <p>Contacts: ${contactStore.size}</p>
+    <p>Chats: ${chatStore.size}</p>
+    <p>Messages: ${messageStore.size}</p>
+
+    <p><b>Sync Actions:</b></p>
+    <p>
+      <a href="/wml/sync.full.wml" accesskey="1"> Sync</a>
+    </p>
+
+    ${navigationBar()}
+
+    <do type="accept" label="Refresh">
+      <go href="/wml/status.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("status", "Status", body, "/wml/status.wml"));
+});
+
+// Enhanced QR Code page
+app.get("/wml/qr.wml", (req, res) => {
+  const body = currentQR
+    ? `
+    
+      <p><b>QR Code Available</b></p>
+      <p>Scan with WhatsApp:</p>
+      <p><img src="/api/qr/image?format=wbmp" alt="QR Code" localscr="qr.wbmp"/></p>
+      <p><small>Auto-refreshes every 30 seconds</small></p>
+      
+      <p><b>QR Formats:</b></p>
+  <p>
+  <a href="/api/qr/image?format=png">[PNG]</a> 
+  <a href="/api/qr/text">[Text]</a> |
+  <a href="/api/qr/image?format=wbmp">[WBMP]</a> 
+  <a href="/api/qr/wml-wbmp">[WML+WBMP]</a>
+</p>
+    `
+    : `
+   
+      <p><b>QR Code Not Available</b></p>
+      <p>Status: ${esc(connectionState)}</p>
+      <p>Please wait or check connection...</p>
+    `;
+
+  const body_full = `
+    ${body}
+    ${navigationBar()}
+    <do type="accept" label="Refresh">
+      <go href="/wml/qr.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("qr", "QR Code", body_full, "/wml/qr.wml"));
+});
+
+app.get("/api/qr/wml-wbmp", (req, res) => {
+  if (!currentQR) {
+    res.set("Content-Type", "text/vnd.wap.wml");
+    return res.send(`<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
+  "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="noqr" title="QR Not Available">
+    <p>QR code not available</p>
+  </card>
+</wml>`);
+  }
+
+  // Restituisce una WML page che richiama l'immagine WBMP
+  res.set("Content-Type", "text/vnd.wap.wml");
+  res.send(`<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
+  "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="qr" title="WhatsApp QR">
+    <p>Scansiona il QR:</p>
+    <p><img src="/api/qr/image?format=wbmp" alt="QR Code"/></p>
+  </card>
+</wml>`);
+});
+
+// Enhanced Contacts with search and pagination
+
+app.get("/wml/contacts.wml", (req, res) => {
+  const userAgent = req.headers["user-agent"] || "";
+
+  // Usa req.query per GET. Se il form usa POST, i dati sarebbero in req.body.
+  // La <go> con method="get" mette i dati in query string.
+  const query = req.query;
+
+  const page = Math.max(1, parseInt(query.page || "1"));
+  let limit = Math.max(1, Math.min(20, parseInt(query.limit || "10")));
+
+  // Limiti più restrittivi per dispositivi WAP 1.0
+  if (userAgent.includes("Nokia") || userAgent.includes("UP.Browser")) {
+    limit = Math.min(5, limit); // Max 5 elementi per pagina
+  }
+
+  const search = query.q || "";
+
+  let contacts = Array.from(contactStore.values());
+
+  // Applica filtro di ricerca
+  if (search) {
+    const searchLower = search.toLowerCase();
+    contacts = contacts.filter((c) => {
+      const name = (c.name || c.notify || c.verifiedName || "").toLowerCase();
+      const number = c.id.replace("@s.whatsapp.net", "");
+      return name.includes(searchLower) || number.includes(searchLower);
+    });
+  }
+
+  const total = contacts.length;
+  const start = (page - 1) * limit;
+  const items = contacts.slice(start, start + limit);
+
+  // Funzione di escaping sicura per WML
+  const escWml = (text) =>
+    (text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+
+  // Header della pagina
+  const searchHeader = search
+    ? `<p><b>Risultati per:</b> ${escWml(search)} (${total})</p>`
+    : `<p><b>Tutti i contatti</b> (${total})</p>`;
+
+  // Lista contatti
+  const list =
+    items
+      .map((c, idx) => {
+        const name = c.name || c.notify || c.verifiedName || "Sconosciuto";
+        const jid = c.id;
+        const number = jidFriendly(jid);
+        return `<p>${start + idx + 1}. ${escWml(name)}<br/>
+      <small>${escWml(number)}</small><br/>
+      <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}">[Dettagli]</a> 
+      <a href="/wml/chat.wml?jid=${encodeURIComponent(
+        jid
+      )}&amp;limit=10">[Chat]</a></p>`;
+      })
+      .join("") || "<p>Nessun contatto trovato.</p>";
+
+  // Paginazione con First/Last e numeri di pagina
+  const totalPages = Math.ceil(total / limit) || 1;
+
+  const firstPage =
+    page > 1
+      ? `<a href="/wml/contacts.wml?page=1&amp;limit=${limit}&amp;q=${encodeURIComponent(
+          search
+        )}">[First]</a>`
+      : "";
+
+  const prevPage =
+    page > 1
+      ? `<a href="/wml/contacts.wml?page=${
+          page - 1
+        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}">[Prev]</a>`
+      : "";
+
+  const nextPage =
+    page < totalPages
+      ? `<a href="/wml/contacts.wml?page=${
+          page + 1
+        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}">[Next]</a>`
+      : "";
+
+  const lastPage =
+    page < totalPages
+      ? `<a href="/wml/contacts.wml?page=${totalPages}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+          search
+        )}">[Last]</a>`
+      : "";
+
+  // numeri di pagina (mostra ±2 intorno alla pagina corrente)
+  let pageNumbers = "";
+  const startPage = Math.max(1, page - 2);
+  const endPage = Math.min(totalPages, page + 2);
+  for (let p = startPage; p <= endPage; p++) {
+    if (p === page) {
+      pageNumbers += `<b>[${p}]</b> `;
+    } else {
+      pageNumbers += `<a href="/wml/contacts.wml?page=${p}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+        search
+      )}">${p}</a> `;
+    }
+  }
+
+  const pagination = `
+    <p>
+      ${firstPage} ${firstPage && prevPage ? "" : ""} ${prevPage}
+      ${pageNumbers}
+      ${nextPage} ${nextPage && lastPage ? "" : ""} ${lastPage}
+    </p>`;
+
+  // Form di ricerca semplificato
+  const searchForm = `
+    <p><b>Cerca contatti:</b></p>
+    <p>
+      <input name="q" title="Cerca..." value="${escWml(
+        search
+      )}" emptyok="true" size="15" maxlength="30"/>
+      <do type="accept" label="Cerca">
+        <go href="/wml/contacts.wml" method="get">
+          <postfield name="q" value="$(q)"/>
+          <postfield name="page" value="1"/>
+          <postfield name="limit" value="${limit}"/>
+        </go>
+      </do>
+    </p>`;
+
+  // Corpo della card WML
+  const body = `
+    <p><b>Contatti - Pagina ${page}/${Math.ceil(total / limit) || 1}</b></p>
+    ${searchHeader}
+    ${searchForm}
+    ${list}
+    ${pagination}
+    <p>
+      <a href="/wml/home.wml">[Home]</a> 
+      <a href="/wml/chats.wml">[Chats]</a>
+    </p>
+    <do type="accept" label="Aggiorna">
+      <go href="/wml/contacts.wml?page=${page}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+    search
+  )}"/>
+    </do>
+   `;
+
+  // Crea la stringa WML completa
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <head>
+    <meta http-equiv="Cache-Control" content="max-age=0"/>
+  </head>
+  <card id="contacts" title="Contatti">
+    ${body}
+  </card>
+</wml>`;
+
+  // --- MODIFICHE CHIAVE PER LA COMPATIBILITÀ ---
+
+  // 1. Imposta gli header per WAP 1.0 con la codifica corretta (ISO-8859-1)
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
+  // 2. Codifica l'intera stringa WML in un buffer ISO-8859-1
+  const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+
+  // 3. Invia il buffer codificato
+  res.send(encodedBuffer);
+});
+
+// Aggiungi un listener per poter eseguire il server
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`Server WAP in ascolto su http://localhost:${PORT}`);
+  console.log(
+    `Accedi a http://localhost:${PORT}/wml/contacts.wml per testare.`
+  );
+});
+// Enhanced Contact Detail page with WTAI integration
+app.get("/wml/contact.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+    const jid = formatJid(req.query.jid || "");
+    const contact = contactStore.get(jid);
+    const number = jidFriendly(jid);
+
+    // Try to fetch additional info
+    let status = null;
+    let businessProfile = null;
+
+    try {
+      status = await sock.fetchStatus(jid);
+      businessProfile = await sock.getBusinessProfile(jid);
+    } catch (e) {
+      // Silently fail for these optional features
+    }
+
+    const body = `
+      <p><b>${esc(
+        contact?.name ||
+          contact?.notify ||
+          contact?.verifiedName ||
+          "Unknown Contact"
+      )}</b></p>
+      <p>Number: ${esc(number)}</p>
+      <p>JID: <small>${esc(jid)}</small></p>
+      ${status ? `<p>Status: <em>${esc(status.status || "")}</em></p>` : ""}
+      ${businessProfile ? "<p><b>[BUSINESS]</b></p>" : ""}
+      
+      <p><b>Quick Actions:</b></p>
+      <p>
+        <a href="wtai://wp/mc;${number}" accesskey="1">[1] Call</a><br/>
+        <a href="wtai://wp/sms;${number};" accesskey="2">[2] SMS</a><br/>
+        <a href="wtai://wp/ap;${esc(
+          contact?.name || number
+        )};${number}" accesskey="3">[3] Add to Phone</a><br/>
+      </p>
+      
+      <p><b>WhatsApp Actions:</b></p>
+      <p>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;limit=15" accesskey="4">[4] Open Chat</a><br/>
+        <a href="/wml/send.text.wml?to=${encodeURIComponent(
+          jid
+        )}" accesskey="5">[5] Send Message</a><br/>
+        <a href="/wml/block.wml?jid=${encodeURIComponent(
+          jid
+        )}" accesskey="7">[7] Block</a><br/>
+        <a href="/wml/unblock.wml?jid=${encodeURIComponent(
+          jid
+        )}" accesskey="8">[8] Unblock</a><br/>
+      </p>
+      
+      ${navigationBar()}
+      
+      <do type="accept" label="Chat">
+        <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=15"/>
+      </do>
+      <do type="options" label="Call">
+        <go href="wtai://wp/mc;${number}"/>
+      </do>
+    `;
+
+    sendWml(res, card("contact", "Contact Info", body));
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Error",
+        [e.message || "Failed to load contact"],
+        "/wml/contacts.wml"
+      )
+    );
+  }
+});
+/*
+app.get('/wml/chat.wml', async (req, res) => {
+  const userAgent = req.headers['user-agent'] || ''
+  const isOldNokia = /Nokia|Series40|MAUI|UP\.Browser/i.test(userAgent)
+  
+  const raw = req.query.jid || ''
+  const jid = formatJid(raw)
+  const offset = Math.max(0, parseInt(req.query.offset || '0'))
+  const search = (req.query.search || '').trim().toLowerCase()
+  
+  // Very small limits for Nokia 7210
+  const limit = isOldNokia ? 3 : 10
+  
+  // Load chat history if missing
+  if ((!chatStore.get(jid) || chatStore.get(jid).length === 0) && sock) {
+    try {
+      await loadChatHistory(jid, limit * 3)
+    } catch (e) {
+      logger.warn(`Failed to load chat history for ${jid}: ${e.message}`)
+    }
+  }
+  
+  let allMessages = (chatStore.get(jid) || []).slice()
+  
+  // Sort by timestamp - MOST RECENT FIRST
+  allMessages.sort((a, b) => {
+    const tsA = Number(a.messageTimestamp) || 0
+    const tsB = Number(b.messageTimestamp) || 0
+    return tsB - tsA // Most recent first
+  })
+  
+  // Apply search filter if present
+  if (search) {
+    allMessages = allMessages.filter(m => (messageText(m) || '').toLowerCase().includes(search))
+  }
+  
+  const total = allMessages.length
+  const items = allMessages.slice(offset, offset + limit)
+  
+  const contact = contactStore.get(jid)
+  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
+  const number = jidFriendly(jid)
+  const isGroup = jid.endsWith('@g.us')
+  
+  // Simple escaping for Nokia 7210
+  const esc = text => (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  
+  // Simple truncate
+  const truncate = (text, maxLength) => {
+    if (!text) return ''
+    if (text.length <= maxLength) return text
+    return text.substring(0, maxLength - 3) + '...'
+  }
+  
+  // Simple timestamp for Nokia
+  const formatTime = (timestamp) => {
+    const date = new Date(Number(timestamp) * 1000)
+    if (isNaN(date.getTime())) return ''
+    
+    const day = date.getDate().toString().padStart(2, '0')
+    const month = (date.getMonth() + 1).toString().padStart(2, '0')
+    const hours = date.getHours().toString().padStart(2, '0')
+    const mins = date.getMinutes().toString().padStart(2, '0')
+    
+    return `${day}/${month} ${hours}:${mins}`
+  }
+  
+  let messageList = ''
+  
+  if (items.length === 0) {
+    messageList = '<p>No messages</p>'
+  } else {
+    messageList = items.map((m, idx) => {
+      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
+      const time = formatTime(m.messageTimestamp)
+      const msgNumber = idx + 1
+      const mid = m.key.id
+      
+      // Handle different message types for Nokia
+      let text = ''
+      let mediaLink = ''
+      
+      if (m.message) {
+        if (m.message.imageMessage) {
+          const img = m.message.imageMessage
+          const size = Math.round((img.fileLength || 0) / 1024)
+          text = `[IMG ${size}KB]`
+          if (img.caption) text += ` ${truncate(img.caption, 30)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`
+          
+        } else if (m.message.videoMessage) {
+          const vid = m.message.videoMessage
+          const size = Math.round((vid.fileLength || 0) / 1024)
+          text = `[VID ${size}KB]`
+          if (vid.caption) text += ` ${truncate(vid.caption, 30)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`
+          
+        } else if (m.message.audioMessage) {
+          const aud = m.message.audioMessage
+          const size = Math.round((aud.fileLength || 0) / 1024)
+          const duration = aud.seconds || 0
+          text = `[AUD ${size}KB ${duration}s]`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View AUD]</a>`
+          
+        } else if (m.message.documentMessage) {
+          const doc = m.message.documentMessage
+          const size = Math.round((doc.fileLength || 0) / 1024)
+          const filename = doc.fileName || 'file'
+          text = `[DOC ${size}KB] ${truncate(filename, 20)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`
+          
+        } else if (m.message.stickerMessage) {
+          text = '[STICKER]'
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`
+          
+        } else {
+          text = truncate(messageText(m) || '', 50)
+        }
+      } else {
+        text = truncate(messageText(m) || '', 50)
+      }
+      
+      return `<p>${msgNumber}. ${esc(who)} (${time})<br/>${esc(text)}${mediaLink}</p>`
+    }).join('')
+  }
+  
+  // Simple navigation for Nokia
+  const olderOffset = offset + limit
+  const olderLink = olderOffset < total ? 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">2-Older</a></p>` : ''
+  
+  const newerOffset = Math.max(0, offset - limit)
+  const newerLink = offset > 0 ? 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">3-Newer</a></p>` : ''
+  
+  // Simple search for Nokia
+  const searchBox = search ? 
+    `<p>Search: ${esc(search)}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">Clear</a></p>` : 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;search=prompt">Search</a></p>`
+  
+  const body = `<p>${esc(chatName.length > 15 ? chatName.substring(0, 15) : chatName)}</p>
+<p>Msgs ${offset + 1}-${Math.min(offset + limit, total)}/${total}</p>
+${searchBox}
+${messageList}
+${newerLink}
+${olderLink}
+<p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">1-Send</a></p>
+<p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
+  
+  // Nokia 7210 compatible WML 1.1
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Con\l" content="max-age=0"/></head>
+<card id="chat" title="Chat">
+${body}
+</card>
+</wml>`
+  
+  // Nokia 7210 headers
+  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=iso-8859-1')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Pragma', 'no-cache')
+  
+  const encodedBuffer = iconv.encode(wmlOutput, 'iso-8859-1')
+  res.send(encodedBuffer)
+})*/
+/*
+// Route per scaricare media - compatibile Nokia 7210
+app.get('/wml/chat.wml', async (req, res) => {
+  const userAgent = req.headers['user-agent'] || ''
+  const isOldNokia = /Nokia|Series40|MAUI|UP\.Browser/i.test(userAgent)
+  
+  const raw = req.query.jid || ''
+  const jid = formatJid(raw)
+  const offset = Math.max(0, parseInt(req.query.offset || '0'))
+  const search = (req.query.search || '').trim().toLowerCase()
+  
+  // Very small limits for Nokia 7210
+  const limit = isOldNokia ? 3 : 10
+  
+  // Load chat history if missing
+  if ((!chatStore.get(jid) || chatStore.get(jid).length === 0) && sock) {
+    try {
+      await loadChatHistory(jid, limit * 3)
+    } catch (e) {
+      logger.warn(`Failed to load chat history for ${jid}: ${e.message}`)
+    }
+  }
+  
+  let allMessages = (chatStore.get(jid) || []).slice()
+  
+  // Sort by timestamp - MOST RECENT FIRST
+  allMessages.sort((a, b) => {
+    const tsA = Number(a.messageTimestamp) || 0
+    const tsB = Number(b.messageTimestamp) || 0
+    return tsB - tsA // Most recent first
+  })
+  
+  // Apply search filter if present
+  if (search) {
+    allMessages = allMessages.filter(m => (messageText(m) || '').toLowerCase().includes(search))
+  }
+  
+  const total = allMessages.length
+  const items = allMessages.slice(offset, offset + limit)
+  
+  const contact = contactStore.get(jid)
+  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
+  const number = jidFriendly(jid)
+  const isGroup = jid.endsWith('@g.us')
+  
+  // Simple escaping for Nokia 7210
+  const esc = text => (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  
+  // Simple truncate
+  const truncate = (text, maxLength) => {
+    if (!text) return ''
+    if (text.length <= maxLength) return text
+    return text.substring(0, maxLength - 3) + '...'
+  }
+  
+  // Simple timestamp for Nokia
+  const formatTime = (timestamp) => {
+    const date = new Date(Number(timestamp) * 1000)
+    if (isNaN(date.getTime())) return ''
+    
+    const day = date.getDate().toString().padStart(2, '0')
+    const month = (date.getMonth() + 1).toString().padStart(2, '0')
+    const hours = date.getHours().toString().padStart(2, '0')
+    const mins = date.getMinutes().toString().padStart(2, '0')
+    
+    return `${day}/${month} ${hours}:${mins}`
+  }
+  
+  let messageList = ''
+  
+  if (items.length === 0) {
+    messageList = '<p>No messages</p>'
+  } else {
+    messageList = items.map((m, idx) => {
+      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
+      const time = formatTime(m.messageTimestamp)
+      const msgNumber = idx + 1
+      const mid = m.key.id
+      
+      // Handle different message types for Nokia
+      let text = ''
+      let mediaLink = ''
+      
+      if (m.message) {
+        if (m.message.imageMessage) {
+          const img = m.message.imageMessage
+          const size = Math.round((img.fileLength || 0) / 1024)
+          text = `[IMG ${size}KB]`
+          if (img.caption) text += ` ${truncate(img.caption, 30)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`
+          
+        } else if (m.message.videoMessage) {
+          const vid = m.message.videoMessage
+          const size = Math.round((vid.fileLength || 0) / 1024)
+          text = `[VID ${size}KB]`
+          if (vid.caption) text += ` ${truncate(vid.caption, 30)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`
+          
+        } else if (m.message.audioMessage) {
+          const aud = m.message.audioMessage
+          const size = Math.round((aud.fileLength || 0) / 1024)
+          const duration = aud.seconds || 0
+          text = `[AUD ${size}KB ${duration}s]`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View AUD]</a>`
+          
+        } else if (m.message.documentMessage) {
+          const doc = m.message.documentMessage
+          const size = Math.round((doc.fileLength || 0) / 1024)
+          const filename = doc.fileName || 'file'
+          text = `[DOC ${size}KB] ${truncate(filename, 20)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`
+          
+        } else if (m.message.stickerMessage) {
+          text = '[STICKER]'
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`
+          
+        } else {
+          text = truncate(messageText(m) || '', 50)
+        }
+      } else {
+        text = truncate(messageText(m) || '', 50)
+      }
+      
+      return `<p>${msgNumber}. ${esc(who)} (${time})<br/>${esc(text)}${mediaLink}</p>`
+    }).join('')
+  }
+  
+  // Simple navigation for Nokia
+  const olderOffset = offset + limit
+  const olderLink = olderOffset < total ? 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">2-Older</a></p>` : ''
+  
+  const newerOffset = Math.max(0, offset - limit)
+  const newerLink = offset > 0 ? 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">3-Newer</a></p>` : ''
+  
+  // Simple search for Nokia
+  const searchBox = search ? 
+    `<p>Search: ${esc(search)}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">Clear</a></p>` : 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;search=prompt">Search</a></p>`
+  
+  const body = `<p>${esc(chatName.length > 15 ? chatName.substring(0, 15) : chatName)}</p>
+<p>Msgs ${offset + 1}-${Math.min(offset + limit, total)}/${total}</p>
+${searchBox}
+${messageList}
+${newerLink}
+${olderLink}
+<p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">1-Send</a></p>
+<p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
+  
+  // Nokia 7210 compatible WML 1.1
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>
+<card id="chat" title="Chat">
+${body}
+</card>
+</wml>`
+  
+  // Nokia 7210 headers
+  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=iso-8859-1')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Pragma', 'no-cache')
+  
+  const encodedBuffer = iconv.encode(wmlOutput, 'iso-8859-1')
+  res.send(encodedBuffer)
+})*/
+
+app.get("/wml/chat.wml", async (req, res) => {
+  const userAgent = req.headers["user-agent"] || "";
+  const isOldNokia = false;
+
+  const raw = req.query.jid || "";
+  const jid = formatJid(raw);
+  const offset = Math.max(0, parseInt(req.query.offset || "0"));
+  const search = (req.query.search || "").trim().toLowerCase();
+
+  // Fixed limit to 5 elements per page
+  const limit = 5;
+
+  // Load chat history if missing
+  if ((!chatStore.get(jid) || chatStore.get(jid).length === 0) && sock) {
+    try {
+      await loadChatHistory(jid, limit * 5);
+    } catch (e) {
+      logger.warn(`Failed to load chat history for ${jid}: ${e.message}`);
+    }
+  }
+
+  let allMessages = (chatStore.get(jid) || []).slice();
+
+  // Sort by timestamp - MOST RECENT FIRST (descending order)
+  allMessages.sort((a, b) => {
+    const tsA = Number(a.messageTimestamp) || 0;
+    const tsB = Number(b.messageTimestamp) || 0;
+    return tsB - tsA; // Most recent first
+  });
+
+  // Apply search filter if present
+  if (search) {
+    allMessages = allMessages.filter((m) =>
+      (messageText(m) || "").toLowerCase().includes(search)
+    );
+  }
+
+  const totalMessages = allMessages.length;
+  const items = allMessages.slice(offset, offset + limit);
+
+  const contact = contactStore.get(jid);
+  const chatName =
+    contact?.name ||
+    contact?.notify ||
+    contact?.verifiedName ||
+    jidFriendly(jid);
+  const number = jidFriendly(jid);
+  const isGroup = jid.endsWith("@g.us");
+
+  // Enhanced escaping that works for both Nokia and modern devices
+  const escWml = (text) =>
+    (text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+
+  // Truncation function
+  const truncate = (text, maxLength) => {
+    if (!text) return "";
+    if (text.length <= maxLength) return text;
+    return text.substring(0, maxLength - 3) + "...";
+  };
+
+  // Enhanced timestamp formatting with date and time
+  const formatMessageTimestamp = (timestamp) => {
+    const date = new Date(Number(timestamp) * 1000);
+    if (isNaN(date.getTime())) return "Invalid date";
+
+    if (isOldNokia) {
+      // Simple format for Nokia: dd/mm hh:mm
+      const day = date.getDate().toString().padStart(2, "0");
+      const month = (date.getMonth() + 1).toString().padStart(2, "0");
+      const hours = date.getHours().toString().padStart(2, "0");
+      const mins = date.getMinutes().toString().padStart(2, "0");
+      return `${day}/${month} ${hours}:${mins}`;
+    } else {
+      // Full format for modern devices: 30 Dec 2024 14:30
+      const timeStr = date.toLocaleTimeString("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      const dateStr = date.toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      });
+      return `${dateStr} ${timeStr}`;
+    }
+  };
+
+  // Message list with full media support
+  let messageList = "";
+
+  if (items.length === 0) {
+    messageList = "<p>No messages</p>";
+  } else {
+    messageList = items
+      .map((m, idx) => {
+        const who = m.key.fromMe
+          ? "Me"
+          : isOldNokia
+          ? chatName.length > 10
+            ? chatName.substring(0, 10)
+            : chatName
+          : isGroup
+          ? m.pushName || "Unknown"
+          : chatName;
+        const time = formatMessageTimestamp(m.messageTimestamp);
+        const msgNumber = idx + 1; // 1 = most recent
+        const mid = m.key.id;
+
+        // Handle different message types with full media support
+        let text = "";
+        let mediaLink = "";
+
+        if (m.message) {
+          if (m.message.imageMessage) {
+            const img = m.message.imageMessage;
+            const size = Math.round((img.fileLength || 0) / 1024);
+            text = isOldNokia ? `[IMG ${size}KB]` : `[IMAGE ${size}KB]`;
+            if (img.caption)
+              text += ` ${truncate(img.caption, isOldNokia ? 30 : 50)}`;
+
+            if (isOldNokia) {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`;
+            } else {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(
+                jid
+              )}">[View Image]</a> | <a href="/wml/media/${encodeURIComponent(
+                mid
+              )}.jpg">[Download]</a>`;
+            }
+          } else if (m.message.videoMessage) {
+            const vid = m.message.videoMessage;
+            const size = Math.round((vid.fileLength || 0) / 1024);
+            const duration = vid.seconds || 0;
+            text = isOldNokia
+              ? `[VID ${size}KB]`
+              : `[VIDEO ${size}KB, ${duration}s]`;
+            if (vid.caption)
+              text += ` ${truncate(vid.caption, isOldNokia ? 30 : 50)}`;
+
+            if (isOldNokia) {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`;
+            } else {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(
+                jid
+              )}">[View Video]</a> | <a href="/wml/media/${encodeURIComponent(
+                mid
+              )}.mp4">[Download]</a>`;
+            }
+          } // Nel blocco che genera la lista dei messaggi, sostituisci la gestione degli audio con questo:
+          else if (m.message.audioMessage) {
+            const aud = m.message.audioMessage;
+            const size = Math.round((aud.fileLength || 0) / 1024);
+            const duration = aud.seconds || 0;
+            text = `[AUDIO ${size}KB ${duration}s]`;
+
+            // Aggiungi il link per la trascrizione se disponibile
+            if (
+              m &&
+              m.transcription &&
+              m.transcription !== "[Trascrizione fallita]" &&
+              m.transcription !== "[Audio troppo lungo per la trascrizione]"
+            ) {
+              mediaLink = `<br/>
+ 
+      <a href="/wml/audio-transcription.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(jid)}">[View Transcription]</a>`;
+            }
+          } else if (m.message.documentMessage) {
+            const doc = m.message.documentMessage;
+            const size = Math.round((doc.fileLength || 0) / 1024);
+            const filename = doc.fileName || "file";
+            text = isOldNokia
+              ? `[DOC ${size}KB] ${truncate(filename, 20)}`
+              : `[DOCUMENT ${size}KB] ${truncate(filename, 40)}`;
+
+            const ext = filename.split(".").pop() || "bin";
+            if (isOldNokia) {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`;
+            } else {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(
+                jid
+              )}">[View Document]</a> | <a href="/wml/media/${encodeURIComponent(
+                mid
+              )}.${ext}">[Download]</a>`;
+            }
+          } else if (m.message.stickerMessage) {
+            const sticker = m.message.stickerMessage;
+            const size = Math.round((sticker.fileLength || 0) / 1024);
+            text = isOldNokia ? "[STICKER]" : `[STICKER ${size}KB]`;
+
+            if (isOldNokia) {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`;
+            } else {
+              mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(
+                mid
+              )}&amp;jid=${encodeURIComponent(
+                jid
+              )}">[View Sticker]</a> | <a href="/wml/media/${encodeURIComponent(
+                mid
+              )}.webp">[Download]</a>`;
+            }
+          } else {
+            text = truncate(messageText(m) || "", isOldNokia ? 50 : 100);
+          }
+        } else {
+          text = truncate(messageText(m) || "", isOldNokia ? 50 : 100);
+        }
+
+        // Format message entry
+        if (isOldNokia) {
+          return `<p>${msgNumber}. ${escWml(who)} (${time})<br/>${escWml(
+            text
+          )}${mediaLink}</p>`;
+        } else {
+          const typeIndicator = m.key.fromMe ? "[OUT]" : "[IN]";
+          const isVeryRecent = idx < 3;
+          const recentIndicator = isVeryRecent ? "🔥" : "";
+
+          return `<p>${recentIndicator}<b>${msgNumber}. ${typeIndicator} ${escWml(
+            who
+          )}</b><br/>
+          <small><b>Time:</b> ${time}</small><br/>
+          <small><b>Message:</b> ${escWml(text)}</small>${mediaLink}<br/>
+          <a href="/wml/msg.wml?mid=${encodeURIComponent(
+            mid
+          )}&amp;jid=${encodeURIComponent(jid)}">[Details]</a> 
+          <a href="/wml/send.text.wml?to=${encodeURIComponent(
+            jid
+          )}&amp;reply=${encodeURIComponent(mid)}">[Reply]</a>
+        </p>`;
+        }
+      })
+      .join("");
+  }
+
+  // Enhanced navigation with First/Last buttons
+  const totalPages = Math.ceil(totalMessages / limit);
+  const currentPage = Math.floor(offset / limit) + 1;
+
+  // Calculate navigation offsets
+  const firstOffset = 0;
+  const lastOffset = Math.max(0, (totalPages - 1) * limit);
+  const olderOffset = offset + limit;
+  const newerOffset = Math.max(0, offset - limit);
+
+  // Build navigation links
+  let navigationLinks = [];
+
+  // First button (only if not on first page)
+  if (offset > 0) {
+    const firstLink = isOldNokia
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${firstOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="7">7-First</a>`
+      : `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${firstOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="7">[7] First</a>`;
+    navigationLinks.push(firstLink);
+  }
+
+  // Newer/Previous button
+  if (offset > 0) {
+    const newerLink = isOldNokia
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="3">3-Newer</a>`
+      : `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="3">[3] Newer</a>`;
+    navigationLinks.push(newerLink);
+  }
+
+  // Older/Next button
+  if (olderOffset < totalMessages) {
+    const olderLink = isOldNokia
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="2">2-Older</a>`
+      : `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="2">[2] Older</a>`;
+    navigationLinks.push(olderLink);
+  }
+
+  // Last button (only if not on last page)
+  if (offset < lastOffset) {
+    const lastLink = isOldNokia
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${lastOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="8">8-Last</a>`
+      : `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${lastOffset}&amp;search=${encodeURIComponent(
+          search
+        )}" accesskey="8">[8] Last</a>`;
+    navigationLinks.push(lastLink);
+  }
+
+  // Numeri di pagina (max 5 visibili: due prima, attuale, due dopo)
+  let pageNumbers = "";
+  const startPage = Math.max(1, currentPage - 2);
+  const endPage = Math.min(totalPages, currentPage + 2);
+
+  for (let p = startPage; p <= endPage; p++) {
+    if (p === currentPage) {
+      pageNumbers += `<b>[${p}]</b> `;
+    } else {
+      const offsetForPage = (p - 1) * limit;
+      pageNumbers += `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+        jid
+      )}&amp;offset=${offsetForPage}&amp;search=${encodeURIComponent(
+        search
+      )}">${p}</a> `;
+    }
+  }
+
+  // Bottoni First/Last e Prev/Next
+  const firstPage =
+    currentPage > 1
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=0&amp;search=${encodeURIComponent(search)}">[First]</a>`
+      : "";
+
+  const prevPage =
+    currentPage > 1
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(
+          search
+        )}">[Previous]</a>`
+      : "";
+
+  const nextPage =
+    currentPage < totalPages
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(
+          search
+        )}">[Next]</a>`
+      : "";
+
+  const lastPage =
+    currentPage < totalPages
+      ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;offset=${lastOffset}&amp;search=${encodeURIComponent(
+          search
+        )}">[Last]</a>`
+      : "";
+
+  // Sezione completa di navigazione
+  const navigationSection = `
+  <p>
+    ${firstPage} ${firstPage && prevPage ? "" : ""} ${prevPage}
+    ${pageNumbers}
+    ${nextPage} ${nextPage && lastPage ? "" : ""} ${lastPage}
+  </p>`;
+
+  // Search form adapted to device capability
+  const searchForm = isOldNokia
+    ? search
+      ? `<p>Search: ${escWml(
+          search
+        )}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}">Clear</a></p>`
+      : `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;search=prompt">Search</a></p>`
+    : `<p><b>Search Messages:</b></p>
+     <p>
+       <input name="searchQuery" title="Search..." value="${escWml(
+         search
+       )}" size="15" maxlength="50"/>
+       <do type="accept" label="Search">
+         <go href="/wml/chat.wml" method="get">
+           <postfield name="jid" value="${escWml(jid)}"/>
+           <postfield name="search" value="$(searchQuery)"/>
+           <postfield name="offset" value="0"/>
+         </go>
+       </do>
+     </p>
+     ${
+       search
+         ? `<p>Searching: <b>${escWml(
+             search
+           )}</b> | <a href="/wml/chat.wml?jid=${encodeURIComponent(
+             jid
+           )}">[Clear]</a></p>`
+         : ""
+     }`;
+
+  // Page info adapted to device
+  const pageInfo = isOldNokia
+    ? `<p>Page ${currentPage}/${totalPages}</p><p>Msgs ${offset + 1}-${Math.min(
+        offset + limit,
+        totalMessages
+      )}/${totalMessages}</p>`
+    : `<p><b>Page ${currentPage} of ${totalPages}</b></p>
+     <p><b>Messages ${offset + 1}-${Math.min(
+        offset + limit,
+        totalMessages
+      )} of ${totalMessages}</b></p>
+     <p>Showing 5 messages per page (most recent first)</p>`;
+
+  // Quick actions adapted to device
+  const quickActions = isOldNokia
+    ? `<p><a href="/wml/send.text.wml?to=${encodeURIComponent(
+        jid
+      )}" accesskey="1">1-Send</a></p>
+     <p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
+    : `<p><b>Quick Actions:</b></p>
+     <p>
+       <a href="/wml/send.text.wml?to=${encodeURIComponent(
+         jid
+       )}" accesskey="1">[1] Send Text</a> 
+       <a href="/wml/contact.wml?jid=${encodeURIComponent(
+         jid
+       )}" accesskey="4">[4] Contact Info</a>
+       ${
+         number && !isGroup
+           ? ` | <a href="wtai://wp/mc;${number}" accesskey="9">[9] Call</a>`
+           : ""
+       }
+       ${
+         number && !isGroup
+           ? ` | <a href="wtai://wp/ms;${number};">[SMS]</a>`
+           : ""
+       }
+     </p>
+     <p>
+       <a href="/wml/chats.wml" accesskey="0">[0] Back to Chats</a> |
+       <a href="/wml/home.wml" accesskey="*">[*] Home</a>
+     </p>`;
+
+  // Build final body
+  const chatTitle = isOldNokia
+    ? chatName.length > 15
+      ? chatName.substring(0, 15)
+      : chatName
+    : chatName;
+
+  const body = isOldNokia
+    ? `<p>${escWml(chatTitle)}</p>
+${pageInfo}
+${searchForm}
+${messageList}
+${navigationSection}
+${quickActions}`
+    : `<p><b>${escWml(chatTitle)}</b> ${isGroup ? "[GROUP]" : "[CHAT]"}</p>
+<p>${escWml(number)} | Total: ${totalMessages} messages</p>
+${searchForm}
+${pageInfo}
+${messageList}
+${navigationSection}
+${quickActions}`;
+
+  // Create WML output with appropriate DOCTYPE
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>
+<card id="chat" title="Chat">
+${body}
+<do type="accept" label="Send">
+  <go href="/wml/send.text.wml?to=${encodeURIComponent(jid)}"/>
+</do>
+<do type="options" label="Refresh">
+  <go href="/wml/chat.wml?jid=${encodeURIComponent(
+    jid
+  )}&amp;offset=${offset}&amp;search=${encodeURIComponent(search)}"/>
+</do>
+</card>
+</wml>`;
+
+  // Set appropriate headers
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
+  const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+  res.send(encodedBuffer);
+});
+// Route per visualizzare info media - WAP friendly come QR
+
+function encodeMultiByte(value) {
+  if (value < 128) {
+    return Buffer.from([value]);
+  }
+
+  const bytes = [];
+  let remaining = value;
+
+  // Encoding multi-byte WBMP standard
+  while (remaining >= 128) {
+    bytes.unshift(remaining & 0x7f);
+    remaining = remaining >> 7;
+  }
+  bytes.unshift(remaining | 0x80);
+
+  return Buffer.from(bytes);
+}
+
+function createWBMP(pixels, width, height) {
+  // Header WBMP standard
+  const typeField = Buffer.from([0x00]);
+  const fixHeader = Buffer.from([0x00]);
+  const widthBytes = encodeMultiByte(width);
+  const heightBytes = encodeMultiByte(height);
+
+  // Calcola dimensioni data
+  const bytesPerRow = Math.ceil(width / 8);
+  const dataSize = bytesPerRow * height;
+  const data = Buffer.alloc(dataSize, 0x00); // Inizializza a 0 (bianco)
+
+  // Converte pixel in 1-bit
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const pixelIndex = y * width + x;
+      const grayscale = pixels[pixelIndex]; // Già grayscale
+
+      // WBMP: 1 = nero, 0 = bianco
+      const isBlack = grayscale < 128;
+
+      if (isBlack) {
+        const byteIndex = y * bytesPerRow + Math.floor(x / 8);
+        const bitPosition = 7 - (x % 8);
+        data[byteIndex] |= 1 << bitPosition;
+      }
+    }
+  }
+
+  return Buffer.concat([typeField, fixHeader, widthBytes, heightBytes, data]);
+}
+
+app.get("/wml/audio-transcription.wml", async (req, res) => {
+  try {
+    const mid = req.query.mid || "";
+    const jid = req.query.jid || "";
+
+    // Trova il messaggio nella chat specifica
+    const messages = chatStore.get(jid) || [];
+    const targetMessage = messages.find((m) => m.key.id === mid);
+
+    if (!targetMessage) {
+      sendWml(
+        res,
+        resultCard(
+          "Errore",
+          ["Messaggio non trovato"],
+          `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=15`
+        )
+      );
+      return;
+    }
+
+    // Verifica che sia un messaggio audio
+    if (!targetMessage.message?.audioMessage) {
+      sendWml(
+        res,
+        resultCard(
+          "Errore",
+          ["Questo messaggio non contiene un audio"],
+          `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=15`
+        )
+      );
+      return;
+    }
+
+    const contact = contactStore.get(jid);
+    const chatName = contact?.name || contact?.notify || jidFriendly(jid);
+    const aud = targetMessage.message.audioMessage;
+    const duration = aud.seconds || 0;
+    const size = Math.round((aud.fileLength || 0) / 1024);
+
+    // Prepara la trascrizione
+    let transcriptionText = "";
+    let transcriptionStatus = "";
+
+    if (targetMessage.transcription) {
+      if (targetMessage.transcription === "[Trascrizione fallita]") {
+        transcriptionStatus = "❌ Trascrizione fallita";
+        transcriptionText =
+          "Non è stato possibile trascrivere questo messaggio audio.";
+      } else if (
+        targetMessage.transcription ===
+        "[Audio troppo lungo per la trascrizione]"
+      ) {
+        transcriptionStatus = "⚠️ Audio troppo lungo";
+        transcriptionText =
+          "Questo messaggio audio supera i 10MB e non può essere trascritto.";
+      } else {
+        transcriptionStatus = "✅ Trascrizione completata";
+        transcriptionText = targetMessage.transcription;
+      }
+    } else {
+      transcriptionStatus = "⏳ In elaborazione";
+      transcriptionText = "La trascrizione è in corso...";
+    }
+
+    const body = `
+      <p><b>Trascrizione Messaggio Audio</b></p>
+      
+      <p><b>Da:</b> ${esc(chatName)}</p>
+      <p><b>Durata:</b> ${duration} secondi</p>
+      <p><b>Dimensione:</b> ${size}KB</p>
+      <p><b>Stato:</b> ${transcriptionStatus}</p>
+      
+      <p><b>Trascrizione:</b></p>
+      <p>${esc(transcriptionText)}</p>
+      
+      <p><b>Azioni:</b></p>
+      <p>
+       
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}&amp;limit=15" accesskey="0">[0] Torna alla Chat</a>
+      </p>
+      
+      <do type="accept" label="Ascolta">
+        <go href="/wml/media/${encodeURIComponent(mid)}.wav"/>
+      </do>
+      <do type="options" label="Indietro">
+        <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=15"/>
+      </do>
+    `;
+
+    sendWml(res, card("audio-transcription", "Trascrizione Audio", body));
+  } catch (error) {
+    logger.error("Audio transcription page error:", error);
+    sendWml(
+      res,
+      resultCard(
+        "Errore",
+        [error.message || "Errore durante il caricamento della trascrizione"],
+        "/wml/home.wml"
+      )
+    );
+  }
+});
+
+app.get("/wml/media/:filename", async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const messageId = filename.split(".")[0];
+    const forceWbmp = filename.endsWith(".wbmp");
+
+    // Debug logging
+    console.log(`Richiesta media: ${filename}, WBMP: ${forceWbmp}`);
+
+    // Find message in all chats
+    let targetMessage = null;
+
+    for (const [jid, messages] of chatStore.entries()) {
+      const found = messages.find(
+        (m) => m.key.id === decodeURIComponent(messageId)
+      );
+      if (found) {
+        targetMessage = found;
+        break;
+      }
+    }
+
+    if (!targetMessage || !sock) {
+      console.log("Messaggio non trovato o sock non disponibile");
+      res.status(404).send("Media not found");
+      return;
+    }
+
+    // Download media
+    let mediaData = null;
+    let mimeType = "application/octet-stream";
+    let filename_out = filename;
+    let isImage = false;
+
+    if (targetMessage.message?.imageMessage) {
+      mediaData = await downloadMediaMessage(
+        targetMessage,
+        "buffer",
+        {},
+        {
+          logger,
+          reuploadRequest: sock.updateMediaMessage,
+        }
+      );
+      mimeType = forceWbmp ? "image/vnd.wap.wbmp" : "image/jpeg";
+      filename_out = forceWbmp
+        ? `image_${messageId}.wbmp`
+        : `image_${messageId}.jpg`;
+      isImage = true;
+    } else if (targetMessage.message?.stickerMessage) {
+      mediaData = await downloadMediaMessage(
+        targetMessage,
+        "buffer",
+        {},
+        {
+          logger,
+          reuploadRequest: sock.updateMediaMessage,
+        }
+      );
+      mimeType = forceWbmp ? "image/vnd.wap.wbmp" : "image/jpeg";
+      filename_out = forceWbmp
+        ? `sticker_${messageId}.wbmp`
+        : `sticker_${messageId}.jpg`;
+      isImage = true;
+    } else if (targetMessage.message?.documentMessage) {
+      const doc = targetMessage.message.documentMessage;
+      mediaData = await downloadMediaMessage(
+        targetMessage,
+        "buffer",
+        {},
+        {
+          logger,
+          reuploadRequest: sock.updateMediaMessage,
+        }
+      );
+
+      if (doc.mimetype && doc.mimetype.startsWith("image/")) {
+        isImage = true;
+        mimeType = forceWbmp ? "image/vnd.wap.wbmp" : "image/jpeg";
+        filename_out = forceWbmp
+          ? `doc_${messageId}.wbmp`
+          : `doc_${messageId}.jpg`;
+      } else {
+        mimeType = doc.mimetype || "application/octet-stream";
+        filename_out = doc.fileName || `document_${messageId}.bin`;
+      }
+    }
+
+    if (!mediaData) {
+      console.log("Impossibile scaricare il media");
+      res.status(404).send("Could not download media");
+      return;
+    }
+
+    console.log(
+      `Media scaricato, dimensione: ${mediaData.length} bytes, isImage: ${isImage}`
+    );
+
+    // Processa le immagini
+    if (isImage) {
+      try {
+        const maxSizeBytes = 35 * 1024; // 35KB limit
+
+        if (forceWbmp) {
+          console.log("Conversione a WBMP per dispositivi WAP...");
+
+          // Ottieni metadata dell'immagine originale per controllo dimensioni
+          const originalMetadata = await sharp(mediaData).metadata();
+          console.log(
+            `Immagine originale: ${originalMetadata.width}x${originalMetadata.height}`
+          );
+
+          // Calcola dimensioni ottimali per dispositivi WAP - PIÙ LARGHE
+          const maxWidth = 240; // Larghezza aumentata per schermi più grandi
+          const maxHeight = 280; // Altezza aumentata per massima visibilità
+
+          let targetWidth = originalMetadata.width;
+          let targetHeight = originalMetadata.height;
+
+          // Se l'immagine è troppo grande, ridimensiona mantenendo proporzioni
+          if (targetWidth > maxWidth || targetHeight > maxHeight) {
+            const widthRatio = maxWidth / targetWidth;
+            const heightRatio = maxHeight / targetHeight;
+            const ratio = Math.min(widthRatio, heightRatio);
+
+            targetWidth = Math.round(targetWidth * ratio);
+            targetHeight = Math.round(targetHeight * ratio);
+            console.log(
+              `Ridimensionando a ${targetWidth}x${targetHeight} per compatibilità WAP estesa`
+            );
+          }
+
+          // Processamento pre-resize per preservare i dettagli
+          let processedImage = sharp(mediaData)
+            .linear(1.2, -(128 * 0.2)) // Aumenta contrasto lineare
+            .modulate({
+              brightness: 1.05,
+              saturation: 0.8,
+              hue: 0,
+            });
+
+          // Applica resize solo se necessario
+          if (
+            targetWidth !== originalMetadata.width ||
+            targetHeight !== originalMetadata.height
+          ) {
+            processedImage = processedImage.resize(targetWidth, targetHeight, {
+              kernel: sharp.kernel.lanczos3,
+              fit: "contain",
+              position: "center",
+              background: { r: 255, g: 255, b: 255, alpha: 1 },
+            });
+          }
+
+          // Converti in grayscale con altissima qualità
+          const { data: pixels, info } = await processedImage
+            .greyscale()
+            .linear(1.3, -30) // Contrasto aggressivo pre-normalizzazione
+            .normalise({
+              lower: 1, // Percentile inferiore per bianco puro
+              upper: 99, // Percentile superiore per nero puro
+            })
+            .sharpen({
+              sigma: 1.5, // Raggio sharpening
+              flat: 2, // Soglia flat areas
+              jagged: 3, // Soglia jagged areas
+            })
+            .threshold(128, {
+              greyscale: true,
+              grayscale: true,
+            }) // Soglia ottimale per bianco/nero
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+
+          console.log(
+            `Pixel estratti: ${pixels.length}, dimensioni finali: ${info.width}x${info.height}`
+          );
+
+          // Crea WBMP con dimensioni ottimizzate per WAP
+          mediaData = createWBMP(pixels, info.width, info.height);
+          console.log(
+            `WBMP esteso per WAP ${info.width}x${info.height} creato, dimensione finale: ${mediaData.length} bytes`
+          );
+        } else {
+          console.log("Conversione a JPEG...");
+          let quality = 80;
+
+          do {
+            mediaData = await sharp(mediaData).jpeg({ quality }).toBuffer();
+
+            console.log(
+              `JPEG creato, dimensione: ${mediaData.length} bytes (limite: ${maxSizeBytes})`
+            );
+
+            // Se troppo grande, riduci solo la qualità
+            if (mediaData.length > maxSizeBytes) {
+              if (quality > 10) {
+                quality = Math.max(10, quality - 10);
+                console.log(`Riducendo qualità a ${quality}%`);
+              } else {
+                console.log(
+                  `Qualità minima raggiunta (${quality}%), dimensione finale: ${mediaData.length} bytes`
+                );
+                break; // Cannot reduce quality further
+              }
+            } else {
+              console.log(
+                `JPEG ottimizzato con successo: ${mediaData.length} bytes`
+              );
+              break;
+            }
+          } while (mediaData.length > maxSizeBytes && quality >= 10);
+        }
+
+        // Controllo finale dimensione
+        if (mediaData.length > maxSizeBytes) {
+          console.log(
+            `ATTENZIONE: File ancora sopra il limite: ${mediaData.length} bytes (max: ${maxSizeBytes})`
+          );
+        }
+      } catch (conversionError) {
+        console.error("Errore conversione immagine:", conversionError);
+        // Continua con l'immagine originale
+      }
+    }
+
+    // Controllo finale per tutti i file (anche non-immagini)
+    const maxSizeBytes = 35 * 1024; // 35KB limit
+    if (mediaData.length > maxSizeBytes) {
+      console.log(
+        `ATTENZIONE: File troppo grande: ${mediaData.length} bytes (max: ${maxSizeBytes})`
+      );
+      // Opzionalmente potresti ritornare un errore:
+      // res.status(413).send('File too large')
+      // return
+    }
+
+    // Headers
+    if (forceWbmp && isImage) {
+      console.log("Invio come WBMP");
+      // Headers WAP semplificati
+      res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+      res.setHeader("Content-Length", mediaData.length);
+      res.setHeader("Cache-Control", "no-cache"); // Disabilita cache per debug
+    } else if (isImage) {
+      console.log("Invio come JPEG");
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Content-Length", mediaData.length);
+      res.setHeader("Cache-Control", "no-cache");
+    } else {
+      console.log("Invio come download");
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename_out}"`
+      );
+      res.setHeader("Content-Length", mediaData.length);
+    }
+
+    console.log(
+      `Invio risposta: ${mediaData.length} bytes, Content-Type: ${res.getHeader(
+        "Content-Type"
+      )}`
+    );
+    res.send(mediaData);
+  } catch (error) {
+    console.error("Errore generale:", error);
+    res.status(500).send("Internal Server Error");
+  }
+});
+// Route esistente modificata per includere link alla pagina WBMP dedicata
+app.get("/wml/media-info.wml", async (req, res) => {
+  try {
+    const messageId = req.query.mid || "";
+    const jid = req.query.jid || "";
+
+    // Find message in the specific chat
+    const messages = chatStore.get(jid) || [];
+    const targetMessage = messages.find((m) => m.key.id === messageId);
+
+    const contact = contactStore.get(jid);
+    const chatName = contact?.name || contact?.notify || jidFriendly(jid);
+
+    // Simple escaping
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    const body = targetMessage
+      ? (() => {
+          if (targetMessage.message?.imageMessage) {
+            const img = targetMessage.message.imageMessage;
+            const size = Math.round((img.fileLength || 0) / 1024);
+            const caption = img.caption
+              ? `<p><b>Caption:</b> ${esc(img.caption)}</p>`
+              : "";
+
+            return `<p><b>Image Message</b></p>
+<p>From: ${esc(chatName)}</p>
+<p>Size: ${size}KB</p>
+<p>Type: ${img.mimetype || "image/jpeg"}</p>
+${caption}
+<p><b>Nokia Compatible:</b></p>
+<p>
+<a href="/wml/media/${encodeURIComponent(messageId)}.jpg">[Small JPG]</a> 
+<a href="/wml/media/${encodeURIComponent(messageId)}.png">[Small PNG]</a> 
+<a href="/wml/view-wbmp.wml?mid=${encodeURIComponent(
+              messageId
+            )}&amp;jid=${encodeURIComponent(jid)}">[WBMP View]</a>
+</p>
+`;
+          } else if (targetMessage.message?.videoMessage) {
+            const vid = targetMessage.message.videoMessage;
+            const size = Math.round((vid.fileLength || 0) / 1024);
+            const duration = vid.seconds || 0;
+            const caption = vid.caption
+              ? `<p><b>Caption:</b> ${esc(vid.caption)}</p>`
+              : "";
+
+            return `<p><b>Video Message</b></p>
+<p>From: ${esc(chatName)}</p>
+<p>Size: ${size}KB | Duration: ${duration}s</p>
+<p>Type: ${vid.mimetype || "video/mp4"}</p>
+${caption}
+<p><b>Mobile Compatible:</b></p>
+<p>
+<a href="/wml/media/${encodeURIComponent(messageId)}.3gp">[3GP]</a> 
+<a href="/wml/media/${encodeURIComponent(messageId)}.avi">[AVI]</a>
+</p>
+<p><b>Full Quality:</b></p>
+<p>
+<a href="/wml/media/${encodeURIComponent(
+              messageId
+            )}.original.mp4">[Original MP4]</a> 
+<a href="/wml/media/${encodeURIComponent(messageId)}.original.webm">[WEBM]</a>
+</p>`;
+          } // Nel blocco che gestisce i messaggi audio, aggiungi questo:
+          else if (targetMessage.message?.audioMessage) {
+            const aud = targetMessage.message.audioMessage;
+            const size = Math.round((aud.fileLength || 0) / 1024);
+            const duration = aud.seconds || 0;
+
+            body = `<p><b>Audio Message</b></p>
+    <p>From: ${esc(chatName)}</p>
+    <p>Size: ${size}KB | Duration: ${duration}s</p>
+    <p>Type: ${aud.mimetype || "audio/ogg"}</p>
+    
+    ${
+      targetMessage.transcription &&
+      targetMessage.transcription !== "[Trascrizione fallita]" &&
+      targetMessage.transcription !== "[Audio troppo lungo per la trascrizione]"
+        ? `<p><b>Trascrizione disponibile:</b></p>
+      <p><a href="/wml/audio-transcription.wml?mid=${encodeURIComponent(
+        messageId
+      )}&amp;jid=${encodeURIComponent(
+            jid
+          )}" accesskey="4">[4] View Transcription</a></p>`
+        : ""
+    }
+    
+    <p><b>Download Options:</b></p>
+    <p>
+      <a href="/wml/media/${encodeURIComponent(
+        messageId
+      )}.wav" accesskey="5">[5] Download WAV</a> |
+      <a href="/wml/media/${encodeURIComponent(
+        messageId
+      )}.ogg" accesskey="6">[6] Download OGG</a>
+    </p>`;
+          } else if (targetMessage.message?.documentMessage) {
+            const doc = targetMessage.message.documentMessage;
+            const size = Math.round((doc.fileLength || 0) / 1024);
+            const filename = doc.fileName || "document";
+            const ext = filename.split(".").pop() || "bin";
+
+            return `<p><b>Document</b></p>
+<p>From: ${esc(chatName)}</p>
+<p>Name: ${esc(filename)}</p>
+<p>Size: ${size}KB</p>
+<p>Type: ${doc.mimetype || "unknown"}</p>
+<p><b>Download Options:</b></p>
+<p>
+<a href="/wml/media/${encodeURIComponent(messageId)}.${ext}">[Original]</a> 
+<a href="/wml/media-text/${encodeURIComponent(messageId)}">[Text View]</a>
+</p>`;
+          } else if (targetMessage.message?.stickerMessage) {
+            const sticker = targetMessage.message.stickerMessage;
+            const size = Math.round((sticker.fileLength || 0) / 1024);
+
+            return `<p><b>Sticker</b></p>
+<p>From: ${esc(chatName)}</p>
+<p>Size: ${size}KB</p>
+<p>Type: image/webp</p>
+<p><b>Nokia Compatible:</b></p>
+<p>
+<a href="/wml/view-wbmp.wml?mid=${encodeURIComponent(
+              messageId
+            )}&amp;jid=${encodeURIComponent(jid)}">[WBMP View]</a> 
+<a href="/wml/media/${encodeURIComponent(messageId)}.jpg">[Small JPG]</a>
+</p>
+<p><b>Other Formats:</b></p>
+<p>
+<a href="/wml/media/${encodeURIComponent(
+              messageId
+            )}.original.webp">[Original WEBP]</a> 
+<a href="/wml/media/${encodeURIComponent(messageId)}.png">[PNG]</a>
+</p>`;
+          }
+
+          return "<p><b>Unknown Media Type</b></p>";
+        })()
+      : `<p><b>Media Not Found</b></p>
+<p>Message may have been deleted</p>
+<p>Please try refreshing the chat</p>`;
+
+    const body_full = `${body}
+<p>
+<a href="/wml/chat.wml?jid=${encodeURIComponent(
+      jid
+    )}" accesskey="0">[0] Back to Chat</a> 
+<a href="/wml/chats.wml" accesskey="9">[9] All Chats</a>
+</p>
+<do type="accept" label="Back">
+<go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}"/>
+</do>
+<do type="options" label="Refresh">
+<go href="/wml/media-info.wml?mid=${encodeURIComponent(
+      messageId
+    )}&amp;jid=${encodeURIComponent(jid)}"/>
+</do>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>
+<card id="media" title="Media Info">
+${body_full}
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("Media info error:", error);
+    res.status(500).send("Error loading media info");
+  }
+});
+
+function messageText(msg) {
+  try {
+    const c = extractMessageContent(msg?.message);
+    if (!c) return "[unsupported]";
+
+    if (c.conversation) return c.conversation;
+    if (c.extendedTextMessage?.text) return c.extendedTextMessage.text;
+
+    if (c.audioMessage) {
+      const duration = c.audioMessage.seconds || 0;
+      const transcription = msg.transcription || "";
+
+      let result = `[AUDIO ${duration}s]`;
+
+      // Aggiungi un'icona se la trascrizione è disponibile
+      if (
+        transcription &&
+        transcription !== "[Trascrizione fallita]" &&
+        transcription !== "[Audio troppo lungo per la trascrizione]"
+      ) {
+        result += " 📝";
+      }
+
+      return result;
+    }
+
+    // ... resto del codice esistente per altri tipi di messaggi
+  } catch {
+    return "[unknown]";
+  }
+}
+
+// Nuova route per visualizzare WBMP in una pagina WAP dedicata
+app.get("/wml/view-wbmp.wml", async (req, res) => {
+  try {
+    const messageId = req.query.mid || "";
+    const jid = req.query.jid || "";
+
+    // Find message in the specific chat
+    const messages = chatStore.get(jid) || [];
+    const targetMessage = messages.find((m) => m.key.id === messageId);
+
+    const contact = contactStore.get(jid);
+    const chatName = contact?.name || contact?.notify || jidFriendly(jid);
+
+    // Simple escaping
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    let body = "";
+    let title = "WBMP Image";
+
+    if (targetMessage) {
+      const isImage = targetMessage.message?.imageMessage;
+      const isSticker = targetMessage.message?.stickerMessage;
+
+      if (isImage || isSticker) {
+        const mediaObj = isImage
+          ? targetMessage.message.imageMessage
+          : targetMessage.message.stickerMessage;
+        const size = Math.round((mediaObj.fileLength || 0) / 1024);
+        const caption = mediaObj.caption
+          ? `<p><b>Caption:</b> ${esc(mediaObj.caption)}</p>`
+          : "";
+
+        title = isImage ? "Image (WBMP)" : "Sticker (WBMP)";
+
+        body = `<p><b>${isImage ? "Image" : "Sticker"}</b></p>
+<p>From: ${esc(chatName)}</p>
+<p>Size: ${size}KB</p>
+${caption}
+<p>
+<img src="/wml/media/${encodeURIComponent(messageId)}.wbmp" alt="WBMP Image"/>
+</p>
+<p>
+<a href="/wml/media-info.wml?mid=${encodeURIComponent(
+          messageId
+        )}&amp;jid=${encodeURIComponent(
+          jid
+        )}" accesskey="0">[0] Back to Media Info</a>
+</p>
+<p>
+<a href="/wml/chat.wml?jid=${encodeURIComponent(
+          jid
+        )}" accesskey="1">[1] Back to Chat</a> |
+<a href="/wml/chats.wml" accesskey="9">[9] All Chats</a>
+</p>`;
+      } else {
+        body = `<p><b>Not an Image</b></p>
+<p>This message does not contain an image or sticker</p>
+<p>
+<a href="/wml/media-info.wml?mid=${encodeURIComponent(
+          messageId
+        )}&amp;jid=${encodeURIComponent(
+          jid
+        )}" accesskey="0">[0] Back to Media Info</a>
+</p>`;
+      }
+    } else {
+      body = `<p><b>Media Not Found</b></p>
+<p>Message may have been deleted</p>
+<p>
+<a href="/wml/chats.wml" accesskey="9">[9] All Chats</a>
+</p>`;
+    }
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>
+<card id="wbmp" title="${title}">
+${body}
+<do type="accept" label="Back">
+<go href="/wml/media-info.wml?mid=${encodeURIComponent(
+      messageId
+    )}&amp;jid=${encodeURIComponent(jid)}"/>
+</do>
+<do type="options" label="Chat">
+<go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}"/>
+</do>
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("WBMP view error:", error);
+    res.status(500).send("Error loading WBMP view");
+  }
+});
+
+/*
+app.get('/wml/chat.wml', async (req, res) => {
+  const userAgent = req.headers['user-agent'] || ''
+  const isOldNokia = /Nokia|Series40|MAUI|UP\.Browser/i.test(userAgent)
+  
+  const raw = req.query.jid || ''
+  const jid = formatJid(raw)
+  const offset = Math.max(0, parseInt(req.query.offset || '0'))
+  const search = (req.query.search || '').trim().toLowerCase()
+  
+  // Very small limits for Nokia 7210
+  const limit = isOldNokia ? 3 : 10
+  
+  // Load chat history if missing
+  if ((!chatStore.get(jid) || chatStore.get(jid).length === 0) && sock) {
+    try {
+      await loadChatHistory(jid, limit * 3)
+    } catch (e) {
+      logger.warn(`Failed to load chat history for ${jid}: ${e.message}`)
+    }
+  }
+  
+  let allMessages = (chatStore.get(jid) || []).slice()
+  
+  // Sort by timestamp - MOST RECENT FIRST
+  allMessages.sort((a, b) => {
+    const tsA = Number(a.messageTimestamp) || 0
+    const tsB = Number(b.messageTimestamp) || 0
+    return tsB - tsA // Most recent first
+  })
+  
+  // Apply search filter if present
+  if (search) {
+    allMessages = allMessages.filter(m => (messageText(m) || '').toLowerCase().includes(search))
+  }
+  
+  const total = allMessages.length
+  const items = allMessages.slice(offset, offset + limit)
+  
+  const contact = contactStore.get(jid)
+  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
+  const number = jidFriendly(jid)
+  const isGroup = jid.endsWith('@g.us')
+  
+  // Simple escaping for Nokia 7210
+  const esc = text => (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  
+  // Simple truncate
+  const truncate = (text, maxLength) => {
+    if (!text) return ''
+    if (text.length <= maxLength) return text
+    return text.substring(0, maxLength - 3) + '...'
+  }
+  
+  // Simple timestamp for Nokia
+  const formatTime = (timestamp) => {
+    const date = new Date(Number(timestamp) * 1000)
+    if (isNaN(date.getTime())) return ''
+    
+    const day = date.getDate().toString().padStart(2, '0')
+    const month = (date.getMonth() + 1).toString().padStart(2, '0')
+    const hours = date.getHours().toString().padStart(2, '0')
+    const mins = date.getMinutes().toString().padStart(2, '0')
+    
+    return `${day}/${month} ${hours}:${mins}`
+  }
+  
+  let messageList = ''
+  
+  if (items.length === 0) {
+    messageList = '<p>No messages</p>'
+  } else {
+    messageList = items.map((m, idx) => {
+      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
+      const time = formatTime(m.messageTimestamp)
+      const msgNumber = idx + 1
+      const mid = m.key.id
+      
+      // Handle different message types for Nokia
+      let text = ''
+      let mediaLink = ''
+      
+      if (m.message) {
+        if (m.message.imageMessage) {
+          const img = m.message.imageMessage
+          const size = Math.round((img.fileLength || 0) / 1024)
+          text = `[IMG ${size}KB]`
+          if (img.caption) text += ` ${truncate(img.caption, 30)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`
+          
+        } else if (m.message.videoMessage) {
+          const vid = m.message.videoMessage
+          const size = Math.round((vid.fileLength || 0) / 1024)
+          text = `[VID ${size}KB]`
+          if (vid.caption) text += ` ${truncate(vid.caption, 30)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`
+          
+        } else if (m.message.audioMessage) {
+          const aud = m.message.audioMessage
+          const size = Math.round((aud.fileLength || 0) / 1024)
+          const duration = aud.seconds || 0
+          text = `[AUD ${size}KB ${duration}s]`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View AUD]</a>`
+          
+        } else if (m.message.documentMessage) {
+          const doc = m.message.documentMessage
+          const size = Math.round((doc.fileLength || 0) / 1024)
+          const filename = doc.fileName || 'file'
+          text = `[DOC ${size}KB] ${truncate(filename, 20)}`
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`
+          
+        } else if (m.message.stickerMessage) {
+          text = '[STICKER]'
+          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`
+          
+        } else {
+          text = truncate(messageText(m) || '', 50)
+        }
+      } else {
+        text = truncate(messageText(m) || '', 50)
+      }
+      
+      return `<p>${msgNumber}. ${esc(who)} (${time})<br/>${esc(text)}${mediaLink}</p>`
+    }).join('')
+  }
+  
+  // Simple navigation for Nokia
+  const olderOffset = offset + limit
+  const olderLink = olderOffset < total ? 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">2-Older</a></p>` : ''
+  
+  const newerOffset = Math.max(0, offset - limit)
+  const newerLink = offset > 0 ? 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">3-Newer</a></p>` : ''
+  
+  // Simple search for Nokia
+  const searchBox = search ? 
+    `<p>Search: ${esc(search)}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">Clear</a></p>` : 
+    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;search=prompt">Search</a></p>`
+  
+  const body = `<p>${esc(chatName.length > 15 ? chatName.substring(0, 15) : chatName)}</p>
+<p>Msgs ${offset + 1}-${Math.min(offset + limit, total)}/${total}</p>
+${searchBox}
+${messageList}
+${newerLink}
+${olderLink}
+<p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">1-Send</a></p>
+<p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
+  
+  // Nokia 7210 compatible WML 1.1
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>
+<card id="chat" title="Chat">
+${body}
+</card>
+</wml>`
+  
+  // Nokia 7210 headers
+  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=iso-8859-1')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Pragma', 'no-cache')
+  
+  const encodedBuffer = iconv.encode(wmlOutput, 'iso-8859-1')
+  res.send(encodedBuffer)
+})*/
+// Enhanced Message Actions page
+app.get("/wml/msg.wml", (req, res) => {
+  const mid = String(req.query.mid || "");
+  const jid = formatJid(req.query.jid || "");
+
+  // Find message in the specific chat (using our new system)
+  const messages = chatStore.get(jid) || [];
+  const msg = messages.find((m) => m.key.id === mid);
+
+  if (!msg) {
+    sendWml(
+      res,
+      resultCard(
+        "Message",
+        ["Message not found"],
+        `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=15`
+      )
+    );
+    return;
+  }
+
+  const text = truncate(messageText(msg), 150);
+  const ts = new Date(Number(msg.messageTimestamp) * 1000).toLocaleString();
+
+  // Enhanced media detection
+  let mediaInfo = "";
+  let mediaActions = "";
+  let hasMedia = false;
+  let transcriptionInfo = "";
+  let transcriptionActions = "";
+
+  if (msg.message) {
+    if (msg.message.imageMessage) {
+      const img = msg.message.imageMessage;
+      const size = Math.round((img.fileLength || 0) / 1024);
+      mediaInfo = `<p><small>Type: Image (${size}KB)</small></p>`;
+      mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(
+        jid
+      )}" accesskey="4">[4] View Image</a><br/>
+      <a href="/wml/media/${encodeURIComponent(
+        mid
+      )}.jpg" accesskey="5">[5] Download JPG</a><br/>`;
+      hasMedia = true;
+    } else if (msg.message.videoMessage) {
+      const vid = msg.message.videoMessage;
+      const size = Math.round((vid.fileLength || 0) / 1024);
+      const duration = vid.seconds || 0;
+      mediaInfo = `<p><small>Type: Video (${size}KB, ${duration}s)</small></p>`;
+      mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(
+        jid
+      )}" accesskey="4">[4] View Video</a><br/>
+      <a href="/wml/media/${encodeURIComponent(
+        mid
+      )}.mp4" accesskey="5">[5] Download MP4</a><br/>`;
+      hasMedia = true;
+    } else if (msg.message.audioMessage) {
+      const aud = msg.message.audioMessage;
+      const size = Math.round((aud.fileLength || 0) / 1024);
+      const duration = aud.seconds || 0;
+
+      mediaInfo = `<p><small>Type: Audio (${size}KB, ${duration}s)</small></p>`;
+
+      hasMedia = true;
+
+      // Gestione trascrizione
+      if (msg.transcription) {
+        if (msg.transcription === "[Trascrizione fallita]") {
+          transcriptionInfo = `<p><small>Trascrizione: Fallita</small></p>`;
+        } else if (
+          msg.transcription === "[Audio troppo lungo per la trascrizione]"
+        ) {
+          transcriptionInfo = `<p><small>Trascrizione: Audio troppo lungo</small></p>`;
+        } else {
+          transcriptionInfo = `<p><small>Trascrizione: Disponibile</small></p>`;
+          transcriptionActions = `<a href="/wml/audio-transcription.wml?mid=${encodeURIComponent(
+            mid
+          )}&amp;jid=${encodeURIComponent(
+            jid
+          )}" accesskey="6">[6] View Transcription</a><br/>`;
+        }
+      } else {
+        transcriptionInfo = `<p><small>Trascrizione: In elaborazione...</small></p>`;
+      }
+    } else if (msg.message.documentMessage) {
+      const doc = msg.message.documentMessage;
+      const size = Math.round((doc.fileLength || 0) / 1024);
+      const filename = doc.fileName || "document";
+      mediaInfo = `<p><small>Type: Document (${size}KB)</small></p>
+      <p><small>File: ${esc(filename)}</small></p>`;
+      const ext = filename.split(".").pop() || "bin";
+      mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(
+        jid
+      )}" accesskey="4">[4] View Document</a><br/>
+      <a href="/wml/media/${encodeURIComponent(
+        mid
+      )}.${ext}" accesskey="5">[5] Download File</a><br/>`;
+      hasMedia = true;
+    } else if (msg.message.stickerMessage) {
+      const sticker = msg.message.stickerMessage;
+      const size = Math.round((sticker.fileLength || 0) / 1024);
+      mediaInfo = `<p><small>Type: Sticker (${size}KB)</small></p>`;
+      mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(
+        jid
+      )}" accesskey="4">[4] View Sticker</a><br/>
+      <a href="/wml/media/${encodeURIComponent(
+        mid
+      )}.webp" accesskey="5">[5] Download Sticker</a><br/>`;
+      hasMedia = true;
+    }
+  }
+
+  const body = `
+    <p><b>Message Details</b></p>
+    <p>${esc(text)}</p>
+    <p><small>Time: ${ts}</small></p>
+    <p><small>From: ${msg.key.fromMe ? "Me" : "Them"}</small></p>
+    ${mediaInfo}
+    ${transcriptionInfo}
+    
+    <p><b>Actions:</b></p>
+    <p>
+      <a href="/wml/msg.reply.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(jid)}" accesskey="1">[1] Reply</a><br/>
+      <a href="/wml/msg.react.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(jid)}" accesskey="2">[2] React</a><br/>
+      <a href="/wml/msg.forward.wml?mid=${encodeURIComponent(
+        mid
+      )}" accesskey="3">[3] Forward</a><br/>
+      ${mediaActions}
+      ${transcriptionActions}
+      <a href="/wml/msg.delete.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(jid)}" accesskey="7">[7] Delete</a><br/>
+      <a href="/wml/msg.read.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(
+    jid
+  )}" accesskey="8">[8] Mark Read</a><br/>
+    </p>
+    
+    <p><a href="/wml/chat.wml?jid=${encodeURIComponent(
+      jid
+    )}&amp;limit=15" accesskey="0">[0] Back to Chat</a></p>
+    
+    <do type="accept" label="Reply">
+      <go href="/wml/msg.reply.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(jid)}"/>
+    </do>
+    ${
+      hasMedia || transcriptionActions
+        ? `<do type="options" label="Media">
+      <go href="/wml/media-info.wml?mid=${encodeURIComponent(
+        mid
+      )}&amp;jid=${encodeURIComponent(jid)}"/>
+    </do>`
+        : ""
+    }
+  `;
+
+  sendWml(res, card("msg", "Message", body));
+});
+app.get("/wml/send-menu.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+  const search = (req.query.search || "").toLowerCase();
+  const page = parseInt(req.query.page || "1", 10);
+  const pageSize = 5;
+  const contact = to
+    ? contactStore.get?.(formatJid(to)) || contactStore[formatJid(to)]
+    : null;
+  const contactName = contact?.name || contact?.notify || jidFriendly(to) || "";
+
+  // Recupera contatti in array
+  let contactsArray = [];
+  if (contactStore instanceof Map)
+    contactsArray = Array.from(contactStore.values());
+  else contactsArray = Object.values(contactStore);
+
+  // Filtra contatti per ricerca
+  const filteredContacts = contactsArray.filter(
+    (c) => !search || (c.name || c.notify || "").toLowerCase().includes(search)
+  );
+
+  const totalPages = Math.ceil(filteredContacts.length / pageSize);
+  const currentPage = Math.min(Math.max(page, 1), totalPages || 1);
+  const start = (currentPage - 1) * pageSize;
+  const pageContacts = filteredContacts.slice(start, start + pageSize);
+
+  // Debug: verifica i contatti
+  console.log("Total contacts:", contactsArray.length);
+  console.log("Filtered contacts:", filteredContacts.length);
+  console.log("Page contacts:", pageContacts.length);
+  console.log("Sample contact:", pageContacts[0]);
+
+  const selectOptions = pageContacts
+    .map((c) => {
+      const displayName = c.name || c.notify || jidFriendly(c.jid) || c.jid;
+      const jidValue = c.jid || c.id || "";
+      console.log("Contact option:", displayName, "->", jidValue);
+      return `<option value="${esc(jidValue)}"${
+        jidValue === to ? ' selected="selected"' : ""
+      }>${esc(displayName)}</option>`;
+    })
+    .join("");
+
+  // Costruisci paginazione "max 5 numeri" con First / Last / Back / Next
+  let pagination = "";
+  if (totalPages > 1) {
+    pagination += "<p>";
+    // First
+    if (currentPage > 1) {
+      pagination += `<a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}&amp;search=${encodeURIComponent(search)}&amp;page=1">First</a> `;
+      pagination += `<a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}&amp;search=${encodeURIComponent(search)}&amp;page=${
+        currentPage - 1
+      }">Back</a> `;
+    }
+    // Calcola range di 5 numeri centrati sulla pagina corrente
+    let startPage = Math.max(1, currentPage - 2);
+    let endPage = Math.min(totalPages, startPage + 4);
+    if (endPage - startPage < 4) startPage = Math.max(1, endPage - 4);
+    for (let i = startPage; i <= endPage; i++) {
+      if (i === currentPage) pagination += `<b>${i}</b> `;
+      else
+        pagination += `<a href="/wml/send-menu.wml?to=${encodeURIComponent(
+          to
+        )}&amp;search=${encodeURIComponent(search)}&amp;page=${i}">${i}</a> `;
+    }
+    // Next / Last
+    if (currentPage < totalPages) {
+      pagination += `<a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}&amp;search=${encodeURIComponent(search)}&amp;page=${
+        currentPage + 1
+      }">Next</a> `;
+      pagination += `<a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}&amp;search=${encodeURIComponent(
+        search
+      )}&amp;page=${totalPages}">Last</a>`;
+    }
+    pagination += "</p>";
+  }
+
+  const body = `
+    <p><b>Send Message</b></p>
+    ${to ? `<p>To: <b>${esc(contactName)}</b></p>` : ""}
+    <p>Search contacts:</p>
+    <input name="search" value="${esc(
+      req.query.search || ""
+    )}" size="15" iname="search"/>
+    <do type="accept" label="Filter">
+      <go href="/wml/send-menu.wml">
+        <postfield name="to" value="${esc(to)}"/>
+        <postfield name="search" value="$(search)"/>
+      </go>
+    </do>
+   
+    <p>Select contact (page ${currentPage} of ${totalPages || 1}):</p>
+    <select name="target" title="Contact">
+      <option value="">-- Enter number manually --</option>
+      ${selectOptions}
+    </select>
+    <do type="accept" label="Set Contact">
+      <go href="/wml/send-menu.wml">
+        <postfield name="to" value="$target"/>
+        <postfield name="search" value="${esc(search)}"/>
+        <postfield name="page" value="${currentPage}"/>
+      </go>
+    </do>
+    ${pagination}
+    
+    ${
+      to
+        ? `<p><a href="/wml/send-menu.wml?search=${encodeURIComponent(
+            search
+          )}&amp;page=${currentPage}">[Clear Selection]</a></p>`
+        : ""
+    }
+    <p>Or enter number manually:</p>
+    <input name="target_manual" value="${esc(to)}" size="15" title="Manual"/>
+    <do type="accept" label="Set Manual">
+      <go href="/wml/send-menu.wml">
+        <postfield name="to" value="$target_manual"/>
+        <postfield name="search" value="${esc(search)}"/>
+        <postfield name="page" value="${currentPage}"/>
+      </go>
+    </do>
+    <p><b>Message Types:</b></p>
+    <select name="msgtype" title="Type" iname="msgtype" ivalue="/wml/send.text.wml">
+      <option value="/wml/send.text.wml">Text Message</option>
+      <option value="/wml/send.image.wml">Image (URL)</option>
+      <option value="/wml/send.video.wml">Video (URL)</option>
+      <option value="/wml/send.audio.wml">Audio (URL)</option>
+      <option value="/wml/send.document.wml">Document</option>
+      <option value="/wml/send.sticker.wml">Sticker</option>
+      <option value="/wml/send.location.wml">Location</option>
+      <option value="/wml/send.contact.wml">Contact</option>
+      <option value="/wml/send.poll.wml">Poll</option>
+    </select>
+    
+<do type="accept" label="Send Message">
+  <go href="/wml/send-dispatch.wml" method="post">
+    <postfield name="msgtype" value="$(msgtype)"/>
+    <postfield name="target" value="$(target)"/>
+    <postfield name="target_manual" value="$(target_manual)"/>
+  </go>
+</do>
+
+
+    
+    <do type="accept" label="Reset All ">
+      <go href="/wml/send-menu.wml" method="post">
+       
+      </go>
+    </do>
+    
+
+    ${navigationBar()}
+    <do type="options" label="Recent">
+      <go href="/wml/contacts.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("send-menu", "Send Menu", body));
+});
+// Route di dispatch per gestire la selezione del destinatario
+app.post("/wml/send-dispatch.wml", (req, res) => {
+  const msgtype = req.body.msgtype || "/wml/send.text.wml";
+  const target = req.body.target || "";
+  const targetManual = req.body.target_manual || "";
+
+  // Debug: log dei parametri ricevuti
+  console.log(
+    "Dispatch POST - msgtype:",
+    msgtype,
+    "target:",
+    target,
+    "target_manual:",
+    targetManual
+  );
+
+  // Determina il destinatario: priorità al contatto selezionato, altrimenti manuale
+  const finalTarget = target || targetManual;
+
+  if (!finalTarget) {
+    // Nessun destinatario specificato, torna al menu con errore
+    const body = `
+      <p><b>Error</b></p>
+      <p>Please select a contact or enter a number manually.</p>
+      <p>Debug info: target="${esc(target)}", manual="${esc(targetManual)}"</p>
+      <p><a href="/wml/send-menu.wml">Back to Send Menu</a></p>
+      ${navigationBar()}
+    `;
+    return sendWml(res, card("error", "Error", body));
+  }
+
+  // Redirect alla pagina del tipo di messaggio con il destinatario
+  const redirectUrl = `${msgtype}?to=${encodeURIComponent(finalTarget)}`;
+  console.log("Redirecting to:", redirectUrl);
+
+  const body = `
+    <p>Redirecting to ${esc(msgtype)}...</p>
+    <p>Target: ${esc(finalTarget)}</p>
+    <onevent type="onenterforward">
+      <go href="${redirectUrl}"/>
+    </onevent>
+    <p><a href="${redirectUrl}">Continue</a></p>
+  `;
+
+  sendWml(res, card("dispatch", "Loading...", body));
+});
+
+// Versione GET per fallback
+app.get("/wml/send-dispatch.wml", (req, res) => {
+  const msgtype = req.query.msgtype || "/wml/send.text.wml";
+  const target = req.query.target || "";
+  const targetManual = req.query.target_manual || "";
+
+  const finalTarget = target || targetManual;
+
+  if (!finalTarget) {
+    const body = `
+      <p><b>Error</b></p>
+      <p>Please select a contact or enter a number manually.</p>
+      <p><a href="/wml/send-menu.wml">Back to Send Menu</a></p>
+      ${navigationBar()}
+    `;
+    return sendWml(res, card("error", "Error", body));
+  }
+
+  const redirectUrl = `${msgtype}?to=${encodeURIComponent(finalTarget)}`;
+
+  const body = `
+    <p>Redirecting...</p>
+    <onevent type="onenterforward">
+      <go href="${redirectUrl}"/>
+    </onevent>
+    <p><a href="${redirectUrl}">Continue</a></p>
+  `;
+
+  sendWml(res, card("dispatch", "Loading...", body));
+});
+
+// Enhanced Send Text with templates
+app.get("/wml/send.text.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+  const template = req.query.template || "";
+
+  const templates = [
+    "Hello! How are you?",
+    "Thanks for your message.",
+    "I will call you back later.",
+    "Please send me the details.",
+    "Meeting confirmed for today.",
+  ];
+
+  const body = `
+    <p><b>Send Text Message</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Message:</p>
+    <input name="message" title="Your message" value="${esc(
+      template
+    )}" size="30" maxlength="1000"/>
+    
+    ${
+      template
+        ? ""
+        : `
+    <p><b>Templates:</b></p>
+    <select name="tmpl" title="Quick Templates">
+      ${templates
+        .map(
+          (t, i) =>
+            `<option value="${esc(t)}">${i + 1}. ${esc(
+              truncate(t, 20)
+            )}</option>`
+        )
+        .join("")}
+    </select>
+    <do type="options" label="Use">
+      <refresh>
+        <setvar name="message" value="$(tmpl)"/>
+      </refresh>
+    </do>
+    `
+    }
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.text">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="message" value="$(message)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-text", "Send Text", body));
+});
+
+// Endpoint per inviare immagini
+app.get("/wml/send.image.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Image</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Image URL:</p>
+    <input name="imageUrl" title="Image URL" value="https://" size="30" maxlength="500"/>
+    
+    <p>Caption (optional):</p>
+    <input name="caption" title="Image caption" value="" size="30" maxlength="1000"/>
+    
+    <p><small>Supported formats: JPG, PNG, GIF</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.image">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="imageUrl" value="$(imageUrl)"/>
+        <postfield name="caption" value="$(caption)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-image", "Send Image", body));
+});
+
+// Endpoint per inviare video
+app.get("/wml/send.video.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Video</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Video URL:</p>
+    <input name="videoUrl" title="Video URL" value="https://" size="30" maxlength="500"/>
+    
+    <p>Caption (optional):</p>
+    <input name="caption" title="Video caption" value="" size="30" maxlength="1000"/>
+    
+    <p><small>Supported formats: MP4, 3GP, AVI</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.video">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="videoUrl" value="$(videoUrl)"/>
+        <postfield name="caption" value="$(caption)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-video", "Send Video", body));
+});
+
+// Endpoint per inviare audio
+app.get("/wml/send.audio.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Audio</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Audio URL:</p>
+    <input name="audioUrl" title="Audio URL" value="https://" size="30" maxlength="500"/>
+    
+    <p>Audio Type:</p>
+    <select name="audioType" title="Audio Type">
+      <option value="audio/mp3">MP3</option>
+      <option value="audio/mp4">MP4</option>
+      <option value="audio/ogg">OGG</option>
+      <option value="audio/wav">WAV</option>
+    </select>
+    
+    <p>Voice Message:</p>
+    <select name="ptt" title="Voice Message">
+      <option value="false">No</option>
+      <option value="true">Yes</option>
+    </select>
+    
+    <p><small>Max file size: 16MB</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.audio">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="audioUrl" value="$(audioUrl)"/>
+        <postfield name="audioType" value="$(audioType)"/>
+        <postfield name="ptt" value="$(ptt)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-audio", "Send Audio", body));
+});
+
+// Endpoint per inviare documenti
+app.get("/wml/send.document.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Document</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Document URL:</p>
+    <input name="documentUrl" title="Document URL" value="https://" size="30" maxlength="500"/>
+    
+    <p>File Name:</p>
+    <input name="fileName" title="File name" value="document.pdf" size="20" maxlength="100"/>
+    
+    <p>MIME Type:</p>
+    <select name="mimeType" title="MIME Type">
+      <option value="application/pdf">PDF</option>
+      <option value="application/msword">Word</option>
+      <option value="application/vnd.ms-excel">Excel</option>
+      <option value="application/zip">ZIP</option>
+      <option value="text/plain">Text</option>
+      <option value="application/octet-stream">Other</option>
+    </select>
+    
+    <p><small>Max file size: 100MB</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.document">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="documentUrl" value="$(documentUrl)"/>
+        <postfield name="fileName" value="$(fileName)"/>
+        <postfield name="mimeType" value="$(mimeType)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-document", "Send Document", body));
+});
+
+// Endpoint per inviare sticker
+app.get("/wml/send.sticker.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Sticker</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Sticker URL:</p>
+    <input name="stickerUrl" title="Sticker URL" value="https://" size="30" maxlength="500"/>
+    
+    <p><small>Supported formats: WEBP, PNG</small></p>
+    <p><small>Max file size: 1MB</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.sticker">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="stickerUrl" value="$(stickerUrl)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-sticker", "Send Sticker", body));
+});
+
+// Endpoint per inviare posizione
+app.get("/wml/send.location.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Location</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Latitude:</p>
+    <input name="latitude" title="Latitude" value="41.9028" size="15" maxlength="20"/>
+    
+    <p>Longitude:</p>
+    <input name="longitude" title="Longitude" value="12.4964" size="15" maxlength="20"/>
+    
+    <p>Location Name (optional):</p>
+    <input name="name" title="Location name" value="" size="20" maxlength="100"/>
+    
+    <p><small>Example: Rome, Italy</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.location">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="latitude" value="$(latitude)"/>
+        <postfield name="longitude" value="$(longitude)"/>
+        <postfield name="name" value="$(name)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-location", "Send Location", body));
+});
+
+// Endpoint per inviare contatti
+app.get("/wml/send.contact.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Contact</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Contact Name:</p>
+    <input name="contactName" title="Contact name" value="" size="20" maxlength="50"/>
+    
+    <p>Phone Number:</p>
+    <input name="phoneNumber" title="Phone number" value="" size="15" maxlength="20"/>
+    
+    <p>Organization (optional):</p>
+    <input name="organization" title="Organization" value="" size="20" maxlength="50"/>
+    
+    <p>Email (optional):</p>
+    <input name="email" title="Email" value="" size="20" maxlength="100"/>
+    
+    <p><small>Format: +39XXXXXXXXXX</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.contact">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="contactName" value="$(contactName)"/>
+        <postfield name="phoneNumber" value="$(phoneNumber)"/>
+        <postfield name="organization" value="$(organization)"/>
+        <postfield name="email" value="$(email)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-contact", "Send Contact", body));
+});
+
+// Endpoint per inviare sondaggi
+app.get("/wml/send.poll.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Poll</b></p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+    
+    <p>Poll Question:</p>
+    <input name="pollName" title="Poll question" value="" size="25" maxlength="100"/>
+    
+    <p>Option 1:</p>
+    <input name="option1" title="Option 1" value="" size="20" maxlength="50"/>
+    
+    <p>Option 2:</p>
+    <input name="option2" title="Option 2" value="" size="20" maxlength="50"/>
+    
+    <p>Option 3 (optional):</p>
+    <input name="option3" title="Option 3" value="" size="20" maxlength="50"/>
+    
+    <p>Option 4 (optional):</p>
+    <input name="option4" title="Option 4" value="" size="20" maxlength="50"/>
+    
+    <p>Selectable Answers:</p>
+    <select name="selectableCount" title="Selectable answers">
+      <option value="1">1 answer</option>
+      <option value="2">2 answers</option>
+      <option value="3">3 answers</option>
+      <option value="4">4 answers</option>
+    </select>
+    
+    <p><small>Min 2 options, max 12 options per poll</small></p>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.poll">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="pollName" value="$(pollName)"/>
+        <postfield name="option1" value="$(option1)"/>
+        <postfield name="option2" value="$(option2)"/>
+        <postfield name="option3" value="$(option3)"/>
+        <postfield name="option4" value="$(option4)"/>
+        <postfield name="selectableCount" value="$(selectableCount)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a> 
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-poll", "Send Poll", body));
+});
+
+// POST handlers per ogni tipo di messaggio
+app.post("/wml/send.image", async (req, res) => {
+  try {
+    const { to, imageUrl, caption } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      image: response.data,
+      caption,
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Image Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Caption: ${caption || "No caption"}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send image"],
+        "/wml/send.image.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.video", async (req, res) => {
+  try {
+    const { to, videoUrl, caption } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      video: response.data,
+      caption,
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Video Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Caption: ${caption || "No caption"}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send video"],
+        "/wml/send.video.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.audio", async (req, res) => {
+  try {
+    const { to, audioUrl, audioType = "audio/mp4", ptt = "false" } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const response = await axios.get(audioUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      audio: response.data,
+      ptt: ptt === "true",
+      mimetype: audioType,
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Audio Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Type: ${audioType}`,
+          `Voice Message: ${ptt === "true" ? "Yes" : "No"}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send audio"],
+        "/wml/send.audio.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.document", async (req, res) => {
+  try {
+    const { to, documentUrl, fileName, mimeType } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const response = await axios.get(documentUrl, {
+      responseType: "arraybuffer",
+    });
+    const result = await sock.sendMessage(formatJid(to), {
+      document: response.data,
+      fileName: fileName || "document",
+      mimetype: mimeType || "application/octet-stream",
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Document Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `File: ${fileName || "document"}`,
+          `Type: ${mimeType || "application/octet-stream"}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send document"],
+        "/wml/send.document.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.sticker", async (req, res) => {
+  try {
+    const { to, stickerUrl } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const response = await axios.get(stickerUrl, {
+      responseType: "arraybuffer",
+    });
+    const result = await sock.sendMessage(formatJid(to), {
+      sticker: response.data,
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Sticker Sent",
+        [`To: ${jidFriendly(to)}`, `ID: ${result?.key?.id || "Unknown"}`],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send sticker"],
+        "/wml/send.sticker.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.location", async (req, res) => {
+  try {
+    const { to, latitude, longitude, name } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const result = await sock.sendMessage(formatJid(to), {
+      location: {
+        degreesLatitude: parseFloat(latitude),
+        degreesLongitude: parseFloat(longitude),
+        name,
+      },
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Location Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Location: ${latitude}, ${longitude}`,
+          `Name: ${name || "Unnamed location"}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send location"],
+        "/wml/send.location.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.contact", async (req, res) => {
+  try {
+    const { to, contactName, phoneNumber, organization, email } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${contactName}\nTEL;type=CELL:${phoneNumber}\n${
+      organization ? `ORG:${organization}\n` : ""
+    }${email ? `EMAIL:${email}\n` : ""}END:VCARD`;
+
+    const result = await sock.sendMessage(formatJid(to), {
+      contacts: {
+        displayName: contactName,
+        contacts: [
+          {
+            displayName: contactName,
+            vcard,
+          },
+        ],
+      },
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Contact Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Contact: ${contactName}`,
+          `Phone: ${phoneNumber}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send contact"],
+        "/wml/send.contact.wml"
+      )
+    );
+  }
+});
+
+app.post("/wml/send.poll", async (req, res) => {
+  try {
+    const {
+      to,
+      pollName,
+      option1,
+      option2,
+      option3,
+      option4,
+      selectableCount,
+    } = req.body;
+    if (!sock) throw new Error("Not connected");
+
+    const options = [option1, option2];
+    if (option3) options.push(option3);
+    if (option4) options.push(option4);
+
+    const result = await sock.sendMessage(formatJid(to), {
+      poll: {
+        name: pollName,
+        values: options,
+        selectableCount: Math.min(parseInt(selectableCount), options.length),
+      },
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Poll Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Question: ${pollName}`,
+          `Options: ${options.length}`,
+          `Selectable: ${selectableCount}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send poll"],
+        "/wml/send.poll.wml"
+      )
+    );
+  }
+});
+
+app.get("/wml/groups.search.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    // Query di ricerca
+    const query = (req.query.q || "").toLowerCase().trim();
+    if (!query) throw new Error("No search query provided");
+
+    // Parametri di paginazione
+    const page = parseInt(req.query.page) || 1;
+    const limit = 5;
+    const offset = (page - 1) * limit;
+
+    // Prendo tutti i gruppi e filtro per nome
+    const groups = await sock.groupFetchAllParticipating();
+    const groupList = Object.values(groups)
+      .filter((g) => (g?.subject || "").toLowerCase().includes(query))
+      .sort((a, b) => (b?.subject || "").localeCompare(a?.subject || ""));
+
+    const totalGroups = groupList.length;
+    const totalPages = Math.max(1, Math.ceil(totalGroups / limit));
+    const paginatedGroups = groupList.slice(offset, offset + limit);
+
+    // Escape WML
+    const escWml = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+
+    // Lista risultati
+    const list =
+      paginatedGroups
+        .map((g, idx) => {
+          const globalIdx = offset + idx;
+          const memberCount = g?.participants?.length || 0;
+          return `<p><b>${globalIdx + 1}.</b> ${escWml(
+            g.subject || "Unnamed Group"
+          )}<br/>
+        <small>${memberCount} members | ${escWml(
+            g.id.slice(-8)
+          )}...</small><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          g.id
+        )}&amp;limit=15">[Chat]</a>
+      </p>`;
+        })
+        .join("") ||
+      `<p>No groups found matching "<i>${escWml(query)}</i>".</p>`;
+
+    // Controlli paginazione
+    let paginationControls = "<p><b>Pages:</b><br/>";
+    if (page > 1) {
+      paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
+        query
+      )}&page=1">[First]</a> `;
+      paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
+        query
+      )}&page=${page - 1}">[&lt;]</a> `;
+    }
+
+    const startPage = Math.max(1, page - 2);
+    const endPage = Math.min(totalPages, page + 2);
+
+    for (let i = startPage; i <= endPage; i++) {
+      if (i === page) {
+        paginationControls += `<b>[${i}]</b> `;
+      } else {
+        paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
+          query
+        )}&page=${i}">[${i}]</a> `;
+      }
+    }
+
+    if (page < totalPages) {
+      paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
+        query
+      )}&page=${page + 1}">[&gt;]</a> `;
+      paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
+        query
+      )}&page=${totalPages}">[Last]</a>`;
+    }
+
+    paginationControls += `<br/><small>Page ${page} of ${totalPages} (${totalGroups} results)</small></p>`;
+
+    // Body
+    const body = `
+      <p><b>Search results for: "${escWml(query)}"</b></p>
+      ${list}
+      ${paginationControls}
+      <p><a href="/wml/groups.wml">[Back to Groups]</a></p>
+      <p>
+        <a href="/wml/home.wml">[Home]</a> 
+        <a href="/wml/chats.wml">[Chats]</a> 
+        <a href="/wml/contacts.wml">[Contacts]</a>
+      </p>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <head>
+    <meta http-equiv="Cache-Control" content="max-age=0"/>
+  </head>
+  <card id="search" title="Group Search">
+    ${body}
+  </card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (e) {
+    const errorWml = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="error" title="Error">
+    <p><b>Error:</b></p>
+    <p>${e.message || "Failed to search groups"}</p>
+    <p><a href="/wml/groups.wml">[Back to Groups]</a></p>
+  </card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    const encodedBuffer = iconv.encode(errorWml, "iso-8859-1");
+    res.send(encodedBuffer);
+  }
+});
+
+app.get("/wml/groups.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    // Parametri di paginazione
+    const page = parseInt(req.query.page) || 1;
+    const limit = 5;
+    const offset = (page - 1) * limit;
+
+    const groups = await sock.groupFetchAllParticipating();
+    const groupList = Object.values(groups).sort((a, b) =>
+      (b?.subject || "").localeCompare(a?.subject || "")
+    );
+
+    // Calcoli per la paginazione
+    const totalGroups = groupList.length;
+    const totalPages = Math.ceil(totalGroups / limit);
+    const paginatedGroups = groupList.slice(offset, offset + limit);
+
+    // Escape WML sicuro
+    const escWml = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+
+    // Lista gruppi
+    const list =
+      paginatedGroups
+        .map((g, idx) => {
+          const globalIdx = offset + idx;
+          const memberCount = g?.participants?.length || 0;
+          return `<p><b>${globalIdx + 1}.</b> ${escWml(
+            g.subject || "Unnamed Group"
+          )}<br/>
+        <small>${memberCount} members | ${escWml(
+            g.id.slice(-8)
+          )}...</small><br/>
+        <a href="/wml/group.view.wml?gid=${encodeURIComponent(
+          g.id
+        )}" accesskey="${Math.min(idx + 1, 9)}">[${Math.min(
+            idx + 1,
+            9
+          )}] Open</a> |
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          g.id
+        )}&amp;limit=15">[Chat]</a>
+      </p>`;
+        })
+        .join("") || "<p>No groups found.</p>";
+
+    // Controlli paginazione
+    let paginationControls = "";
+    if (totalPages > 1) {
+      paginationControls = "<p><b>Pages:</b><br/>";
+
+      if (page > 1) {
+        paginationControls += `<a href="/wml/groups.wml?page=1">[First]</a> `;
+        paginationControls += `<a href="/wml/groups.wml?page=${
+          page - 1
+        }">[&lt;]</a> `;
+      }
+
+      const startPage = Math.max(1, page - 2);
+      const endPage = Math.min(totalPages, page + 2);
+
+      for (let i = startPage; i <= endPage; i++) {
+        if (i === page) {
+          paginationControls += `<b>[${i}]</b> `;
+        } else {
+          paginationControls += `<a href="/wml/groups.wml?page=${i}">[${i}]</a> `;
+        }
+      }
+
+      if (page < totalPages) {
+        paginationControls += `<a href="/wml/groups.wml?page=${
+          page + 1
+        }">[&gt;]</a> `;
+        paginationControls += `<a href="/wml/groups.wml?page=${totalPages}">[Last]</a>`;
+      }
+
+      paginationControls += `<br/><small>Page ${page} of ${totalPages} (${totalGroups} groups)</small></p>`;
+    }
+
+    // Form ricerca
+    const searchForm = `
+      <p><b>Search groups:</b></p>
+      <p>
+        <input name="q" title="Search..." value="" emptyok="true" size="15" maxlength="30"/>
+        <do type="accept" label="Search">
+          <go href="/wml/groups.search.wml" method="get">
+            <postfield name="q" value="$(q)"/>
+          </go>
+        </do>
+      </p>`;
+
+    // Body card
+    const body = `
+      <p><b>My Groups (${totalGroups}) - Page ${page}/${totalPages || 1}</b></p>
+      ${searchForm}
+      ${list}
+      ${paginationControls}
+      <p><b>Group Actions:</b></p>
+      <p>
+        <a href="/wml/group.create.wml" accesskey="*">[*] Create New Group</a>
+      </p>
+      <p>
+        <a href="/wml/home.wml">[Home]</a> 
+        <a href="/wml/chats.wml">[Chats]</a> 
+        <a href="/wml/contacts.wml">[Contacts]</a>
+      </p>
+      <do type="accept" label="Create">
+        <go href="/wml/group.create.wml"/>
+      </do>
+      <do type="options" label="Menu">
+        <go href="/wml/menu.wml"/>
+      </do>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <head>
+    <meta http-equiv="Cache-Control" content="max-age=0"/>
+  </head>
+  <card id="groups" title="Groups">
+    ${body}
+  </card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (e) {
+    const errorWml = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="error" title="Error">
+    <p><b>Error:</b></p>
+    <p>${e.message || "Failed to load groups"}</p>
+    <p><a href="/wml/home.wml">[Back to Home]</a></p>
+  </card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    const encodedBuffer = iconv.encode(errorWml, "iso-8859-1");
+    res.send(encodedBuffer);
+  }
+});
+
+app.get("/wml/search.results.wml", (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const searchType = req.query.type || "messages";
+  const limitParam = req.query.limit || "10";
+  const limit =
+    limitParam === "all"
+      ? Infinity
+      : Math.max(1, Math.min(50, parseInt(limitParam)));
+  const page = Math.max(1, parseInt(req.query.page || "1"));
+  const pageSize = 5;
+  if (!q || q.length < 2) {
+    sendWml(
+      res,
+      resultCard(
+        "Search Error",
+        ["Query must be at least 2 characters"],
+        "/wml/home.wml"
+      )
+    );
+    return;
+  }
+  let allResults = [];
+  const searchLower = q.toLowerCase();
+  // funzione sicura per troncare
+  function truncate(str, n) {
+    return str && str.length > n ? str.slice(0, n) + "..." : str;
+  }
+  // Funzione per formattare il timestamp
+  function formatTimestamp(timestamp) {
+    if (!timestamp || timestamp === 0) return "Unknown";
+    return new Date(Number(timestamp) * 1000).toLocaleString("en-GB", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  if (searchType === "messages") {
+    for (const [chatId, messages] of chatStore.entries()) {
+      for (const msg of messages) {
+        const content = extractMessageContent(msg.message);
+        let text = "";
+        let messageType = "";
+
+        if (content?.conversation) {
+          text = content.conversation;
+          messageType = "text";
+        } else if (content?.extendedTextMessage?.text) {
+          text = content.extendedTextMessage.text;
+          messageType = "text";
+        } else if (content?.imageMessage) {
+          text = "[Image] " + (content.imageMessage.caption || "");
+          messageType = "image";
+        } else if (content?.videoMessage) {
+          text = "[Video] " + (content.videoMessage.caption || "");
+          messageType = "video";
+        } else if (content?.audioMessage) {
+          const duration = content.audioMessage.seconds || 0;
+          text = `[Audio ${duration}s]`;
+          messageType = "audio";
+
+          if (
+            msg.transcription &&
+            msg.transcription !== "[Trascrizione fallita]" &&
+            msg.transcription !== "[Audio troppo lungo per la trascrizione]"
+          ) {
+            text += " " + msg.transcription;
+          }
+        } else if (content?.documentMessage) {
+          text = "[Document] " + (content.documentMessage.fileName || "");
+          messageType = "document";
+        } else if (content?.stickerMessage) {
+          text = "[Sticker]";
+          messageType = "sticker";
+        } else if (content?.locationMessage) {
+          text = "[Location]";
+          messageType = "location";
+        } else if (content?.contactMessage) {
+          text = "[Contact]";
+          messageType = "contact";
+        }
+
+        const searchableText = text.toLowerCase();
+        const typeSearchable = messageType.toLowerCase();
+
+        if (
+          searchableText.includes(searchLower) ||
+          typeSearchable.includes(searchLower)
+        ) {
+          const contact = contactStore.get(chatId);
+          const chatName =
+            contact?.name || contact?.notify || jidFriendly(chatId);
+          const timestamp = Number(msg.messageTimestamp) || 0;
+
+          allResults.push({
+            type: "message",
+            chatId,
+            chatName,
+            messageId: msg.key.id,
+            text: truncate(text, 40),
+            timestamp: timestamp, // Timestamp numerico per ordinamento
+            formattedTime: formatTimestamp(timestamp), // Timestamp formattato per visualizzazione
+            fromMe: msg.key.fromMe,
+            messageType: messageType,
+            audioInfo:
+              messageType === "audio"
+                ? {
+                    duration: content?.audioMessage?.seconds || 0,
+                    hasTranscription: !!(
+                      msg.transcription &&
+                      msg.transcription !== "[Trascrizione fallita]" &&
+                      msg.transcription !==
+                        "[Audio troppo lungo per la trascrizione]"
+                    ),
+                  }
+                : null,
+          });
+
+          if (limit !== Infinity && allResults.length >= limit) break;
+        }
+      }
+      if (limit !== Infinity && allResults.length >= limit) break;
+    }
+    // Ordina i messaggi per timestamp decrescente
+    allResults.sort((a, b) => b.timestamp - a.timestamp);
+  } else if (searchType === "contacts") {
+    const contacts = Array.from(contactStore.values()).filter((c) => {
+      const name = (c.name || c.notify || c.verifiedName || "").toLowerCase();
+      const number = c.id.replace("@s.whatsapp.net", "");
+      return name.includes(searchLower) || number.includes(searchLower);
+    });
+
+    const limitedContacts =
+      limit === Infinity ? contacts : contacts.slice(0, limit);
+    allResults = limitedContacts.map((c) => {
+      // Cerca l'ultimo messaggio con questo contatto
+      const messages = chatStore.get(c.id) || [];
+      const lastMessage =
+        messages.length > 0 ? messages[messages.length - 1] : null;
+      const timestamp = lastMessage ? Number(lastMessage.messageTimestamp) : 0;
+
+      return {
+        type: "contact",
+        name: c.name || c.notify || c.verifiedName || "Unknown",
+        number: jidFriendly(c.id),
+        jid: c.id,
+        timestamp: timestamp, // Timestamp numerico per ordinamento
+        formattedTime: formatTimestamp(timestamp), // Timestamp formattato per visualizzazione
+        lastMessageText: lastMessage
+          ? truncate(messageText(lastMessage), 30)
+          : "No messages",
+      };
+    });
+    // Ordina i contatti per timestamp decrescente
+    allResults.sort((a, b) => b.timestamp - a.timestamp);
+  } else if (searchType === "chats") {
+    for (const [chatId, messages] of chatStore.entries()) {
+      const contact = contactStore.get(chatId);
+      const isGroup = chatId.endsWith("@g.us");
+      let chatName = isGroup
+        ? contact?.subject || contact?.name || `Unnamed Group`
+        : contact?.name ||
+          contact?.notify ||
+          contact?.verifiedName ||
+          jidFriendly(chatId);
+
+      if (chatName.toLowerCase().includes(searchLower)) {
+        const lastMessage =
+          messages.length > 0 ? messages[messages.length - 1] : null;
+        const timestamp = lastMessage
+          ? Number(lastMessage.messageTimestamp)
+          : 0;
+        const formattedTime = formatTimestamp(timestamp);
+
+        allResults.push({
+          type: "chat",
+          chatId,
+          chatName,
+          isGroup,
+          messageCount: messages.length,
+          timestamp: timestamp, // Timestamp numerico per ordinamento
+          formattedTime: formattedTime, // Timestamp formattato per visualizzazione
+          phoneNumber: isGroup ? null : chatId.replace("@s.whatsapp.net", ""),
+        });
+
+        if (limit !== Infinity && allResults.length >= limit) break;
+      }
+    }
+    // Ordina le chat per timestamp decrescente
+    allResults.sort((a, b) => b.timestamp - a.timestamp);
+  } else if (searchType === "groups") {
+    for (const [chatId, messages] of chatStore.entries()) {
+      if (!chatId.endsWith("@g.us")) continue;
+      const contact = contactStore.get(chatId);
+      const groupName = contact?.subject || contact?.name || `Unnamed Group`;
+
+      if (groupName.toLowerCase().includes(searchLower)) {
+        const lastMessage =
+          messages.length > 0 ? messages[messages.length - 1] : null;
+        const timestamp = lastMessage
+          ? Number(lastMessage.messageTimestamp)
+          : 0;
+        const formattedTime = formatTimestamp(timestamp);
+        let memberCount = 0;
+        if (contact?.participants) memberCount = contact.participants.length;
+
+        allResults.push({
+          type: "group",
+          chatId,
+          chatName: groupName,
+          messageCount: messages.length,
+          timestamp: timestamp, // Timestamp numerico per ordinamento
+          formattedTime: formattedTime, // Timestamp formattato per visualizzazione
+          memberCount,
+        });
+
+        if (limit !== Infinity && allResults.length >= limit) break;
+      }
+    }
+    // Ordina i gruppi per timestamp decrescente
+    allResults.sort((a, b) => b.timestamp - a.timestamp);
+  }
+
+  // pagination
+  const totalResults = allResults.length;
+  const totalPages = Math.ceil(totalResults / pageSize) || 1;
+  const startIndex = (page - 1) * pageSize;
+  const endIndex = Math.min(startIndex + pageSize, totalResults);
+  const paginatedResults = allResults.slice(startIndex, endIndex);
+
+  const resultList =
+    paginatedResults
+      .map((r, idx) => {
+        const globalIndex = startIndex + idx + 1;
+        if (r.type === "message") {
+          let messagePrefix = "";
+          if (r.messageType === "audio") {
+            messagePrefix = "[AUDIO] ";
+            if (r.audioInfo?.hasTranscription) {
+              messagePrefix += "[TRANSCRIPTION] ";
+            }
+          } else if (r.messageType === "image") {
+            messagePrefix = "[IMG] ";
+          } else if (r.messageType === "video") {
+            messagePrefix = "[VID] ";
+          } else if (r.messageType === "document") {
+            messagePrefix = "[DOC] ";
+          } else if (r.messageType === "sticker") {
+            messagePrefix = "[STICK] ";
+          }
+
+          return `<p><b>${globalIndex}.</b> ${messagePrefix}${esc(r.text)}<br/>
+        <small>From: ${esc(r.chatName)} | ${r.formattedTime} | ${
+            r.fromMe ? "Me" : "Them"
+          }</small><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          r.chatId
+        )}&amp;limit=15">[Open Chat]</a> 
+        <a href="/wml/msg.wml?mid=${encodeURIComponent(
+          r.messageId
+        )}&amp;jid=${encodeURIComponent(r.chatId)}">[Message]</a>
+        ${
+          r.messageType === "audio" && r.audioInfo?.hasTranscription
+            ? ` <a href="/wml/audio-transcription.wml?mid=${encodeURIComponent(
+                r.messageId
+              )}&amp;jid=${encodeURIComponent(r.chatId)}">[TRANSCRIPTION]</a>`
+            : ""
+        }
+      </p>`;
+        } else if (r.type === "contact") {
+          return `<p><b>${globalIndex}.</b> ${esc(r.name)}<br/>
+        <small>${esc(r.number)} | Last: ${r.formattedTime}</small><br/>
+        <small>Last msg: ${esc(r.lastMessageText)}</small><br/>
+        <a href="/wml/contact.wml?jid=${encodeURIComponent(r.jid)}">[View]</a> |
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          r.jid
+        )}&amp;limit=15">[Chat]</a>
+      </p>`;
+        } else if (r.type === "chat") {
+          const typeIcon = r.isGroup ? "[GROUP]" : "[CHAT]";
+          const phoneInfo = r.phoneNumber ? ` | ${r.phoneNumber}` : "";
+          return `<p><b>${globalIndex}.</b> ${typeIcon} ${esc(r.chatName)}<br/>
+        <small>${r.messageCount} messages | Last: ${
+            r.formattedTime
+          }${phoneInfo}</small><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          r.chatId
+        )}&amp;limit=15">[Open]</a> |
+        <a href="/wml/send.text.wml?to=${encodeURIComponent(
+          r.chatId
+        )}">[Send]</a>
+        ${
+          r.phoneNumber
+            ? ` | <a href="wtai://wp/mc;${r.phoneNumber}">[Call]</a>`
+            : ""
+        }
+      </p>`;
+        } else if (r.type === "group") {
+          const memberInfo =
+            r.memberCount > 0 ? ` | ${r.memberCount} members` : "";
+          return `<p><b>${globalIndex}.</b> [GROUP] ${esc(r.chatName)}<br/>
+        <small>${r.messageCount} messages | Last: ${
+            r.formattedTime
+          }${memberInfo}</small><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(
+          r.chatId
+        )}&amp;limit=15">[Open]</a> |
+        <a href="/wml/send.text.wml?to=${encodeURIComponent(
+          r.chatId
+        )}">[Send]</a>
+      </p>`;
+        }
+        return "";
+      })
+      .join("") || "<p>No results found.</p>";
+
+  // pagination controls (come prima)
+  let paginationControls = "";
+  if (totalPages > 1) {
+    paginationControls = "<p><b>Pages:</b><br/>";
+    if (page > 1) {
+      paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+        q
+      )}&amp;type=${encodeURIComponent(
+        searchType
+      )}&amp;limit=${encodeURIComponent(
+        limitParam
+      )}&amp;page=1">[&lt;&lt; First]</a> `;
+      paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+        q
+      )}&amp;type=${encodeURIComponent(
+        searchType
+      )}&amp;limit=${encodeURIComponent(limitParam)}&amp;page=${
+        page - 1
+      }">[&lt; Prev]</a> `;
+    }
+    const startPage = Math.max(1, page - 2);
+    const endPage = Math.min(totalPages, page + 2);
+    if (startPage > 1) {
+      paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+        q
+      )}&amp;type=${encodeURIComponent(
+        searchType
+      )}&amp;limit=${encodeURIComponent(limitParam)}&amp;page=1">[1]</a> `;
+      if (startPage > 2) paginationControls += "... ";
+    }
+    for (let i = startPage; i <= endPage; i++) {
+      if (i === page) paginationControls += `<b>[${i}]</b> `;
+      else
+        paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+          q
+        )}&amp;type=${encodeURIComponent(
+          searchType
+        )}&amp;limit=${encodeURIComponent(
+          limitParam
+        )}&amp;page=${i}">[${i}]</a> `;
+    }
+    if (endPage < totalPages) {
+      if (endPage < totalPages - 1) paginationControls += "... ";
+      paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+        q
+      )}&amp;type=${encodeURIComponent(
+        searchType
+      )}&amp;limit=${encodeURIComponent(
+        limitParam
+      )}&amp;page=${totalPages}">[${totalPages}]</a> `;
+    }
+    if (page < totalPages) {
+      paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+        q
+      )}&amp;type=${encodeURIComponent(
+        searchType
+      )}&amp;limit=${encodeURIComponent(limitParam)}&amp;page=${
+        page + 1
+      }">[Next &gt;]</a> `;
+      paginationControls += `<a href="/wml/search.results.wml?q=${encodeURIComponent(
+        q
+      )}&amp;type=${encodeURIComponent(
+        searchType
+      )}&amp;limit=${encodeURIComponent(
+        limitParam
+      )}&amp;page=${totalPages}">[Last &gt;&gt;]</a>`;
+    }
+    paginationControls += "</p>";
+  }
+
+  const limitDisplay = limitParam === "all" ? "No limit" : limitParam;
+  const searchTypeDisplay =
+    searchType.charAt(0).toUpperCase() + searchType.slice(1);
+  const body = `
+    <p><b>Search Results</b></p>
+    <p>Query: <b>${esc(q)}</b></p>
+    <p>Type: ${esc(searchTypeDisplay)} | Limit: ${limitDisplay}</p>
+    <p>Page: ${page}/${totalPages} | Total: ${totalResults}</p>
+    <p>Showing: ${startIndex + 1}-${endIndex} of ${totalResults}</p>
+    <p><small>Sorted by most recent first</small></p>
+    ${resultList}
+    ${paginationControls}
+    <p><b>Search Again:</b></p>
+    <p>
+      <a href="/wml/search.wml?q=${encodeURIComponent(
+        q
+      )}" accesskey="1">[1] New Search</a> |
+      <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+    </p>
+    <do type="accept" label="Home">
+      <go href="/wml/home.wml"/>
+    </do>
+  `;
+  sendWml(res, card("search-results", "Search Results", body));
+});
+
+// Enhanced Search Form
+app.get("/wml/search.wml", (req, res) => {
+  const prevQuery = esc(req.query.q || "");
+  const prevLimit = req.query.limit || "5"; // default a 10
+
+  const body = `
+    <p><b>Search WhatsApp</b></p>
+        
+    <p>Search for:</p>
+    <input name="q" title="Search query" value="${prevQuery}" size="20" maxlength="100"/>
+        
+    <p>Search in:</p>
+    <select name="type" title="Search Type">
+      <option value="messages">Messages</option>
+      <option value="contacts">Contacts</option>
+      <option value="chats">Chats/Conversations</option>
+      <option value="groups">Groups Only</option>
+    </select>
+        
+    <p>Limit:</p>
+    <select name="limit" title="Max Results">
+      <option value="5" ${
+        prevLimit === "5" ? 'selected="selected"' : ""
+      }>5 results</option>
+      <option value="10" ${
+        prevLimit === "10" ? 'selected="selected"' : ""
+      }>10 results</option>
+      <option value="20" ${
+        prevLimit === "20" ? 'selected="selected"' : ""
+      }>20 results</option>
+      <option value="50" ${
+        prevLimit === "50" ? 'selected="selected"' : ""
+      }>50 results</option>
+      <option value="all" ${
+        prevLimit === "all" ? 'selected="selected"' : ""
+      }>No limit</option>
+    </select>
+
+    <do type="accept" label="Search">
+      <go href="/wml/search.results.wml" method="get">
+        <postfield name="q" value="$(q)"/>
+        <postfield name="type" value="$(type)"/>
+        <postfield name="limit" value="$(limit)"/>
+        <postfield name="chatJid" value="$(chatJid)"/>
+      </go>
+    </do>
+
+    ${navigationBar()}
+  `;
+
+  sendWml(res, card("search", "Search", body));
+});
+
+// Auto-refresh for dynamic content
+app.get("/wml/live-status.wml", (req, res) => {
+  const refreshInterval = req.query.interval || "30";
+
+  const body = `
+   
+    <p><b>Live Status Monitor</b></p>
+    <p>Updates every ${refreshInterval} seconds</p>
+    
+    <p><b>Connection:</b> ${connectionState}</p>
+    <p><b>Messages:</b> ${messageStore.size}</p>
+    <p><b>Contacts:</b> ${contactStore.size}</p>
+    <p><b>Chats:</b> ${chatStore.size}</p>
+    <p><b>Time:</b> ${new Date().toLocaleTimeString()}</p>
+    
+  
+    
+    <p><a href="/wml/home.wml" accesskey="0">[0] Home</a></p>
+    
+   
+  `;
+
+  sendWml(
+    res,
+    card(
+      "live-status",
+      "Live Status",
+      body,
+      `/wml/live-status.wml?interval=${refreshInterval}`
+    )
+  );
+});
+
+// Add all the existing endpoints from your original code here...
+// [Previous POST handlers for send.text, send.image, etc.]
+
+// Keep all existing POST handlers and API endpoints
+app.post("/wml/send.text", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+    const { to, message } = req.body;
+    const result = await sock.sendMessage(formatJid(to), { text: message });
+    sendWml(
+      res,
+      resultCard(
+        "Message Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Message: ${truncate(message, 50)}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [e.message || "Failed to send"],
+        "/wml/send.text.wml"
+      )
+    );
+  }
+});
+
+// Enhanced sync functions
+async function loadChatHistory(jid, limit = 20000) {
+  if (!sock) return;
+  try {
+    // In production, implement proper message fetching
+    logger.info(`Loading chat history for ${jid}, limit: ${limit}`);
+  } catch (error) {
+    logger.error(`Failed to load chat history: ${error.message}`);
+  }
+}
+
+async function performInitialSync() {
+  try {
+    if (!sock || connectionState !== "open") {
+      logger.warn("Cannot sync: not connected");
+      return;
+    }
+
+    logger.info(`Starting enhanced initial sync (attempt ${syncAttempts + 1})`);
+    syncAttempts++;
+
+    let successCount = 0;
+
+    // Sync contacts
+    try {
+      logger.info("Checking contacts...");
+      if (contactStore.size === 0) {
+        logger.info("Waiting for contacts via events...");
+        await delay(3000);
+      }
+      logger.info(`Contacts in store: ${contactStore.size}`);
+      successCount++;
+    } catch (err) {
+      logger.error("Contact sync failed:", err.message);
+    }
+
+    // Sync chats
+    try {
+      logger.info("Fetching chats...");
+      const groups = await sock.groupFetchAllParticipating();
+      logger.info(`Retrieved ${Object.keys(groups).length} groups`);
+
+      for (const chatId of Object.keys(groups)) {
+        if (!chatStore.has(chatId)) {
+          chatStore.set(chatId, []);
+        }
+      }
+
+      if (chatStore.size === 0) {
+        logger.info("Waiting for chats via events...");
+        await delay(3000);
+      }
+
+      logger.info(`Chats in store: ${chatStore.size}`);
+      successCount++;
+    } catch (err) {
+      logger.error("Chat sync failed:", err.message);
+    }
+
+    // Check sync completion
+    const counts = {
+      contacts: contactStore.size,
+      chats: chatStore.size,
+      messages: messageStore.size,
+    };
+
+    logger.info("Sync results:", counts);
+
+    if (counts.contacts > 0 && counts.chats > 0) {
+      isFullySynced = true;
+      logger.info("Initial sync completed successfully!");
+    } else if (syncAttempts < 9999999) {
+      const delayMs = syncAttempts * 5000;
+      logger.info(`Sync incomplete, retrying in ${delayMs / 1000}s...`);
+      setTimeout(performInitialSync, delayMs);
+    } else {
+      logger.warn("Sync attempts exhausted. Data may still load gradually.");
+    }
+  } catch (err) {
+    logger.error("Initial sync failed:", err);
+    if (syncAttempts < 999999) {
+      setTimeout(performInitialSync, 5000);
+    }
+  }
+}
+
+// Production-ready connection with better error handling
+async function connectWithBetterSync() {
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(
+      "./auth_info_baileys"
+    );
+    const { version } = await fetchLatestBaileysVersion();
+
+    sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      syncFullHistory: true,
+      markOnlineOnConnect: false,
+      emitOwnEvents: true,
+      getMessage: async (key) => messageStore.get(key.id) || null,
+      shouldIgnoreJid: (jid) => false,
+      shouldSyncHistoryMessage: (msg) => true,
+      browser: ["WhatsApp WML Gateway", "Chrome", "1.0.0"],
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
+      retryRequestDelayMs: 1000,
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on(
+      "connection.update",
+      async ({ connection, lastDisconnect, qr }) => {
+        connectionState = connection;
+
+        if (qr) {
+          currentQR = qr;
+          logger.info("QR Code generated");
+          if (isDev) {
+            qrcode.generate(qr, { small: true });
+          }
+        }
+
+        if (connection === "close") {
+          const shouldReconnect =
+            lastDisconnect?.error?.output?.statusCode !==
+            DisconnectReason.loggedOut;
+          logger.info(
+            `Connection closed. Should reconnect: ${shouldReconnect}`
+          );
+
+          if (shouldReconnect) {
+            const delay = Math.min(5000 * Math.pow(2, syncAttempts), 30000); // Exponential backoff
+            setTimeout(connectWithBetterSync, delay);
+          } else {
+            // Clear stores on logout
+            contactStore.clear();
+            chatStore.clear();
+            messageStore.clear();
+            isFullySynced = false;
+            syncAttempts = 0;
+          }
+        } else if (connection === "open") {
+          logger.info("WhatsApp connected successfully!");
+          currentQR = null;
+          isFullySynced = false;
+          syncAttempts = 0;
+
+          // Start sync process
+          setTimeout(enhancedInitialSync, 5000);
+        }
+      }
+    );
+
+    // Enhanced event handlers
+    sock.ev.on(
+      "messaging-history.set",
+      ({ chats, contacts, messages, isLatest }) => {
+        logger.info(
+          `History batch - Chats: ${chats.length}, Contacts: ${contacts.length}, Messages: ${messages.length}`
+        );
+
+        for (const chat of chats) {
+          if (!chatStore.has(chat.id)) {
+            chatStore.set(chat.id, []);
+          }
+        }
+
+        for (const contact of contacts) {
+          contactStore.set(contact.id, contact);
+        }
+
+        for (const msg of messages) {
+          if (msg.key?.id) {
+            messageStore.set(msg.key.id, msg);
+            const chatId = msg.key.remoteJid;
+            if (!chatStore.has(chatId)) {
+              chatStore.set(chatId, []);
+            }
+            const chatMessages = chatStore.get(chatId);
+            chatMessages.push(msg);
+          }
+        }
+
+        if (isLatest) {
+          logger.info("Bulk history sync complete");
+          isFullySynced = true;
+          saveAll();
+        }
+      }
+    );
+    // Replace the messages.upsert event handler with this fixed version
+
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      let newMessagesCount = 0;
+      for (const message of messages) {
+        // Changed from 'msg' to 'message' to avoid conflicts
+        newMessagesCount++;
+        if (message.key?.id) {
+          messageStore.set(message.key.id, message);
+          const chatId = message.key.remoteJid;
+
+          if (!chatStore.has(chatId)) {
+            chatStore.set(chatId, []);
+          }
+          const chatMessages = chatStore.get(chatId);
+          chatMessages.push(message);
+
+          // Gestione trascrizione audio con Whisper
+          if (message.message?.audioMessage && transcriptionEnabled) {
+            try {
+              console.log("Transcribing audio with Whisper...");
+              const audioBuffer = await downloadMediaMessage(message, "buffer");
+
+              // Limita la dimensione dell'audio
+              const maxSize = 10 * 1024 * 1024; // 10MB max
+              if (audioBuffer.length > maxSize) {
+                message.transcription =
+                  "[Audio troppo lungo per la trascrizione]";
+                console.log("Audio too large for transcription");
+              } else {
+                const transcription = await transcribeAudioWithWhisper(
+                  audioBuffer
+                );
+                message.transcription = transcription;
+                console.log("Whisper transcription:", transcription);
+              }
+            } catch (error) {
+              console.error("Whisper transcription failed:", error);
+              message.transcription = "[Trascrizione fallita]";
+            }
+          }
+        }
+      }
+
+      if (newMessagesCount > 0) {
+        saveMessages();
+        saveChats();
+      }
+    });
+
+    // Contact and chat updates
+    sock.ev.on("contacts.set", ({ contacts }) => {
+      logger.info(`Contacts set: ${contacts.length}`);
+      for (const c of contacts) {
+        contactStore.set(c.id, c);
+      }
+      saveContacts(); // ADD THIS LINE
+    });
+
+    sock.ev.on("contacts.update", (contacts) => {
+      for (const c of contacts) {
+        if (c.id) contactStore.set(c.id, c);
+      }
+    });
+
+    sock.ev.on("chats.set", ({ chats }) => {
+      logger.info(`Chats set: ${chats.length}`);
+      for (const c of chats) {
+        if (!chatStore.has(c.id)) {
+          chatStore.set(c.id, []);
+        }
+      }
+    });
+
+    sock.ev.on("chats.update", (chats) => {
+      for (const c of chats) {
+        if (!chatStore.has(c.id)) {
+          chatStore.set(c.id, []);
+        }
+      }
+    });
+  } catch (error) {
+    logger.error("Connection error:", error);
+    setTimeout(connectWithBetterSync, 10000);
+  }
+}
+
+connectWithBetterSync();
+
+// Keep all existing API endpoints from the original code...
+// [Include all /api/ routes here]
+
+// Graceful shutdown
+const gracefulShutdown = async (signal) => {
+  logger.info(`Received ${signal}. Shutting down gracefully...`);
+  try {
+    // ADD THESE LINES:
+    logger.info("Saving all data before shutdown...");
+    await storage.saveImmediately("contacts", contactStore);
+    await storage.saveImmediately("chats", chatStore);
+    await storage.saveImmediately("messages", messageStore);
+    await storage.saveImmediately("meta", {
+      isFullySynced,
+      syncAttempts,
+      lastSync: new Date().toISOString(),
+    });
+    logger.info("Data saved successfully");
+
+    if (typeof sock !== "undefined" && sock) {
+      logger.info("Closing WhatsApp connection...");
+      await sock.end();
+      logger.info("WhatsApp connection closed");
+    } else {
+      logger.info("No WhatsApp connection to close");
+    }
+
+    contactStore.clear();
+    chatStore.clear();
+    messageStore.clear();
+
+    logger.info("Graceful shutdown completed");
+    process.exit(0);
+  } catch (error) {
+    logger.error("Error during shutdown:", error);
+    process.exit(1);
+  }
+};
+
+// Signal handlers
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGUSR2", () => gracefulShutdown("SIGUSR2"));
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught Exception:", error);
+  gracefulShutdown("uncaughtException");
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+
+  //gracefulShutdown('unhandledRejection')
+});
+
+// Start server
+const server = app.listen(port, () => {
+  logger.info(`WhatsApp WML Gateway started on port ${port}`);
+  logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
+  logger.info("WML endpoints available at /wml/");
+  logger.info("API endpoints available at /api/");
+
+  setInterval(() => {
+    storage.cleanupOldMessages(messageStore, chatStore, 100);
+  }, 60 * 60 * 1000); // every hour
+
+  setInterval(() => {
+    saveAll();
+    logger.info("Periodic save completed");
+  }, 10 * 60 * 1000);
+});
+
+server.on("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    logger.error(`Port ${port} is already in use`);
+    process.exit(1);
+  } else {
+    logger.error("Server error:", error);
+    process.exit(1);
+  }
+});
+
+// Initialize connection
+
+app.get("/api/status", (req, res) => {
+  const isConnected = !!sock?.authState?.creds;
+
+  res.json({
+    connected: isConnected,
+    status: connectionState,
+    user: sock?.user || null,
+    qrAvailable: !!currentQR,
+    syncStatus: {
+      isFullySynced,
+      syncAttempts,
+      contactsCount: contactStore.size,
+      chatsCount: chatStore.size,
+      messagesCount: messageStore.size,
+    },
+    uptime: process.uptime(),
+    recommendations: getRecommendations(isConnected),
+  });
+});
+
+app.get("/api/status-detailed", async (req, res) => {
+  try {
+    const isConnected = !!sock?.authState?.creds;
+    let syncStatus = {
+      contacts: contactStore.size,
+      chats: chatStore.size,
+      messages: messageStore.size,
+      isFullySynced,
+      syncAttempts,
+    };
+
+    res.json({
+      connected: isConnected,
+      status: connectionState,
+      user: sock?.user || null,
+      qrAvailable: !!currentQR,
+      syncStatus,
+      stores: {
+        contactStore: {
+          size: contactStore.size,
+          sample: Array.from(contactStore.entries())
+            .slice(0, 3)
+            .map(([key, value]) => ({
+              key,
+              name: value.name || value.notify || "Unknown",
+              hasName: !!value.name,
+            })),
+        },
+        chatStore: {
+          size: chatStore.size,
+          sample: Array.from(chatStore.keys()).slice(0, 5),
+        },
+      },
+      recommendations: getRecommendations(isConnected),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function getRecommendations(isConnected) {
+  if (!isConnected) {
+    return ["Please connect to WhatsApp first", "Check QR code if available"];
+  }
+
+  if (!isFullySynced && contactStore.size === 0 && chatStore.size === 0) {
+    return [
+      "Try calling POST /api/full-sync to force data loading",
+      "Wait a few more seconds for WhatsApp to sync",
+      "Send a test message to trigger data loading",
+    ];
+  }
+
+  if (contactStore.size === 0) {
+    return ["Call POST /api/force-sync-contacts to load contacts"];
+  }
+
+  if (chatStore.size === 0) {
+    return ["Call POST /api/force-sync-chats to load chats"];
+  }
+
+  return ["All systems operational"];
+}
+
+// Force sync endpoints
+app.post("/api/full-sync", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    console.log("🔄 Starting full manual sync...");
+    const results = {
+      contacts: 0,
+      chats: 0,
+      recentChats: 0,
+      errors: [],
+    };
+
+    // Sync contacts
+    try {
+      console.log("📞 Attempting contact sync...");
+
+      // In Baileys, contacts are populated automatically via events
+      // We can't manually fetch them, so we wait for the events
+      if (contactStore.size === 0) {
+        console.log("📞 Waiting for contacts to sync via events...");
+        await delay(3000); // Wait for events to populate
+      }
+
+      results.contacts = contactStore.size;
+      console.log(`📞 Contacts available: ${contactStore.size}`);
+    } catch (error) {
+      results.errors.push(`Contacts sync info: ${error.message}`);
+    }
+
+    // Sync chats
+    try {
+      const chats = await sock.groupFetchAllParticipating();
+      Object.keys(chats).forEach((chatId) => {
+        if (!chatStore.has(chatId)) {
+          chatStore.set(chatId, []);
+        }
+      });
+      results.chats = Object.keys(chats).length;
+      console.log(`💬 Manually synced ${Object.keys(chats).length} chats`);
+    } catch (error) {
+      results.errors.push(`Chats sync failed: ${error.message}`);
+    }
+
+    // Sync recent chats
+    try {
+      console.log("💬 Checking for additional chats...");
+
+      // In Baileys, we don't have fetchChats, but we have what we got from groupFetchAllParticipating
+      // Let's wait a bit more for any chat events
+      await delay(2000);
+
+      results.recentChats = chatStore.size - results.chats;
+      console.log(`💬 Additional chats found: ${results.recentChats}`);
+    } catch (error) {
+      results.errors.push(`Additional chats check failed: ${error.message}`);
+    }
+
+    // Update sync status
+    if (contactStore.size > 0 || chatStore.size > 0) {
+      isFullySynced = true;
+    }
+
+    res.json({
+      status: "completed",
+      results,
+      currentStore: {
+        contacts: contactStore.size,
+        chats: chatStore.size,
+        messages: messageStore.size,
+      },
+      isFullySynced,
+    });
+  } catch (error) {
+    console.error("❌ Full sync failed:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/force-sync-contacts", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    console.log("🔄 Checking contact sync status...");
+
+    // In Baileys, contacts are synced via events, not direct API calls
+    // We can only report what we have and potentially trigger a refresh
+    const initialCount = contactStore.size;
+
+    // Wait a bit to see if more contacts come in
+    console.log("📞 Waiting for contact events...");
+    await delay(3000);
+
+    const finalCount = contactStore.size;
+    const newContacts = finalCount - initialCount;
+
+    console.log(
+      `✅ Contact sync check completed. Total: ${finalCount}, New: ${newContacts}`
+    );
+
+    res.json({
+      status: "success",
+      message: "Contacts are synced via WhatsApp events",
+      initialCount,
+      finalCount,
+      newContacts,
+      totalInStore: contactStore.size,
+    });
+  } catch (error) {
+    console.error("❌ Contact sync check failed:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/force-sync-chats", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    console.log("🔄 Forcing chat sync...");
+
+    const initialChatCount = chatStore.size;
+
+    // Get participating groups (this works)
+    const chats = await sock.groupFetchAllParticipating();
+
+    Object.keys(chats).forEach((chatId) => {
+      if (!chatStore.has(chatId)) {
+        chatStore.set(chatId, []);
+      }
+    });
+
+    // Wait for any additional chat events
+    console.log("💬 Waiting for additional chat events...");
+    await delay(3000);
+
+    const finalChatCount = chatStore.size;
+    const newChats = finalChatCount - initialChatCount;
+
+    console.log(
+      `✅ Chat sync completed. Groups: ${
+        Object.keys(chats).length
+      }, Total: ${finalChatCount}`
+    );
+
+    res.json({
+      status: "success",
+      groupChats: Object.keys(chats).length,
+      initialTotal: initialChatCount,
+      finalTotal: finalChatCount,
+      newChats: newChats,
+      totalInStore: chatStore.size,
+    });
+  } catch (error) {
+    console.error("❌ Force sync chats failed:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/debug-stores", (req, res) => {
+  res.json({
+    connectionState,
+    isFullySynced,
+    syncAttempts,
+    contactStore: {
+      size: contactStore.size,
+      sample: Array.from(contactStore.entries())
+        .slice(0, 5)
+        .map(([key, value]) => ({
+          key,
+          name: value.name || value.notify || "Unknown",
+          hasName: !!value.name,
+          notify: value.notify,
+          verifiedName: value.verifiedName,
+        })),
+    },
+    chatStore: {
+      size: chatStore.size,
+      chats: Array.from(chatStore.keys()).slice(0, 10),
+    },
+    messageStore: {
+      size: messageStore.size,
+      sample: Array.from(messageStore.keys()).slice(0, 5),
+    },
+  });
+});
+
+// =================== QR CODE ENDPOINTS ===================
+
+app.get("/api/qr", (req, res) => {
+  if (currentQR) {
+    res.send(`
+            <html><body style="text-align:center;padding:50px;font-family:Arial;">
+                <h2>📱 WhatsApp QR Code</h2>
+                <div style="background:white;padding:20px;border-radius:10px;display:inline-block;">
+                    <img src="data:image/png;base64,${Buffer.from(
+                      currentQR
+                    ).toString(
+                      "base64"
+                    )}" style="border:10px solid #25D366;border-radius:10px;"/>
+                </div>
+                <p>Scan with WhatsApp app</p>
+                <p><small>Auto-refresh in 10 seconds</small></p>
+                <script>setTimeout(() => location.reload(), 10000);</script>
+            </body></html>
+        `);
+  } else {
+    res.json({
+      message: "QR not available",
+      connected: !!sock?.authState?.creds,
+      status: connectionState,
+    });
+  }
+});
+
+app.get("/api/qr/image", async (req, res) => {
+  const { format = "png" } = req.query;
+
+  if (!currentQR) {
+    return res.status(404).json({
+      error: "QR code not available",
+      connected: !!sock?.authState?.creds,
+      status: connectionState,
+    });
+  }
+
+  try {
+    if (format.toLowerCase() === "wbmp") {
+      // Generate QR as WBMP format using qrcode library
+      try {
+        const qrBuffer = await QRCode.toBuffer(currentQR, {
+          type: "png",
+          width: 256,
+          margin: 2,
+          color: {
+            dark: "#000000",
+            light: "#FFFFFF",
+          },
+        });
+
+        // Convert PNG to simple WBMP-like format
+        // WBMP is a monochrome format, so we'll return the QR as minimal binary
+        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
+        res.setHeader("Cache-Control", "no-cache");
+
+        // Return the buffer (simplified WBMP representation)
+        res.send(qrBuffer);
+      } catch (qrError) {
+        // Fallback: return raw QR string as WBMP
+        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
+        const qrBuffer = Buffer.from(currentQR, "utf8");
+        res.send(qrBuffer);
+      }
+    } else if (format.toLowerCase() === "base64") {
+      // Return as base64 JSON response
+      res.json({
+        qrCode: currentQR,
+        format: "base64",
+        timestamp: Date.now(),
+        dataUrl: `data:text/plain;base64,${Buffer.from(currentQR).toString(
+          "base64"
+        )}`,
+      });
+    } else if (format.toLowerCase() === "png") {
+      // Generate proper PNG QR code
+      try {
+        const qrBuffer = await QRCode.toBuffer(currentQR, {
+          type: "png",
+          width: 256,
+          margin: 2,
+          color: {
+            dark: "#000000",
+            light: "#FFFFFF",
+          },
+        });
+
+        res.setHeader("Content-Type", "image/png");
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.png"');
+        res.setHeader("Cache-Control", "no-cache");
+        res.send(qrBuffer);
+      } catch (qrError) {
+        // Fallback to base64 if available
+        res.setHeader("Content-Type", "image/png");
+        res.send(Buffer.from(currentQR, "base64"));
+      }
+    } else if (format.toLowerCase() === "svg") {
+      // Generate SVG QR code
+      try {
+        const qrSvg = await QRCode.toString(currentQR, {
+          type: "svg",
+          width: 256,
+          margin: 2,
+          color: {
+            dark: "#000000",
+            light: "#FFFFFF",
+          },
+        });
+
+        res.setHeader("Content-Type", "image/svg+xml");
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.svg"');
+        res.setHeader("Cache-Control", "no-cache");
+        res.send(qrSvg);
+      } catch (qrError) {
+        res.status(500).json({ error: "Failed to generate SVG QR code" });
+      }
+    } else {
+      res.status(400).json({
+        error: "Unsupported format",
+        supportedFormats: ["png", "svg", "base64", "wbmp"],
+        examples: [
+          "GET /api/qr/image?format=png",
+          "GET /api/qr/image?format=svg",
+          "GET /api/qr/image?format=wbmp",
+          "GET /api/qr/image?format=base64",
+        ],
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/qr/text", (req, res) => {
+  if (!currentQR) {
+    res.set("Content-Type", "text/vnd.wap.wml");
+    return res.send(`<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
+  "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="noqr" title="QR Not Available">
+    <p>QR code not available</p>
+  </card>
+</wml>`);
+  }
+
+  res.set("Content-Type", "text/vnd.wap.wml");
+  res.send(`<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
+  "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="qr" title="WhatsApp QR">
+    <p>Your QR string:</p>
+    <p>${currentQR}</p>
+  </card>
+</wml>`);
+});
+
+app.post("/api/logout", async (req, res) => {
+  try {
+    if (sock) await sock.logout();
+    if (fs.existsSync("./auth_info_baileys")) {
+      fs.rmSync("./auth_info_baileys", { recursive: true });
+    }
+
+    // Clear stores
+    contactStore.clear();
+    chatStore.clear();
+    messageStore.clear();
+    isFullySynced = false;
+    syncAttempts = 0;
+
+    res.json({ status: "Logged out and data cleared" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/me", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const profilePic = await sock
+      .profilePictureUrl(sock.user.id)
+      .catch(() => null);
+    const status = await sock.fetchStatus(sock.user.id).catch(() => null);
+
+    res.json({
+      user: sock.user,
+      profilePicture: profilePic,
+      status: status?.status,
+      syncStatus: {
+        isFullySynced,
+        contactsCount: contactStore.size,
+        chatsCount: chatStore.size,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/update-profile-name", async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.updateProfileName(name);
+    res.json({ status: "Profile name updated" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/update-profile-status", async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.updateProfileStatus(status);
+    res.json({ status: "Profile status updated" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/update-profile-picture", async (req, res) => {
+  try {
+    const { imageUrl } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    await sock.updateProfilePicture(sock.user.id, response.data);
+    res.json({ status: "Profile picture updated" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/presence", async (req, res) => {
+  try {
+    const { jid, presence = "available" } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    if (jid) {
+      await sock.sendPresenceUpdate(presence, formatJid(jid));
+    } else {
+      await sock.sendPresenceUpdate(presence);
+    }
+    res.json({ status: `Presence set to ${presence}` });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================== ENHANCED CONTACTS ENDPOINTS ===================
+
+app.get("/api/contacts/all", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    // Auto-sync if no contacts and not synced yet
+    if (contactStore.size === 0 && !isFullySynced) {
+      console.log("📞 No contacts found, waiting for sync events...");
+      // In Baileys, contacts come via events, so we just wait
+      await delay(2000);
+      console.log(`📞 Contacts after wait: ${contactStore.size}`);
+    }
+
+    const { page = 1, limit = 100, enriched = false } = req.query;
+    const contacts = Array.from(contactStore.values());
+
+    // Pagination
+    const startIndex = (parseInt(page) - 1) * parseInt(limit);
+    const endIndex = startIndex + parseInt(limit);
+    const paginatedContacts = contacts.slice(startIndex, endIndex);
+
+    if (enriched === "true") {
+      const enrichedContacts = [];
+
+      for (const contact of paginatedContacts) {
+        try {
+          const profilePic = await sock
+            .profilePictureUrl(contact.id, "image")
+            .catch(() => null);
+          const status = await sock.fetchStatus(contact.id).catch(() => null);
+          const businessProfile = await sock
+            .getBusinessProfile(contact.id)
+            .catch(() => null);
+
+          enrichedContacts.push({
+            id: contact.id,
+            name: contact.name || contact.notify || contact.verifiedName,
+            profilePicture: profilePic,
+            status: status?.status,
+            lastSeen: status?.setAt,
+            isMyContact: contact.name ? true : false,
+            isBusiness: !!businessProfile,
+            businessProfile: businessProfile,
+            notify: contact.notify,
+            verifiedName: contact.verifiedName,
+          });
+
+          await delay(150);
+        } catch (error) {
+          enrichedContacts.push({
+            id: contact.id,
+            name: contact.name || contact.notify || contact.verifiedName,
+            error: error.message,
+          });
+        }
+      }
+
+      res.json({
+        contacts: enrichedContacts,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: contacts.length,
+          totalPages: Math.ceil(contacts.length / parseInt(limit)),
+          hasNext: endIndex < contacts.length,
+          hasPrev: parseInt(page) > 1,
+        },
+        syncInfo: { isFullySynced, syncAttempts },
+      });
+    } else {
+      const basicContacts = paginatedContacts.map((contact) => ({
+        id: contact.id,
+        name: contact.name || contact.notify || contact.verifiedName,
+        notify: contact.notify,
+        verifiedName: contact.verifiedName,
+        isMyContact: contact.name ? true : false,
+      }));
+
+      res.json({
+        contacts: basicContacts,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: contacts.length,
+          totalPages: Math.ceil(contacts.length / parseInt(limit)),
+          hasNext: endIndex < contacts.length,
+          hasPrev: parseInt(page) > 1,
+        },
+        syncInfo: { isFullySynced, syncAttempts },
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/contacts/count", (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    res.json({
+      totalContacts: contactStore.size,
+      withNames: Array.from(contactStore.values()).filter((c) => c.name).length,
+      businessContacts: Array.from(contactStore.values()).filter(
+        (c) => c.verifiedName
+      ).length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/contacts/search", async (req, res) => {
+  try {
+    const { query, limit = 50 } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+    if (!query || query.length < 2) {
+      return res
+        .status(400)
+        .json({ error: "Query must be at least 2 characters" });
+    }
+
+    const searchQuery = query.toLowerCase();
+    const contacts = Array.from(contactStore.values());
+
+    const results = contacts
+      .filter((contact) => {
+        const name = (
+          contact.name ||
+          contact.notify ||
+          contact.verifiedName ||
+          ""
+        ).toLowerCase();
+        const number = contact.id.replace("@s.whatsapp.net", "");
+
+        return name.includes(searchQuery) || number.includes(searchQuery);
+      })
+      .slice(0, parseInt(limit));
+
+    res.json({
+      query: query,
+      results: results.map((contact) => ({
+        id: contact.id,
+        name: contact.name || contact.notify || contact.verifiedName,
+        notify: contact.notify,
+        verifiedName: contact.verifiedName,
+        number: contact.id.replace("@s.whatsapp.net", ""),
+        isMyContact: contact.name ? true : false,
+      })),
+      total: results.length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================== ENHANCED CHAT ENDPOINTS ===================
+
+app.get("/api/chats/with-numbers", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    // Auto-sync if no chats and not synced yet
+    if (chatStore.size === 0 && !isFullySynced) {
+      console.log("💬 No chats found, attempting auto-sync...");
+      try {
+        const chats = await sock.groupFetchAllParticipating();
+
+        Object.keys(chats).forEach((chatId) => {
+          if (!chatStore.has(chatId)) {
+            chatStore.set(chatId, []);
+          }
+        });
+
+        console.log(`💬 Auto-synced ${Object.keys(chats).length} group chats`);
+
+        // Wait for additional chat events
+        await delay(2000);
+        console.log(`💬 Total chats after wait: ${chatStore.size}`);
+      } catch (syncError) {
+        console.log("⚠️ Auto-sync failed:", syncError.message);
+      }
+    }
+
+    const chats = Array.from(chatStore.keys()).map((chatId) => {
+      const messages = chatStore.get(chatId) || [];
+      const lastMessage = messages[messages.length - 1];
+      const contact = contactStore.get(chatId);
+
+      const phoneNumber = chatId
+        .replace("@s.whatsapp.net", "")
+        .replace("@g.us", "");
+      const isGroup = chatId.endsWith("@g.us");
+
+      return {
+        id: chatId,
+        phoneNumber: isGroup ? null : phoneNumber,
+        groupId: isGroup ? phoneNumber : null,
+        isGroup: isGroup,
+        contact: {
+          name: contact?.name || contact?.notify || contact?.verifiedName,
+          isMyContact: contact?.name ? true : false,
+        },
+        messageCount: messages.length,
+        lastMessage: lastMessage
+          ? {
+              id: lastMessage.key.id,
+              message: extractMessageContent(lastMessage.message),
+              timestamp: lastMessage.messageTimestamp,
+              fromMe: lastMessage.key.fromMe,
+            }
+          : null,
+      };
+    });
+
+    chats.sort((a, b) => {
+      const aTime = a.lastMessage?.timestamp || 0;
+      const bTime = b.lastMessage?.timestamp || 0;
+      return bTime - aTime;
+    });
+
+    res.json({
+      chats,
+      total: chats.length,
+      directChats: chats.filter((c) => !c.isGroup).length,
+      groupChats: chats.filter((c) => c.isGroup).length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/chat/by-number/:number", async (req, res) => {
+  try {
+    const { number } = req.params;
+    const { limit = 50, offset = 0 } = req.query;
+
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const jid = formatJid(number);
+    const messages = chatStore.get(jid) || [];
+
+    const contact = contactStore.get(jid);
+    const profilePic = await sock.profilePictureUrl(jid).catch(() => null);
+    const status = await sock.fetchStatus(jid).catch(() => null);
+
+    // Pagination
+    const startIndex = Math.max(
+      0,
+      messages.length - parseInt(limit) - parseInt(offset)
+    );
+    const endIndex = messages.length - parseInt(offset);
+    const paginatedMessages = messages.slice(startIndex, endIndex);
+
+    const formattedMessages = paginatedMessages.map((msg) => ({
+      id: msg.key.id,
+      fromMe: msg.key.fromMe,
+      timestamp: msg.messageTimestamp,
+      message: extractMessageContent(msg.message),
+      messageType: getContentType(msg.message),
+      quoted: msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+        ? true
+        : false,
+    }));
+
+    res.json({
+      number: number,
+      jid: jid,
+      contact: {
+        name: contact?.name || contact?.notify || contact?.verifiedName,
+        profilePicture: profilePic,
+        status: status?.status,
+        lastSeen: status?.setAt,
+        isMyContact: contact?.name ? true : false,
+      },
+      chat: {
+        messages: formattedMessages,
+        total: messages.length,
+        showing: formattedMessages.length,
+        hasMore: startIndex > 0,
+        isGroup: jid.endsWith("@g.us"),
+      },
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/chat/exists/:number", (req, res) => {
+  try {
+    const { number } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const jid = formatJid(number);
+    const messages = chatStore.get(jid) || [];
+    const contact = contactStore.get(jid);
+
+    res.json({
+      number: number,
+      jid: jid,
+      exists: messages.length > 0,
+      messageCount: messages.length,
+      hasContact: !!contact,
+      contactName: contact?.name || contact?.notify || contact?.verifiedName,
+      lastActivity:
+        messages.length > 0
+          ? messages[messages.length - 1].messageTimestamp
+          : null,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/chat/stats/:number", async (req, res) => {
+  try {
+    const { number } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const jid = formatJid(number);
+    const messages = chatStore.get(jid) || [];
+    const contact = contactStore.get(jid);
+
+    if (messages.length === 0) {
+      return res.json({
+        number: number,
+        jid: jid,
+        exists: false,
+        message: "No chat history found",
+        syncInfo: { isFullySynced, syncAttempts },
+      });
+    }
+
+    // Calculate statistics
+    const myMessages = messages.filter((msg) => msg.key.fromMe);
+    const theirMessages = messages.filter((msg) => !msg.key.fromMe);
+    const mediaMessages = messages.filter((msg) => {
+      const type = getContentType(msg.message);
+      return [
+        "imageMessage",
+        "videoMessage",
+        "audioMessage",
+        "documentMessage",
+        "stickerMessage",
+      ].includes(type);
+    });
+
+    const firstMessage = messages[0];
+    const lastMessage = messages[messages.length - 1];
+
+    // Message types breakdown
+    const messageTypes = {};
+    messages.forEach((msg) => {
+      const type = getContentType(msg.message) || "unknown";
+      messageTypes[type] = (messageTypes[type] || 0) + 1;
+    });
+
+    res.json({
+      number: number,
+      jid: jid,
+      contact: {
+        name: contact?.name || contact?.notify || contact?.verifiedName,
+        isMyContact: contact?.name ? true : false,
+      },
+      statistics: {
+        totalMessages: messages.length,
+        myMessages: myMessages.length,
+        theirMessages: theirMessages.length,
+        mediaMessages: mediaMessages.length,
+        messageTypes: messageTypes,
+        firstMessage: {
+          timestamp: firstMessage.messageTimestamp,
+          fromMe: firstMessage.key.fromMe,
+        },
+        lastMessage: {
+          timestamp: lastMessage.messageTimestamp,
+          fromMe: lastMessage.key.fromMe,
+        },
+        chatDuration:
+          lastMessage.messageTimestamp - firstMessage.messageTimestamp,
+      },
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/chats/bulk-by-numbers", async (req, res) => {
+  try {
+    const { numbers, includeMessages = false, messageLimit = 10 } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+    if (!Array.isArray(numbers)) {
+      return res.status(400).json({ error: "Numbers must be an array" });
+    }
+
+    const results = [];
+
+    for (const number of numbers) {
+      try {
+        const jid = formatJid(number);
+        const messages = chatStore.get(jid) || [];
+        const contact = contactStore.get(jid);
+
+        const result = {
+          number: number,
+          jid: jid,
+          exists: messages.length > 0,
+          messageCount: messages.length,
+          contact: {
+            name: contact?.name || contact?.notify || contact?.verifiedName,
+            isMyContact: contact?.name ? true : false,
+          },
+        };
+
+        if (includeMessages && messages.length > 0) {
+          const recentMessages = messages.slice(-parseInt(messageLimit));
+          result.recentMessages = recentMessages.map((msg) => ({
+            id: msg.key.id,
+            fromMe: msg.key.fromMe,
+            timestamp: msg.messageTimestamp,
+            message: extractMessageContent(msg.message),
+            messageType: getContentType(msg.message),
+          }));
+        }
+
+        results.push(result);
+      } catch (error) {
+        results.push({
+          number: number,
+          error: error.message,
+        });
+      }
+    }
+
+    res.json({
+      results,
+      total: results.length,
+      withChats: results.filter((r) => r.exists).length,
+      withoutChats: results.filter((r) => !r.exists && !r.error).length,
+      errors: results.filter((r) => r.error).length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================== OTHER ENDPOINTS ===================
+
+app.get("/api/contacts", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const contacts = Array.from(contactStore.values());
+
+    const enrichedContacts = [];
+    for (const contact of contacts.slice(0, 50)) {
+      try {
+        const profilePic = await sock
+          .profilePictureUrl(contact.id, "image")
+          .catch(() => null);
+        const status = await sock.fetchStatus(contact.id).catch(() => null);
+
+        enrichedContacts.push({
+          id: contact.id,
+          name: contact.name || contact.notify || contact.verifiedName,
+          profilePicture: profilePic,
+          status: status?.status,
+          isMyContact: contact.name ? true : false,
+          lastSeen: status?.setAt,
+        });
+
+        await delay(100);
+      } catch (error) {
+        enrichedContacts.push({
+          id: contact.id,
+          name: contact.name || contact.notify || contact.verifiedName,
+          error: error.message,
+        });
+      }
+    }
+
+    res.json({
+      contacts: enrichedContacts,
+      total: contactStore.size,
+      showing: enrichedContacts.length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/chats", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const chats = Array.from(chatStore.keys()).map((chatId) => {
+      const messages = chatStore.get(chatId) || [];
+      const lastMessage = messages[messages.length - 1];
+
+      return {
+        id: chatId,
+        isGroup: chatId.endsWith("@g.us"),
+        messageCount: messages.length,
+        lastMessage: lastMessage
+          ? {
+              id: lastMessage.key.id,
+              message: extractMessageContent(lastMessage.message),
+              timestamp: lastMessage.messageTimestamp,
+              fromMe: lastMessage.key.fromMe,
+            }
+          : null,
+      };
+    });
+
+    chats.sort((a, b) => {
+      const aTime = a.lastMessage?.timestamp || 0;
+      const bTime = b.lastMessage?.timestamp || 0;
+      return bTime - aTime;
+    });
+
+    res.json({
+      chats,
+      total: chats.length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/messages/:jid", async (req, res) => {
+  try {
+    const { jid } = req.params;
+    const { limit = 50, offset = 0 } = req.query;
+
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const formattedJid = formatJid(jid);
+    const messages = chatStore.get(formattedJid) || [];
+
+    const startIndex = Math.max(
+      0,
+      messages.length - parseInt(limit) - parseInt(offset)
+    );
+    const endIndex = messages.length - parseInt(offset);
+    const paginatedMessages = messages.slice(startIndex, endIndex);
+
+    const formattedMessages = paginatedMessages.map((msg) => ({
+      id: msg.key.id,
+      fromMe: msg.key.fromMe,
+      timestamp: msg.messageTimestamp,
+      message: extractMessageContent(msg.message),
+      messageType: getContentType(msg.message),
+      quoted: msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+        ? true
+        : false,
+    }));
+
+    res.json({
+      jid: formattedJid,
+      messages: formattedMessages,
+      total: messages.length,
+      showing: formattedMessages.length,
+      hasMore: startIndex > 0,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/search-messages", async (req, res) => {
+  try {
+    const { query, jid, limit = 50 } = req.body;
+
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+    if (!query || query.length < 2) {
+      return res
+        .status(400)
+        .json({ error: "Query must be at least 2 characters" });
+    }
+
+    const results = [];
+    const searchQuery = query.toLowerCase();
+
+    const chatsToSearch = jid ? [formatJid(jid)] : Array.from(chatStore.keys());
+
+    for (const chatId of chatsToSearch) {
+      const messages = chatStore.get(chatId) || [];
+
+      for (const msg of messages) {
+        const content = extractMessageContent(msg.message);
+        const messageText =
+          content?.conversation ||
+          content?.extendedTextMessage?.text ||
+          content?.imageMessage?.caption ||
+          content?.videoMessage?.caption ||
+          "";
+
+        if (messageText.toLowerCase().includes(searchQuery)) {
+          results.push({
+            chatId,
+            messageId: msg.key.id,
+            fromMe: msg.key.fromMe,
+            timestamp: msg.messageTimestamp,
+            message: messageText,
+            messageType: getContentType(msg.message),
+          });
+
+          if (results.length >= limit) break;
+        }
+      }
+
+      if (results.length >= limit) break;
+    }
+
+    results.sort((a, b) => b.timestamp - a.timestamp);
+
+    res.json({
+      query: query,
+      results,
+      total: results.length,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/contact/:jid", async (req, res) => {
+  try {
+    const { jid } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const formattedJid = formatJid(jid);
+    const profilePic = await sock
+      .profilePictureUrl(formattedJid)
+      .catch(() => null);
+    const status = await sock.fetchStatus(formattedJid).catch(() => null);
+    const businessProfile = await sock
+      .getBusinessProfile(formattedJid)
+      .catch(() => null);
+
+    res.json({
+      jid: formattedJid,
+      profilePicture: profilePic,
+      status: status?.status,
+      businessProfile,
+      syncInfo: { isFullySynced, syncAttempts },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/block/:jid", async (req, res) => {
+  try {
+    const { jid } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.updateBlockStatus(formatJid(jid), "block");
+    res.json({ status: "Contact blocked" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/unblock/:jid", async (req, res) => {
+  try {
+    const { jid } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.updateBlockStatus(formatJid(jid), "unblock");
+    res.json({ status: "Contact unblocked" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/check-numbers", async (req, res) => {
+  try {
+    const { numbers } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const results = [];
+    for (const number of numbers) {
+      const jid = formatJid(number);
+      const exists = await sock.onWhatsApp(jid);
+      results.push({
+        number,
+        jid,
+        exists: exists.length > 0,
+        details: exists[0] || null,
+      });
+      await delay(500);
+    }
+
+    res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================== SEND MESSAGE ENDPOINTS ===================
+
+app.post("/api/send-text", async (req, res) => {
+  try {
+    const { to, message } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const result = await sock.sendMessage(formatJid(to), { text: message });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-image", async (req, res) => {
+  try {
+    const { to, imageUrl, caption } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      image: response.data,
+      caption,
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-video", async (req, res) => {
+  try {
+    const { to, videoUrl, caption } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      video: response.data,
+      caption,
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-audio", async (req, res) => {
+  try {
+    const { to, audioUrl, ptt = false } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const response = await axios.get(audioUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      audio: response.data,
+      ptt,
+      mimetype: "audio/mp4",
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-document", async (req, res) => {
+  try {
+    const { to, documentUrl, fileName, mimetype } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const response = await axios.get(documentUrl, {
+      responseType: "arraybuffer",
+    });
+    const result = await sock.sendMessage(formatJid(to), {
+      document: response.data,
+      fileName: fileName || "document",
+      mimetype: mimetype || "application/octet-stream",
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-sticker", async (req, res) => {
+  try {
+    const { to, imageUrl } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const result = await sock.sendMessage(formatJid(to), {
+      sticker: response.data,
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-location", async (req, res) => {
+  try {
+    const { to, latitude, longitude, name } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const result = await sock.sendMessage(formatJid(to), {
+      location: {
+        degreesLatitude: parseFloat(latitude),
+        degreesLongitude: parseFloat(longitude),
+        name,
+      },
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-contact", async (req, res) => {
+  try {
+    const { to, contacts } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const contactList = Array.isArray(contacts) ? contacts : [contacts];
+    const vCards = contactList.map((contact) => ({
+      displayName: contact.name,
+      vcard: `BEGIN:VCARD\nVERSION:3.0\nFN:${contact.name}\nTEL;type=CELL:${contact.number}\nEND:VCARD`,
+    }));
+
+    const result = await sock.sendMessage(formatJid(to), {
+      contacts: {
+        displayName: `${contactList.length} contact${
+          contactList.length > 1 ? "s" : ""
+        }`,
+        contacts: vCards,
+      },
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-poll", async (req, res) => {
+  try {
+    const { to, name, values, selectableCount = 1 } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const result = await sock.sendMessage(formatJid(to), {
+      poll: {
+        name,
+        values,
+        selectableCount: Math.min(selectableCount, values.length),
+      },
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-reaction", async (req, res) => {
+  try {
+    const { to, messageId, emoji } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const targetMessage = messageStore.get(messageId);
+    if (!targetMessage) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const result = await sock.sendMessage(formatJid(to), {
+      react: {
+        text: emoji,
+        key: targetMessage.key,
+      },
+    });
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-reply", async (req, res) => {
+  try {
+    const { to, message, quotedMessageId } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const quotedMessage = messageStore.get(quotedMessageId);
+    if (!quotedMessage) {
+      return res.status(404).json({ error: "Quoted message not found" });
+    }
+
+    const result = await sock.sendMessage(
+      formatJid(to),
+      { text: message },
+      { quoted: quotedMessage }
+    );
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/forward-message", async (req, res) => {
+  try {
+    const { messageId, to } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const targetMessage = messageStore.get(messageId);
+    if (!targetMessage) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const recipients = Array.isArray(to) ? to : [to];
+    const results = [];
+
+    for (const recipient of recipients) {
+      try {
+        const result = await sock.relayMessage(
+          formatJid(recipient),
+          targetMessage.message,
+          {}
+        );
+        results.push({
+          recipient: formatJid(recipient),
+          status: "sent",
+          messageId: result.key.id,
+        });
+      } catch (error) {
+        results.push({
+          recipient: formatJid(recipient),
+          status: "failed",
+          error: error.message,
+        });
+      }
+      await delay(1000);
+    }
+
+    res.json({ status: "ok", results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/delete-message", async (req, res) => {
+  try {
+    const { messageId, to } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const targetMessage = messageStore.get(messageId);
+    if (!targetMessage) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    await sock.sendMessage(formatJid(to), { delete: targetMessage.key });
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/read-messages", async (req, res) => {
+  try {
+    const { messageIds } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const keys = messageIds
+      .map((id) => {
+        const msg = messageStore.get(id);
+        return msg ? msg.key : null;
+      })
+      .filter(Boolean);
+
+    if (keys.length === 0) {
+      return res.status(404).json({ error: "No valid messages found" });
+    }
+
+    await sock.readMessages(keys);
+    res.json({ status: "ok", markedAsRead: keys.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================== GROUP MANAGEMENT ===================
+
+app.post("/api/group-create", async (req, res) => {
+  try {
+    const { name, participants } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const participantJids = participants.map((jid) => formatJid(jid));
+    const group = await sock.groupCreate(name, participantJids);
+
+    res.json({ status: "ok", groupId: group.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/groups", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const groups = await sock.groupFetchAllParticipating();
+    res.json({ groups: Object.values(groups) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/group/:groupId/metadata", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const metadata = await sock.groupMetadata(groupId);
+    res.json({ group: metadata });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/group/:groupId/participants", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { participants, action } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const participantJids = participants.map((jid) => formatJid(jid));
+    const result = await sock.groupParticipantsUpdate(
+      groupId,
+      participantJids,
+      action
+    );
+
+    res.json({ status: "ok", result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/group/:groupId/subject", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { subject } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.groupUpdateSubject(groupId, subject);
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/group/:groupId/description", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { description } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.groupUpdateDescription(groupId, description);
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/group/:groupId/settings", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const { setting, value } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.groupSettingUpdate(groupId, setting, value);
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/group/:groupId/invite-code", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const code = await sock.groupInviteCode(groupId);
+    res.json({
+      inviteCode: code,
+      inviteUrl: `https://chat.whatsapp.com/${code}`,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/group/:groupId/revoke-invite", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const newCode = await sock.groupRevokeInvite(groupId);
+    res.json({
+      status: "ok",
+      newInviteCode: newCode,
+      newInviteUrl: `https://chat.whatsapp.com/${newCode}`,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/group/:groupId/leave", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.groupLeave(groupId);
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =================== MEDIA & UTILITIES ===================
+
+app.post("/api/download-media", async (req, res) => {
+  try {
+    const { messageId } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const message = messageStore.get(messageId);
+    if (!message) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const contentType = getContentType(message.message);
+    if (
+      ![
+        "imageMessage",
+        "videoMessage",
+        "audioMessage",
+        "documentMessage",
+      ].includes(contentType)
+    ) {
+      return res.status(400).json({ error: "No downloadable media" });
+    }
+
+    const mediaData = await downloadMediaMessage(message, "buffer", {});
+    if (!mediaData) {
+      return res.status(400).json({ error: "Failed to download media" });
+    }
+
+    const fileName = `media_${messageId}_${Date.now()}`;
+    const filePath = path.join(__dirname, "downloads", fileName);
+
+    if (!fs.existsSync(path.dirname(filePath))) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    }
+
+    fs.writeFileSync(filePath, mediaData);
+
+    res.json({
+      status: "ok",
+      fileName,
+      filePath,
+      contentType,
+      size: mediaData.length,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/privacy", async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const privacy = await sock.fetchPrivacySettings();
+    res.json({ privacySettings: privacy });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/privacy", async (req, res) => {
+  try {
+    const { setting, value } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    await sock.updatePrivacySettings({ [setting]: value });
+    res.json({ status: "ok" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-status", async (req, res) => {
+  try {
+    const { type, content } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    let statusMessage = {};
+
+    if (type === "text") {
+      statusMessage = { text: content };
+    } else if (type === "image") {
+      const response = await axios.get(content, {
+        responseType: "arraybuffer",
+      });
+      statusMessage = { image: response.data };
+    } else if (type === "video") {
+      const response = await axios.get(content, {
+        responseType: "arraybuffer",
+      });
+      statusMessage = { video: response.data };
+    }
+
+    const result = await sock.sendMessage("status@broadcast", statusMessage);
+    res.json({ status: "ok", messageId: result.key.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/send-broadcast", async (req, res) => {
+  try {
+    const { message, recipients, delay: msgDelay = 2000 } = req.body;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const results = [];
+
+    for (let i = 0; i < recipients.length; i++) {
+      try {
+        const result = await sock.sendMessage(formatJid(recipients[i]), {
+          text: message,
+        });
+        results.push({
+          recipient: formatJid(recipients[i]),
+          status: "sent",
+          messageId: result.key.id,
+        });
+
+        if (i < recipients.length - 1) {
+          await delay(parseInt(msgDelay));
+        }
+      } catch (error) {
+        results.push({
+          recipient: formatJid(recipients[i]),
+          status: "failed",
+          error: error.message,
+        });
+      }
+    }
+
+    res.json({ status: "ok", results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// API endpoint per servire profile picture in tutti i formati con WBMP AD ALTISSIMA FEDELTA
+app.get("/api/profile-picture/:format", async (req, res) => {
+  try {
+    const { format } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const profilePicUrl = await sock.profilePictureUrl(sock.user.id, "image");
+    if (!profilePicUrl) {
+      return res.status(404).json({ error: "No profile picture set" });
+    }
+
+    console.log("Profile picture request:", format);
+
+    // Download original image
+    let mediaData = await axios.get(profilePicUrl, {
+      responseType: "arraybuffer",
+    });
+    mediaData = mediaData.data;
+
+    let mimeType = "application/octet-stream";
+    let filename = "profile-picture";
+
+    // Handle different formats with MASTERPIECE-QUALITY WBMP
+    if (format === "wbmp") {
+      // CONVERSIONE WBMP MASTERPIECE - Input di massima qualità per output perfetto
+      try {
+        console.log("Starting MASTERPIECE QUALITY WBMP conversion...");
+
+        // Step 1: Ottieni la versione di altissima qualità dell'immagine originale
+        console.log("Downloading HIGHEST quality source image...");
+        let highQualityUrl = profilePicUrl;
+
+        // Prova a ottenere versione ad alta risoluzione se disponibile
+        try {
+          const hqProfilePic = await sock.profilePictureUrl(
+            sock.user.id,
+            "preview"
+          ); // Versione più grande
+          if (hqProfilePic && hqProfilePic !== profilePicUrl) {
+            highQualityUrl = hqProfilePic;
+            console.log(
+              "Found higher quality version:",
+              hqProfilePic.length,
+              "chars"
+            );
+          }
+        } catch (e) {
+          console.log("Using standard quality source");
+        }
+
+        // Download con headers per massima qualità
+        const hqResponse = await axios.get(highQualityUrl, {
+          responseType: "arraybuffer",
+          headers: {
+            "User-Agent": "WhatsApp/2.21.0",
+            Accept: "image/jpeg,image/png,image/*;q=0.8,*/*;q=0.5",
+          },
+        });
+        const hqImageData = hqResponse.data;
+
+        console.log(`Source image size: ${hqImageData.length} bytes`);
+
+        // Step 2: Pre-processing di livello professionale
+        console.log("Applying professional preprocessing...");
+
+        // Prima passata: ottimizzazione dimensioni e contrasto
+        const stage1 = await sharp(hqImageData)
+          .resize(320, 320, {
+            // Risoluzione altissima per analisi dettagliata
+            fit: "cover",
+            position: "entropy", // Posizionamento intelligente basato su entropia
+            kernel: sharp.kernel.lanczos3,
+          })
+          .modulate({
+            brightness: 1.05,
+            contrast: 1.2,
+            saturation: 0,
+          })
+          .toBuffer();
+
+        // Seconda passata: analisi dell'istogramma per ottimizzazione dinamica
+        const stats = await sharp(stage1).stats();
+        console.log("Image statistics:", {
+          channels: stats.channels?.map((c) => ({
+            mean: Math.round(c.mean),
+            std: Math.round(c.std),
+            min: c.min,
+            max: c.max,
+          })),
+        });
+
+        // Calcola parametri di ottimizzazione basati sulle statistiche
+        const meanBrightness = stats.channels?.[0]?.mean || 128;
+        const contrast = stats.channels?.[0]?.std || 64;
+        const dynamicBrightness =
+          meanBrightness < 100 ? 1.15 : meanBrightness > 180 ? 0.9 : 1.0;
+        const dynamicContrast = contrast < 40 ? 1.6 : contrast > 80 ? 1.1 : 1.3;
+
+        console.log("Dynamic adjustments:", {
+          dynamicBrightness,
+          dynamicContrast,
+        });
+
+        // Terza passata: preprocessing finale ottimizzato
+        const stage2 = await sharp(stage1)
+          .modulate({
+            brightness: dynamicBrightness,
+            contrast: dynamicContrast,
+            saturation: 0,
+          })
+          .sharpen(1.5, 1, 3) // Sharpening aggressivo
+          .normalise({ lower: 2, upper: 98 }) // Normalizzazione estrema
+          .toBuffer();
+
+        // Step 3: Riduzione finale alla risoluzione target con filtri avanzati
+        const { data: rawPixels, info } = await sharp(stage2)
+          .resize(200, 200, {
+            // Risoluzione finale molto alta per WBMP
+            fit: "cover",
+            position: "entropy",
+            kernel: sharp.kernel.lanczos3,
+          })
+          .convolve({
+            // Edge enhancement personalizzato
+            width: 3,
+            height: 3,
+            kernel: [
+              -0.1666, -0.6666, -0.1666, -0.6666, 4.3332, -0.6666, -0.1666,
+              -0.6666, -0.1666,
+            ],
+          })
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+
+        console.log(
+          `Final processing: ${info.width}x${info.height}, ${rawPixels.length} pixels`
+        );
+
+        // Step 4: Algoritmo di dithering MASTERPIECE con analisi locale avanzata
+        function createMasterpieceWBMP(pixels, width, height) {
+          console.log("Creating MASTERPIECE WBMP with advanced algorithms...");
+
+          const typeField = Buffer.from([0x00]);
+          const fixHeader = Buffer.from([0x00]);
+
+          function encodeMultiByte(value) {
+            if (value < 128) return Buffer.from([value]);
+            const bytes = [];
+            let remaining = value;
+            while (remaining >= 128) {
+              bytes.unshift(remaining & 0x7f);
+              remaining = remaining >> 7;
+            }
+            bytes.unshift(remaining | 0x80);
+            return Buffer.from(bytes);
+          }
+
+          const widthBytes = encodeMultiByte(width);
+          const heightBytes = encodeMultiByte(height);
+          const bytesPerRow = Math.ceil(width / 8);
+          const data = Buffer.alloc(bytesPerRow * height, 0x00);
+
+          // Buffer per error diffusion multi-livello
+          const errorBufferR = new Float32Array(width * height);
+          const errorBufferG = new Float32Array(width * height);
+          const errorBufferB = new Float32Array(width * height);
+
+          // Analisi preliminare per threshold adattivo globale
+          let histogram = new Array(256).fill(0);
+          for (let i = 0; i < pixels.length; i++) {
+            histogram[pixels[i]]++;
+          }
+
+          // Trova soglia ottimale con metodo Otsu
+          function otsuThreshold(hist, total) {
+            let sum = 0;
+            for (let i = 0; i < 256; i++) sum += i * hist[i];
+
+            let sumB = 0;
+            let wB = 0;
+            let wF = 0;
+            let varMax = 0;
+            let threshold = 0;
+
+            for (let t = 0; t < 256; t++) {
+              wB += hist[t];
+              if (wB === 0) continue;
+
+              wF = total - wB;
+              if (wF === 0) break;
+
+              sumB += t * hist[t];
+
+              let mB = sumB / wB;
+              let mF = (sum - sumB) / wF;
+
+              let varBetween = wB * wF * (mB - mF) * (mB - mF);
+
+              if (varBetween > varMax) {
+                varMax = varBetween;
+                threshold = t;
+              }
+            }
+
+            return threshold;
+          }
+
+          const globalThreshold = otsuThreshold(histogram, pixels.length);
+          console.log("Otsu threshold:", globalThreshold);
+
+          // Dithering con algoritmo Sierra-3 + analisi locale
+          for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+              const pixelIndex = y * width + x;
+              let pixelValue = pixels[pixelIndex] + errorBufferR[pixelIndex];
+
+              // Clamp
+              pixelValue = Math.max(0, Math.min(255, pixelValue));
+
+              // Analisi del contrasto locale in finestra 5x5
+              let localMean = 0;
+              let localVar = 0;
+              let localSamples = 0;
+
+              for (let dy = -2; dy <= 2; dy++) {
+                for (let dx = -2; dx <= 2; dx++) {
+                  const nx = x + dx;
+                  const ny = y + dy;
+                  if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    const sampleValue = pixels[ny * width + nx];
+                    localMean += sampleValue;
+                    localSamples++;
+                  }
+                }
+              }
+
+              if (localSamples > 0) {
+                localMean /= localSamples;
+
+                for (let dy = -2; dy <= 2; dy++) {
+                  for (let dx = -2; dx <= 2; dx++) {
+                    const nx = x + dx;
+                    const ny = y + dy;
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                      const sampleValue = pixels[ny * width + nx];
+                      localVar += Math.pow(sampleValue - localMean, 2);
+                    }
+                  }
+                }
+                localVar = Math.sqrt(localVar / localSamples);
+              }
+
+              // Threshold adattivo basato su contrasto locale e globale
+              let adaptiveThreshold = globalThreshold;
+
+              if (localVar > 20) {
+                // Area ad alto contrasto
+                adaptiveThreshold = localMean; // Usa media locale
+              } else if (localVar < 8) {
+                // Area uniforme
+                adaptiveThreshold = globalThreshold; // Usa threshold globale
+              } else {
+                // Area intermedia
+                const blend = (localVar - 8) / 12;
+                adaptiveThreshold =
+                  globalThreshold * (1 - blend) + localMean * blend;
+              }
+
+              const isBlack = pixelValue < adaptiveThreshold;
+              const targetValue = isBlack ? 0 : 255;
+              const error = pixelValue - targetValue;
+
+              // Error diffusion Sierra-3 (migliore di Floyd-Steinberg per dettagli)
+              const errorDistribution = [
+                { dx: 1, dy: 0, weight: 5 / 32 },
+                { dx: 2, dy: 0, weight: 3 / 32 },
+                { dx: -2, dy: 1, weight: 2 / 32 },
+                { dx: -1, dy: 1, weight: 4 / 32 },
+                { dx: 0, dy: 1, weight: 5 / 32 },
+                { dx: 1, dy: 1, weight: 4 / 32 },
+                { dx: 2, dy: 1, weight: 2 / 32 },
+                { dx: -1, dy: 2, weight: 2 / 32 },
+                { dx: 0, dy: 2, weight: 3 / 32 },
+                { dx: 1, dy: 2, weight: 2 / 32 },
+              ];
+
+              for (const dist of errorDistribution) {
+                const nx = x + dist.dx;
+                const ny = y + dist.dy;
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                  const targetIndex = ny * width + nx;
+                  errorBufferR[targetIndex] += error * dist.weight;
+                }
+              }
+
+              // Set pixel nel WBMP
+              if (isBlack) {
+                const byteIndex = y * bytesPerRow + Math.floor(x / 8);
+                const bitPosition = 7 - (x % 8);
+                data[byteIndex] |= 1 << bitPosition;
+              }
+            }
+          }
+
+          console.log("MASTERPIECE WBMP creation completed");
+          return Buffer.concat([
+            typeField,
+            fixHeader,
+            widthBytes,
+            heightBytes,
+            data,
+          ]);
+        }
+
+        mediaData = createMasterpieceWBMP(rawPixels, 200, 200);
+        mimeType = "image/vnd.wap.wbmp";
+        filename = "profile-masterpiece.wbmp";
+
+        console.log(
+          `🎨 MASTERPIECE WBMP created: ${mediaData.length} bytes, 200x200 resolution`
+        );
+        console.log(
+          "Quality features: Otsu thresholding + Sierra-3 dithering + local contrast analysis"
+        );
+      } catch (conversionError) {
+        console.error("⚠️ Masterpiece conversion failed:", conversionError);
+        return res.status(500).json({
+          error: "Masterpiece WBMP conversion failed",
+          details: conversionError.message,
+        });
+      }
+    } else if (format === "small.jpg" || format === "thumbnail") {
+      // Small optimized JPEG for Nokia (same logic as media)
+      try {
+        mediaData = await sharp(mediaData)
+          .resize(128, 128, { fit: "inside", withoutEnlargement: true })
+          .jpeg({
+            quality: 40,
+            progressive: false,
+            mozjpeg: false,
+          })
+          .toBuffer();
+
+        mimeType = "image/jpeg";
+        filename = "profile-picture-small.jpg";
+      } catch (conversionError) {
+        logger.warn("JPEG optimization failed:", conversionError.message);
+        mimeType = "image/jpeg";
+        filename = "profile-picture.jpg";
+      }
+    } else if (format === "small.png") {
+      // Small optimized PNG for Nokia
+      try {
+        mediaData = await sharp(mediaData)
+          .resize(128, 128, { fit: "inside", withoutEnlargement: true })
+          .png({
+            compressionLevel: 9,
+            colors: 16,
+            quality: 50,
+          })
+          .toBuffer();
+
+        mimeType = "image/png";
+        filename = "profile-picture-small.png";
+      } catch (conversionError) {
+        logger.warn("PNG optimization failed:", conversionError.message);
+        mimeType = "image/png";
+        filename = "profile-picture.png";
+      }
+    } else if (format === "jpg" || format === "jpeg") {
+      mimeType = "image/jpeg";
+      filename = "profile-picture.jpg";
+    } else if (format === "png") {
+      mimeType = "image/png";
+      filename = "profile-picture.png";
+    } else {
+      return res.status(400).json({
+        error: "Unsupported format",
+        supportedFormats: [
+          "jpg",
+          "png",
+          "wbmp",
+          "small.jpg",
+          "small.png",
+          "thumbnail",
+        ],
+      });
+    }
+
+    // Set headers (same as media system)
+    if (format === "wbmp") {
+      console.log("Sending HIGH FIDELITY WBMP response");
+      res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+      res.setHeader("Content-Length", mediaData.length);
+      res.setHeader("Cache-Control", "no-cache"); // Disable cache for testing
+    } else {
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`
+      );
+      res.setHeader("Content-Length", mediaData.length);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+    }
+
+    console.log(
+      `Sending response: ${
+        mediaData.length
+      } bytes, Content-Type: ${res.getHeader("Content-Type")}`
+    );
+    res.send(mediaData);
+  } catch (error) {
+    logger.error("Profile picture download error:", error);
+    res.status(500).json({ error: error.message });
+  }
+}); // Complete Profile Management System for WML Interface
+// Enhanced Me/Profile page with full functionality
+
+app.get("/wml/me.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/home.wml")
+      );
+      return;
+    }
+
+    const user = sock.user;
+    let profilePic = null;
+    let status = null;
+
+    try {
+      profilePic = await sock.profilePictureUrl(user.id).catch(() => null);
+      status = await sock.fetchStatus(user.id).catch(() => null);
+    } catch (e) {
+      // Silent fail for optional features
+    }
+
+    const body = `
+      <p><b>My Profile</b></p>
+      <p>Name: <b>${esc(user?.name || user?.notify || "Unknown")}</b></p>
+      <p>Number: ${esc(
+        user?.id?.replace("@s.whatsapp.net", "") || "Unknown"
+      )}</p>
+      <p>JID: <small>${esc(user?.id || "Unknown")}</small></p>
+      ${
+        status
+          ? `<p>Status: <em>${esc(status.status || "No status")}</em></p>`
+          : "<p>Status: <em>No status</em></p>"
+      }
+      ${
+        status?.setAt
+          ? `<p><small>Updated: ${new Date(
+              status.setAt
+            ).toLocaleString()}</small></p>`
+          : ""
+      }
+      
+      <p><b>Profile Actions:</b></p>
+      <p>
+        <a href="/wml/profile.edit-name.wml" accesskey="1">[1] Edit Name</a><br/>
+        <a href="/wml/profile.edit-status.wml" accesskey="2">[2] Edit Status</a><br/>
+        <a href="/wml/profile.picture.wml" accesskey="3">[3] View Profile Picture</a><br/>
+      </p>
+      
+      <p><b>Account Info:</b></p>
+      <p>Connected: ${esc(connectionState)}</p>
+      <p>Sync Status: ${isFullySynced ? "Complete" : "In Progress"}</p>
+      <p>Data: ${contactStore.size} contacts, ${chatStore.size} chats</p>
+      <p>Messages: ${messageStore.size} stored</p>
+      <p>Uptime: ${Math.floor(process.uptime() / 60)} minutes</p>
+      
+      ${navigationBar()}
+      
+      <do type="accept" label="Edit Name">
+        <go href="/wml/profile.edit-name.wml"/>
+      </do>
+      <do type="options" label="Refresh">
+        <go href="/wml/me.wml"/>
+      </do>
+    `;
+
+    sendWml(res, card("me", "My Profile", body));
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Error",
+        [e.message || "Failed to load profile"],
+        "/wml/home.wml"
+      )
+    );
+  }
+});
+
+// Edit Name page
+app.get("/wml/profile.edit-name.wml", (req, res) => {
+  if (!sock) {
+    sendWml(
+      res,
+      resultCard("Error", ["Not connected to WhatsApp"], "/wml/me.wml")
+    );
+    return;
+  }
+
+  const user = sock.user;
+  const currentName = user?.name || user?.notify || "";
+  const success = req.query.success === "1";
+  const preset = req.query.preset || "";
+
+  const successMessage = success
+    ? `
+    <p><b>✓ Name Updated Successfully!</b></p>
+    <p></p>
+  `
+    : "";
+
+  const body = `
+    <p><b>Edit Profile Name</b></p>
+    ${successMessage}
+    
+    <p>Current Name: <b>${esc(currentName || "Not set")}</b></p>
+    
+    <p>New Name:</p>
+    <input name="name" title="Your name" value="${esc(
+      preset || currentName
+    )}" size="25" maxlength="25"/>
+    
+    <p><small>Max 25 characters. This is your display name on WhatsApp.</small></p>
+    
+    <do type="accept" label="Update">
+      <go method="post" href="/wml/profile.update-name">
+        <postfield name="name" value="$(name)"/>
+      </go>
+    </do>
+    
+    <p><b>Quick Names:</b></p>
+    <p>
+      <a href="/wml/profile.edit-name.wml?preset=${encodeURIComponent(
+        currentName
+      )}" accesskey="1">[1] Keep Current</a><br/>
+      <a href="/wml/profile.edit-name.wml?preset=${encodeURIComponent(
+        user?.id?.replace("@s.whatsapp.net", "") || ""
+      )}" accesskey="2">[2] Use Number</a><br/>
+    </p>
+    
+    <p>
+      <a href="/wml/me.wml" accesskey="0">[0] Back to Profile</a> |
+      <a href="/wml/home.wml" accesskey="*">[*] Home</a>
+    </p>
+    
+    <do type="options" label="Cancel">
+      <go href="/wml/me.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("edit-name", "Edit Name", body));
+});
+
+// Edit Status page
+app.get("/wml/profile.edit-status.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/me.wml")
+      );
+      return;
+    }
+
+    const user = sock.user;
+    let currentStatus = "Loading...";
+
+    try {
+      const status = await sock.fetchStatus(user.id);
+      currentStatus = status?.status || "No status set";
+    } catch (e) {
+      currentStatus = "Could not load status";
+    }
+
+    const success = req.query.success === "1";
+    const preset = req.query.preset || "";
+
+    const successMessage = success
+      ? `
+      <p><b>✓ Status Updated Successfully!</b></p>
+      <p></p>
+    `
+      : "";
+
+    const statusTemplates = [
+      "Available",
+      "Busy",
+      "At work",
+      "Can't talk, WhatsApp only",
+      "In a meeting",
+      "Sleeping",
+      "Battery about to die",
+    ];
+
+    const body = `
+      <p><b>Edit Status Message</b></p>
+      ${successMessage}
+      
+      <p>Current Status: <b>${esc(currentStatus)}</b></p>
+      
+      <p>New Status:</p>
+      <input name="status" title="Status message" value="${esc(
+        preset ||
+          (currentStatus !== "Loading..." &&
+          currentStatus !== "Could not load status"
+            ? currentStatus
+            : "")
+      )}" size="30" maxlength="139"/>
+      
+      <p><small>Max 139 characters. Leave empty to remove status.</small></p>
+      
+      <do type="accept" label="Update">
+        <go method="post" href="/wml/profile.update-status">
+          <postfield name="status" value="$(status)"/>
+        </go>
+      </do>
+      
+      <p><b>Quick Status:</b></p>
+      ${statusTemplates
+        .map(
+          (tmpl, i) =>
+            `<p><a href="/wml/profile.edit-status.wml?preset=${encodeURIComponent(
+              tmpl
+            )}" accesskey="${i + 1}">[${i + 1}] ${esc(tmpl)}</a></p>`
+        )
+        .join("")}
+      
+      <p>
+        <a href="/wml/me.wml" accesskey="0">[0] Back to Profile</a> |
+        <a href="/wml/home.wml" accesskey="*">[*] Home</a>
+      </p>
+      
+      <do type="options" label="Cancel">
+        <go href="/wml/me.wml"/>
+      </do>
+    `;
+
+    sendWml(res, card("edit-status", "Edit Status", body));
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Error",
+        [e.message || "Failed to load status editor"],
+        "/wml/me.wml"
+      )
+    );
+  }
+});
+
+// View Profile Picture page (RIUSA SISTEMA MEDIA MESSAGGI - FIXED XML)
+app.get("/wml/profile.picture.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/me.wml")
+      );
+      return;
+    }
+
+    const user = sock.user;
+    let profilePic = null;
+    let hasProfilePic = false;
+
+    try {
+      profilePic = await sock.profilePictureUrl(user.id, "image");
+      hasProfilePic = !!profilePic;
+    } catch (e) {
+      // No profile picture or error loading
+    }
+
+    const body = hasProfilePic
+      ? `
+      <p><b>My Profile Picture</b></p>
+      <p>Profile picture available</p>
+      
+      <p><b>Nokia Compatible:</b></p>
+      <p>
+        <a href="/wml/view-profile-wbmp.wml" accesskey="1">[1] WBMP View</a><br/>
+        <a href="/api/profile-picture/small.jpg" accesskey="2">[2] Small JPG</a><br/>
+        <a href="/api/profile-picture/small.png" accesskey="3">[3] Small PNG</a><br/>
+      </p>
+      
+      <p><b>Full Quality:</b></p>
+      <p>
+        <a href="${esc(profilePic)}" accesskey="4">[4] Original</a><br/>
+        <a href="/api/profile-picture/jpg" accesskey="5">[5] Download JPG</a><br/>
+        <a href="/api/profile-picture/png" accesskey="6">[6] Download PNG</a><br/>
+      </p>
+      
+      <p><b>Mobile Formats:</b></p>
+      <p>
+        <a href="/api/profile-picture/wbmp" accesskey="7">[7] WBMP Download</a><br/>
+        <a href="/api/profile-picture/thumbnail" accesskey="8">[8] Thumbnail</a><br/>
+      </p>
+    `
+      : `
+      <p><b>My Profile Picture</b></p>
+      <p><em>No profile picture set</em></p>
+      
+      <p><b>Info:</b></p>
+      <p>Profile picture can only be updated from WhatsApp mobile app.</p>
+      <p>Once set, you can view it here in multiple formats including WBMP for old devices.</p>
+    `;
+
+    const fullBody = `
+      ${body}
+      
+      <p>
+        <a href="/wml/me.wml" accesskey="0">[0] Back to Profile</a> |
+        <a href="/wml/home.wml" accesskey="*">[*] Home</a>
+      </p>
+      
+      <do type="accept" label="Back">
+        <go href="/wml/me.wml"/>
+      </do>
+      <do type="options" label="Refresh">
+        <go href="/wml/profile.picture.wml"/>
+      </do>
+    `;
+
+    sendWml(res, card("profile-pic", "Profile Picture", fullBody));
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Error",
+        [e.message || "Failed to load profile picture"],
+        "/wml/me.wml"
+      )
+    );
+  }
+});
+
+// Pagina dedicata per visualizzare profile picture in WBMP (FIXED XML + HIGH FIDELITY)
+app.get("/wml/view-profile-wbmp.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/me.wml")
+      );
+      return;
+    }
+
+    const user = sock.user;
+    let hasProfilePic = false;
+
+    try {
+      const profilePic = await sock.profilePictureUrl(user.id, "image");
+      hasProfilePic = !!profilePic;
+    } catch (e) {
+      // No profile picture
+    }
+
+    // Escape sicuro per WML
+    const escWml = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+
+    let body = "";
+    let title = "Profile Picture (WBMP)";
+
+    if (hasProfilePic) {
+      body = `<p><b>My Profile Picture</b></p>
+<p>Nokia 7210 Compatible Format</p>
+<p>
+<img src="/api/profile-picture/wbmp" alt="Profile WBMP"/>
+</p>
+<p>
+<a href="/wml/profile.picture.wml" accesskey="0">[0] Back to Picture Options</a>
+</p>
+<p>
+<a href="/wml/me.wml" accesskey="1">[1] Back to Profile</a> |
+<a href="/wml/home.wml" accesskey="9">[9] Home</a>
+</p>`;
+    } else {
+      body = `<p><b>No Profile Picture</b></p>
+<p>No profile picture set</p>
+<p>
+<a href="/wml/me.wml" accesskey="0">[0] Back to Profile</a>
+</p>`;
+    }
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>
+<card id="wbmp-profile" title="${escWml(title)}">
+${body}
+<do type="accept" label="Back">
+<go href="/wml/profile.picture.wml"/>
+</do>
+<do type="options" label="Profile">
+<go href="/wml/me.wml"/>
+</do>
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("Profile WBMP view error:", error);
+    res.status(500).send("Error loading profile WBMP view");
+  }
+});
+
+// POST handler for updating name
+app.post("/wml/profile.update-name", async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!sock) throw new Error("Not connected");
+    if (!name || name.trim().length === 0)
+      throw new Error("Name cannot be empty");
+    if (name.trim().length > 25)
+      throw new Error("Name too long (max 25 characters)");
+
+    await sock.updateProfileName(name.trim());
+
+    sendWml(
+      res,
+      resultCard(
+        "Name Updated",
+        [
+          `New name: ${esc(name.trim())}`,
+          "Profile name updated successfully!",
+          "Changes may take a few minutes to appear.",
+        ],
+        "/wml/profile.edit-name.wml?success=1",
+        true
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Update Failed",
+        [
+          e.message || "Failed to update name",
+          "Please try again or check connection",
+        ],
+        "/wml/profile.edit-name.wml"
+      )
+    );
+  }
+});
+
+// POST handler for updating status
+app.post("/wml/profile.update-status", async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!sock) throw new Error("Not connected");
+    if (status && status.length > 139)
+      throw new Error("Status too long (max 139 characters)");
+
+    await sock.updateProfileStatus(status || "");
+
+    const statusText = status ? `"${status}"` : "Status cleared";
+
+    sendWml(
+      res,
+      resultCard(
+        "Status Updated",
+        [
+          `New status: ${esc(statusText)}`,
+          "Status message updated successfully!",
+          "Changes may take a few minutes to appear.",
+        ],
+        "/wml/profile.edit-status.wml?success=1",
+        true
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Update Failed",
+        [
+          e.message || "Failed to update status",
+          "Please try again or check connection",
+        ],
+        "/wml/profile.edit-status.wml"
+      )
+    );
+  }
+});
+
+// API endpoint per servire profile picture in tutti i formati (come sistema media messaggi)
+app.get("/api/profile-picture/:format", async (req, res) => {
+  try {
+    const { format } = req.params;
+    if (!sock) return res.status(500).json({ error: "Not connected" });
+
+    const profilePicUrl = await sock.profilePictureUrl(sock.user.id, "image");
+    if (!profilePicUrl) {
+      return res.status(404).json({ error: "No profile picture set" });
+    }
+
+    // Download original image
+    let mediaData = await axios.get(profilePicUrl, {
+      responseType: "arraybuffer",
+    });
+    mediaData = mediaData.data;
+
+    let mimeType = "application/octet-stream";
+    let filename = "profile-picture";
+
+    // Handle different formats like the media system
+    if (format === "wbmp") {
+      // Convert to WBMP for Nokia compatibility (same logic as media)
+      try {
+        const { data: pixels, info } = await sharp(mediaData)
+          .resize(96, 65, {
+            fit: "inside",
+            position: "center",
+          })
+          .greyscale()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+
+        // Create WBMP using same function as media
+        function encodeMultiByte(value) {
+          if (value < 128) {
+            return Buffer.from([value]);
+          }
+          const bytes = [];
+          let remaining = value;
+          while (remaining >= 128) {
+            bytes.unshift(remaining & 0x7f);
+            remaining = remaining >> 7;
+          }
+          bytes.unshift(remaining | 0x80);
+          return Buffer.from(bytes);
+        }
+
+        function createWBMP(pixels, width, height) {
+          const typeField = Buffer.from([0x00]);
+          const fixHeader = Buffer.from([0x00]);
+          const widthBytes = encodeMultiByte(width);
+          const heightBytes = encodeMultiByte(height);
+
+          const bytesPerRow = Math.ceil(width / 8);
+          const dataSize = bytesPerRow * height;
+          const data = Buffer.alloc(dataSize, 0x00);
+
+          for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+              const pixelIndex = y * width + x;
+              const grayscale = pixels[pixelIndex];
+              const isBlack = grayscale < 128;
+
+              if (isBlack) {
+                const byteIndex = y * bytesPerRow + Math.floor(x / 8);
+                const bitPosition = 7 - (x % 8);
+                data[byteIndex] |= 1 << bitPosition;
+              }
+            }
+          }
+
+          return Buffer.concat([
+            typeField,
+            fixHeader,
+            widthBytes,
+            heightBytes,
+            data,
+          ]);
+        }
+
+        mediaData = createWBMP(pixels, 96, 65);
+        mimeType = "image/vnd.wap.wbmp";
+        filename = "profile-picture.wbmp";
+      } catch (conversionError) {
+        logger.warn("WBMP conversion failed:", conversionError.message);
+        mimeType = "image/jpeg";
+        filename = "profile-picture.jpg";
+      }
+    } else if (format === "small.jpg" || format === "thumbnail") {
+      // Small optimized JPEG for Nokia (same logic as media)
+      try {
+        mediaData = await sharp(mediaData)
+          .resize(128, 128, { fit: "inside", withoutEnlargement: true })
+          .jpeg({
+            quality: 40,
+            progressive: false,
+            mozjpeg: false,
+          })
+          .toBuffer();
+
+        mimeType = "image/jpeg";
+        filename = "profile-picture-small.jpg";
+      } catch (conversionError) {
+        logger.warn("JPEG optimization failed:", conversionError.message);
+        mimeType = "image/jpeg";
+        filename = "profile-picture.jpg";
+      }
+    } else if (format === "small.png") {
+      // Small optimized PNG for Nokia
+      try {
+        mediaData = await sharp(mediaData)
+          .resize(128, 128, { fit: "inside", withoutEnlargement: true })
+          .png({
+            compressionLevel: 9,
+            colors: 16,
+            quality: 50,
+          })
+          .toBuffer();
+
+        mimeType = "image/png";
+        filename = "profile-picture-small.png";
+      } catch (conversionError) {
+        logger.warn("PNG optimization failed:", conversionError.message);
+        mimeType = "image/png";
+        filename = "profile-picture.png";
+      }
+    } else if (format === "jpg" || format === "jpeg") {
+      mimeType = "image/jpeg";
+      filename = "profile-picture.jpg";
+    } else if (format === "png") {
+      mimeType = "image/png";
+      filename = "profile-picture.png";
+    } else {
+      return res.status(400).json({
+        error: "Unsupported format",
+        supportedFormats: [
+          "jpg",
+          "png",
+          "wbmp",
+          "small.jpg",
+          "small.png",
+          "thumbnail",
+        ],
+      });
+    }
+
+    // Set headers (same as media system)
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", mediaData.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+
+    res.send(mediaData);
+  } catch (error) {
+    logger.error("Profile picture download error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Presence page - was referenced but not implemented
+app.get("/wml/presence.wml", (req, res) => {
+  if (!sock) {
+    sendWml(
+      res,
+      resultCard("Error", ["Not connected to WhatsApp"], "/wml/home.wml")
+    );
+    return;
+  }
+
+  const body = `
+    <p><b>Update Presence</b></p>
+    <p>Set your availability status:</p>
+    
+    <p><b>Global Presence:</b></p>
+    <p>
+      <a href="/wml/presence.set.wml?type=available" accesskey="1">[1] Available</a><br/>
+      <a href="/wml/presence.set.wml?type=unavailable" accesskey="2">[2] Unavailable</a><br/>
+      <a href="/wml/presence.set.wml?type=composing" accesskey="3">[3] Typing</a><br/>
+      <a href="/wml/presence.set.wml?type=recording" accesskey="4">[4] Recording</a><br/>
+      <a href="/wml/presence.set.wml?type=paused" accesskey="5">[5] Paused</a><br/>
+    </p>
+    
+    <p><b>Chat-Specific:</b></p>
+    <p>Contact/Group JID:</p>
+    <input name="jid" title="JID" size="20"/>
+    
+    <p>Presence type:</p>
+    <select name="presence" title="Presence">
+      <option value="available">Available</option>
+      <option value="unavailable">Unavailable</option>
+      <option value="composing">Typing</option>
+      <option value="recording">Recording</option>
+      <option value="paused">Paused</option>
+    </select>
+    
+    <do type="accept" label="Set">
+      <go method="post" href="/wml/presence.set">
+        <postfield name="jid" value="$(jid)"/>
+        <postfield name="presence" value="$(presence)"/>
+      </go>
+    </do>
+    
+    ${navigationBar()}
+  `;
+
+  sendWml(res, card("presence", "Presence", body));
+});
+
+// Privacy page - was referenced but not implemented
+app.get("/wml/privacy.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/home.wml")
+      );
+      return;
+    }
+
+    let privacySettings = null;
+    try {
+      privacySettings = await sock.fetchPrivacySettings();
+    } catch (e) {
+      // Silent fail
+    }
+
+    const body = `
+    
+      <p><b>Privacy Settings</b></p>
+      
+      ${
+        privacySettings
+          ? `
+      <p><b>Current Settings:</b></p>
+      <p>Last Seen: ${esc(privacySettings.lastSeen || "Unknown")}</p>
+      <p>Profile Photo: ${esc(privacySettings.profilePicture || "Unknown")}</p>
+      <p>Status: ${esc(privacySettings.status || "Unknown")}</p>
+      <p>Read Receipts: ${esc(privacySettings.readReceipts || "Unknown")}</p>
+      `
+          : "<p><em>Privacy settings unavailable</em></p>"
+      }
+      
+      <p><b>Privacy Actions:</b></p>
+      <p>
+        <a href="/wml/privacy.lastseen.wml" accesskey="1">[1] Last Seen</a><br/>
+        <a href="/wml/privacy.profile.wml" accesskey="2">[2] Profile Photo</a><br/>
+        <a href="/wml/privacy.status.wml" accesskey="3">[3] Status Privacy</a><br/>
+        <a href="/wml/privacy.receipts.wml" accesskey="4">[4] Read Receipts</a><br/>
+        <a href="/wml/privacy.groups.wml" accesskey="5">[5] Groups</a><br/>
+      </p>
+      
+      <p><b>Blocked Contacts:</b></p>
+      <p>
+        <a href="/wml/blocked.list.wml" accesskey="7">[7] View Blocked</a><br/>
+        <a href="/wml/block.contact.wml" accesskey="8">[8] Block Contact</a><br/>
+      </p>
+      
+      ${navigationBar()}
+      
+      <do type="accept" label="Refresh">
+        <go href="/wml/privacy.wml"/>
+      </do>
+    `;
+
+    sendWml(res, card("privacy", "Privacy", body));
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Error",
+        [e.message || "Failed to load privacy settings"],
+        "/wml/home.wml"
+      )
+    );
+  }
+});
+
+// =================== POST HANDLERS FOR QUICK ACTIONS ===================
+
+// Presence setting handler
+app.post("/wml/presence.set", async (req, res) => {
+  try {
+    const { jid, presence = "available" } = req.body;
+    const type = req.query.type || presence;
+
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/presence.wml")
+      );
+      return;
+    }
+
+    if (jid && jid.trim()) {
+      await sock.sendPresenceUpdate(type, formatJid(jid.trim()));
+      sendWml(
+        res,
+        resultCard(
+          "Presence Updated",
+          [
+            `Set ${type} for ${esc(jid.trim())}`,
+            "Presence updated successfully",
+          ],
+          "/wml/presence.wml",
+          true
+        )
+      );
+    } else {
+      await sock.sendPresenceUpdate(type);
+      sendWml(
+        res,
+        resultCard(
+          "Presence Updated",
+          [`Global presence set to ${type}`, "Presence updated successfully"],
+          "/wml/presence.wml",
+          true
+        )
+      );
+    }
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Presence Failed",
+        [e.message || "Failed to update presence"],
+        "/wml/presence.wml"
+      )
+    );
+  }
+});
+
+// Quick presence setting via GET for simple links
+app.get("/wml/presence.set.wml", async (req, res) => {
+  try {
+    const { type = "available", jid } = req.query;
+
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/presence.wml")
+      );
+      return;
+    }
+
+    if (jid && jid.trim()) {
+      await sock.sendPresenceUpdate(type, formatJid(jid.trim()));
+      sendWml(
+        res,
+        resultCard(
+          "Presence Updated",
+          [
+            `Set ${type} for ${esc(jid.trim())}`,
+            "Presence updated successfully",
+          ],
+          "/wml/presence.wml",
+          true
+        )
+      );
+    } else {
+      await sock.sendPresenceUpdate(type);
+      sendWml(
+        res,
+        resultCard(
+          "Global Presence Updated",
+          [`Presence set to: ${type}`, "All contacts will see this status"],
+          "/wml/presence.wml",
+          true
+        )
+      );
+    }
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Presence Failed",
+        [e.message || "Failed to update presence"],
+        "/wml/presence.wml"
+      )
+    );
+  }
+});
+
+// =================== MISSING UTILITY ENDPOINTS ===================
+
+// Broadcast page - was referenced but missing
+app.get("/wml/broadcast.wml", (req, res) => {
+  const body = `
+    <p><b>Broadcast Message</b></p>
+    <p>Send message to multiple contacts</p>
+    
+    <p>Recipients (comma-separated):</p>
+    <input name="recipients" title="Phone numbers" size="25" maxlength="500"/>
+    
+    <p>Message:</p>
+    <input name="message" title="Your message" size="30" maxlength="1000"/>
+    
+    <p>Delay between sends (ms):</p>
+    <select name="delay" title="Delay">
+      <option value="1000">1 second</option>
+      <option value="2000">2 seconds</option>
+      <option value="5000">5 seconds</option>
+      <option value="10000">10 seconds</option>
+    </select>
+    
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/broadcast.send">
+        <postfield name="recipients" value="$(recipients)"/>
+        <postfield name="message" value="$(message)"/>
+        <postfield name="delay" value="$(delay)"/>
+      </go>
+    </do>
+    
+    <p>
+      <a href="/wml/contacts.wml" accesskey="1">[1] Select from Contacts</a> |
+      <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+    </p>
+  `;
+
+  sendWml(res, card("broadcast", "Broadcast", body));
+});
+
+// Debug page - was referenced but missing
+app.get("/wml/debug.wml", (req, res) => {
+  const memUsage = process.memoryUsage();
+  const uptime = Math.floor(process.uptime());
+
+  const body = `
+
+    <p><b>Debug Information</b></p>
+    
+    <p><b>Connection:</b></p>
+    <p>State: ${esc(connectionState)}</p>
+    <p>Socket: ${sock ? "Active" : "Null"}</p>
+    <p>User: ${sock?.user?.id ? esc(sock.user.id) : "None"}</p>
+    <p>QR: ${currentQR ? "Available" : "None"}</p>
+    
+    <p><b>Data Stores:</b></p>
+    <p>Contacts: ${contactStore.size}</p>
+    <p>Chats: ${chatStore.size}</p>
+    <p>Messages: ${messageStore.size}</p>
+    <p>Sync Status: ${isFullySynced ? "Complete" : "Pending"}</p>
+    <p>Sync Attempts: ${syncAttempts}</p>
+    
+    <p><b>System:</b></p>
+    <p>Uptime: ${uptime}s</p>
+    <p>Memory: ${Math.round(memUsage.rss / 1024 / 1024)}MB</p>
+    <p>Node: ${process.version}</p>
+    <p>Env: ${process.env.NODE_ENV || "dev"}</p>
+    
+    <p><b>Debug Actions:</b></p>
+    <p>
+      <a href="/wml/debug.stores.wml" accesskey="1">[1] Store Details</a><br/>
+      <a href="/wml/debug.logs.wml" accesskey="2">[2] Recent Logs</a><br/>
+      <a href="/wml/debug.test.wml" accesskey="3">[3] Connection Test</a><br/>
+    </p>
+    
+    ${navigationBar()}
+    
+    <do type="accept" label="Refresh">
+      <go href="/wml/debug.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("debug", "Debug", body, "/wml/debug.wml"));
+});
+
+// Logout confirmation page
+app.get("/wml/logout.wml", (req, res) => {
+  const body = `
+    <p><b>Logout Confirmation</b></p>
+    <p>This will:</p>
+    <p>• Disconnect from WhatsApp</p>
+    <p>• Clear all session data</p>
+    <p>• Remove authentication</p>
+    <p>• Clear local contacts/chats</p>
+    
+    <p><b>Are you sure?</b></p>
+    <p>
+      <a href="/wml/logout.confirm.wml" accesskey="1">[1] Yes, Logout</a><br/>
+      <a href="/wml/home.wml" accesskey="0">[0] Cancel</a><br/>
+    </p>
+    
+    <do type="accept" label="Cancel">
+      <go href="/wml/home.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("logout", "Logout", body));
+});
+
+// Logout execution
+app.get("/wml/logout.confirm.wml", async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout();
+    }
+
+    // Clear auth files
+    if (fs.existsSync("./auth_info_baileys")) {
+      fs.rmSync("./auth_info_baileys", { recursive: true });
+    }
+
+    // Clear stores
+    contactStore.clear();
+    chatStore.clear();
+    messageStore.clear();
+    isFullySynced = false;
+    syncAttempts = 0;
+    currentQR = null;
+    connectionState = "disconnected";
+
+    sendWml(
+      res,
+      resultCard(
+        "Logged Out",
+        [
+          "Successfully logged out",
+          "All data cleared",
+          "You can scan QR to reconnect",
+        ],
+        "/wml/home.wml",
+        true
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Logout Error",
+        [e.message || "Logout failed"],
+        "/wml/home.wml"
+      )
+    );
+  }
+});
+
+// =================== SYNC ENDPOINTS ===================
+
+// Force sync endpoints that were referenced but missing handlers
+app.get("/wml/sync.full.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/status.wml")
+      );
+      return;
+    }
+
+    // Trigger the existing performInitialSync function
+    performInitialSync();
+
+    sendWml(
+      res,
+      resultCard(
+        "Sync Started",
+        [
+          "Full sync initiated",
+          "This may take a few minutes",
+          "Check status page for progress",
+        ],
+        "/wml/status.wml",
+        true
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Sync Failed",
+        [e.message || "Failed to start sync"],
+        "/wml/status.wml"
+      )
+    );
+  }
+});
+
+app.get("/wml/sync.contacts.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/status.wml")
+      );
+      return;
+    }
+
+    const initialCount = contactStore.size;
+
+    // Wait for contact events (contacts sync automatically in Baileys)
+    await delay(3000);
+
+    const finalCount = contactStore.size;
+    const newContacts = finalCount - initialCount;
+
+    sendWml(
+      res,
+      resultCard(
+        "Contact Sync Complete",
+        [
+          `Initial contacts: ${initialCount}`,
+          `Final contacts: ${finalCount}`,
+          `New contacts: ${newContacts}`,
+          "Contacts sync via WhatsApp events",
+        ],
+        "/wml/status.wml",
+        true
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Contact Sync Failed",
+        [e.message || "Failed to sync contacts"],
+        "/wml/status.wml"
+      )
+    );
+  }
+});
+
+// Enhanced Chats page with search and pagination
+app.get("/wml/chats.wml", async (req, res) => {
+  const userAgent = req.headers["user-agent"] || "";
+
+  // Use req.query for GET requests, like in contacts
+  const query = req.query;
+
+  const page = Math.max(1, parseInt(query.page || "1"));
+  let limit = Math.max(1, Math.min(20, parseInt(query.limit || "10")));
+
+  // More restrictive limits for WAP 1.0 devices (like contacts)
+  if (userAgent.includes("Nokia") || userAgent.includes("UP.Browser")) {
+    limit = Math.min(5, limit); // Max 5 items per page
+  }
+
+  const search = query.q || "";
+  const showGroups = query.groups !== "0"; // Default show groups
+  const showDirect = query.direct !== "0"; // Default show direct chats
+
+  // Auto-sync if no chats and not synced yet
+  if (chatStore.size === 0 && !isFullySynced && sock) {
+    try {
+      logger.info("💬 No chats found, attempting auto-sync...");
+      const groups = await sock.groupFetchAllParticipating();
+
+      Object.keys(groups).forEach((chatId) => {
+        if (!chatStore.has(chatId)) {
+          chatStore.set(chatId, []);
+        }
+      });
+
+      logger.info(`💬 Auto-synced ${Object.keys(groups).length} group chats`);
+      await delay(1000); // Brief wait for additional events
+    } catch (syncError) {
+      logger.warn("⚠️ Auto-sync failed:", syncError.message);
+    }
+  }
+
+  // Replace your entire chat processing section with this:
+
+  let chats = Array.from(chatStore.keys()).map((chatId) => {
+    const messages = chatStore.get(chatId) || [];
+    const lastMessage =
+      messages.length > 0 ? messages[messages.length - 1] : null;
+    const contact = contactStore.get(chatId);
+
+    const isGroup = chatId.endsWith("@g.us");
+    const phoneNumber = chatId
+      .replace("@s.whatsapp.net", "")
+      .replace("@g.us", "");
+
+    const chatName = isGroup
+      ? contact?.subject || `Group ${phoneNumber.slice(-8)}`
+      : contact?.name ||
+        contact?.notify ||
+        contact?.verifiedName ||
+        jidFriendly(chatId);
+
+    // Fixed: Use lastMessage instead of undefined msg
+    const lastMessageText = lastMessage
+      ? messageText(lastMessage)
+      : "No messages";
+
+    const lastTimestamp = lastMessage
+      ? Number(lastMessage.messageTimestamp)
+      : 0;
+    const unreadCount = messages.filter((m) => !m.key.fromMe).length;
+
+    // In the chat mapping section, ensure lastMessage is properly constructed:
+
+    return {
+      id: chatId,
+      name: chatName,
+      isGroup,
+      phoneNumber: isGroup ? null : phoneNumber,
+      messageCount: messages.length,
+      lastMessage: {
+        text: lastMessageText || "No message text", // Ensure text is never undefined
+        timestamp: lastTimestamp,
+        fromMe: lastMessage ? lastMessage.key.fromMe : false,
+        timeStr:
+          lastTimestamp > 0
+            ? new Date(lastTimestamp * 1000).toLocaleString("en-GB", {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            : "Never",
+      },
+      unreadCount,
+      contact,
+    };
+  });
+
+  // Filter by chat type
+  if (!showGroups) {
+    chats = chats.filter((c) => !c.isGroup);
+  }
+  if (!showDirect) {
+    chats = chats.filter((c) => c.isGroup);
+  }
+
+  // Apply search filter (like contacts)
+  if (search) {
+    const searchLower = search.toLowerCase();
+    chats = chats.filter((c) => {
+      const nameMatch = c.name.toLowerCase().includes(searchLower);
+      const numberMatch = c.phoneNumber && c.phoneNumber.includes(searchLower);
+      const messageMatch = c.lastMessage.text
+        .toLowerCase()
+        .includes(searchLower);
+      return nameMatch || numberMatch || messageMatch;
+    });
+  }
+
+  // Sort by last message timestamp (most recent first)
+  chats.sort((a, b) => b.lastMessage.timestamp - a.lastMessage.timestamp);
+
+  const total = chats.length;
+  const start = (page - 1) * limit;
+  const items = chats.slice(start, start + limit);
+
+  // Safe WML escaping function (like contacts)
+  const escWml = (text) =>
+    (text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+
+  // Page header
+  const searchHeader = search
+    ? `<p><b>Search Results for:</b> ${escWml(search)} (${total})</p>`
+    : `<p><b>All Chats</b> (${total})</p>`;
+
+  // Chat list
+  // In your chats.wml route, fix the list mapping section:
+
+  const list =
+    items
+      .map((c, idx) => {
+        const typeIcon = c.isGroup ? "[GROUP]" : "[CHAT]";
+        const unreadBadge = c.unreadCount > 0 ? ` (${c.unreadCount})` : "";
+
+        // Add safety checks for lastMessage properties
+        const lastMessageText = c.lastMessage?.text || "No message text";
+        const fromMe = c.lastMessage?.fromMe || false;
+
+        // Safe text processing
+        const messagePreview =
+          lastMessageText.length > 40
+            ? lastMessageText.substring(0, 37) + "..."
+            : lastMessageText;
+        const fromIndicator = fromMe ? "You: " : "";
+
+        // Safe time string access
+        const timeStr = c.lastMessage?.timeStr || "Unknown time";
+
+        return `<p>${start + idx + 1}. ${typeIcon} ${escWml(
+          c.name
+        )}${unreadBadge}<br/>
+      <small>${escWml(fromIndicator + messagePreview)}</small><br/>
+      <small>${escWml(timeStr)} | ${c.messageCount} msgs</small><br/>
+      <a href="/wml/chat.wml?jid=${encodeURIComponent(
+        c.id
+      )}&amp;limit=15">[Open Chat]</a> 
+      <a href="/wml/send.text.wml?to=${encodeURIComponent(
+        c.id
+      )}">[Send Message]</a>
+      ${
+        c.phoneNumber
+          ? `  <a href="wtai://wp/mc;${c.phoneNumber}">[Call]</a>`
+          : ""
+      }
+      ${
+        c.phoneNumber
+          ? `  <a href="wtai://wp/ms;${c.phoneNumber};">[SMS]</a>`
+          : ""
+      }
+      ${
+        c.phoneNumber
+          ? `  <a href="wtai://wp/ap;${c.phoneNumber};">[Add to Phone]</a>`
+          : ""
+      }
+    </p>`;
+      })
+      .join("") || "<p>No chats found.</p>";
+
+  // Pagination con First/Last e numeri di pagina
+  const totalPages = Math.ceil(total / limit) || 1;
+
+  const firstPage =
+    page > 1
+      ? `<a href="/wml/chats.wml?page=1&amp;limit=${limit}&amp;q=${encodeURIComponent(
+          search
+        )}&amp;groups=${showGroups ? 1 : 0}&amp;direct=${
+          showDirect ? 1 : 0
+        }">[First]</a>`
+      : "";
+
+  const prevPage =
+    page > 1
+      ? `<a href="/wml/chats.wml?page=${
+          page - 1
+        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}&amp;groups=${
+          showGroups ? 1 : 0
+        }&amp;direct=${showDirect ? 1 : 0}">[Previous]</a>`
+      : "";
+
+  const nextPage =
+    page < totalPages
+      ? `<a href="/wml/chats.wml?page=${
+          page + 1
+        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}&amp;groups=${
+          showGroups ? 1 : 0
+        }&amp;direct=${showDirect ? 1 : 0}">[Next]</a>`
+      : "";
+
+  const lastPage =
+    page < totalPages
+      ? `<a href="/wml/chats.wml?page=${totalPages}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+          search
+        )}&amp;groups=${showGroups ? 1 : 0}&amp;direct=${
+          showDirect ? 1 : 0
+        }">[Last]</a>`
+      : "";
+
+  // numeri di pagina (massimo 5 visibili: due prima, attuale, due dopo)
+  let pageNumbers = "";
+  const startPage = Math.max(1, page - 2);
+  const endPage = Math.min(totalPages, page + 2);
+  for (let p = startPage; p <= endPage; p++) {
+    if (p === page) {
+      pageNumbers += `<b>[${p}]</b> `;
+    } else {
+      pageNumbers += `<a href="/wml/chats.wml?page=${p}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+        search
+      )}&amp;groups=${showGroups ? 1 : 0}&amp;direct=${
+        showDirect ? 1 : 0
+      }">${p}</a> `;
+    }
+  }
+
+  const pagination = `
+    <p>
+      ${firstPage} ${firstPage && prevPage ? "" : ""} ${prevPage}
+      ${pageNumbers}
+      ${nextPage} ${nextPage && lastPage ? "" : ""} ${lastPage}
+    </p>`;
+
+  // Simplified search form (like contacts)
+  const searchForm = `
+    <p><b>Search chats:</b></p>
+    <p>
+      <input name="q" title="Search..." value="${escWml(
+        search
+      )}" emptyok="true" size="15" maxlength="30"/>
+     
+      <do type="accept" label="Search">
+        <go href="/wml/chats.wml" method="get">
+          <postfield name="q" value="$(q)"/>
+          <postfield name="groups" value="$(groups)"/>
+          <postfield name="direct" value="$(direct)"/>
+          <postfield name="page" value="1"/>
+          <postfield name="limit" value="${limit}"/>
+        </go>
+      </do>
+    </p>`;
+
+  // Filter toggles (simplified)
+  const filterToggles = `
+    <p><b>Quick Filters:</b></p>
+    <p>
+      ${
+        showGroups
+          ? `<a href="/wml/chats.wml?page=${page}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+              search
+            )}&amp;groups=0&amp;direct=${showDirect ? 1 : 0}">[Hide Groups]</a>`
+          : `<a href="/wml/chats.wml?page=${page}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+              search
+            )}&amp;groups=1&amp;direct=${showDirect ? 1 : 0}">[Show Groups]</a>`
+      } 
+      ${
+        showDirect
+          ? `<a href="/wml/chats.wml?page=${page}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+              search
+            )}&amp;groups=${showGroups ? 1 : 0}&amp;direct=0">[Hide Direct]</a>`
+          : `<a href="/wml/chats.wml?page=${page}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+              search
+            )}&amp;groups=${showGroups ? 1 : 0}&amp;direct=1">[Show Direct]</a>`
+      }
+    </p>`;
+
+  // WML card body
+  const body = `
+    <p><b>Chats - Page ${page}/${Math.ceil(total / limit) || 1}</b></p>
+    ${searchHeader}
+    ${searchForm}
+    ${filterToggles}
+    ${list}
+    ${pagination}
+    <p>
+      <a href="/wml/home.wml">[Home]</a> 
+      <a href="/wml/contacts.wml">[Contacts]</a> 
+      <a href="/wml/send-menu.wml">[New Message]</a>
+    </p>
+    <do type="accept" label="Refresh">
+      <go href="/wml/chats.wml?page=${page}&amp;limit=${limit}&amp;q=${encodeURIComponent(
+    search
+  )}&amp;groups=${showGroups ? 1 : 0}&amp;direct=${showDirect ? 1 : 0}"/>
+    </do>
+    <do type="options" label="Menu">
+      <go href="/wml/menu.wml"/>
+    </do>`;
+
+  // Create complete WML string
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <head>
+    <meta http-equiv="Cache-Control" content="max-age=0"/>
+  </head>
+  <card id="chats" title="Chats">
+    ${body}
+  </card>
+</wml>`;
+
+  // --- KEY MODIFICATIONS FOR COMPATIBILITY (like contacts) ---
+
+  // 1. Set headers for WAP 1.0 with correct encoding (ISO-8859-1)
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+
+  // 2. Encode the entire WML string to ISO-8859-1 buffer
+  const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+
+  // 3. Send the encoded buffer
+  res.send(encodedBuffer);
+});
+
+// Advanced chat search page
+app.get("/wml/chats.search.wml", (req, res) => {
+  const prevQuery = esc(req.query.q || "");
+  const prevType = req.query.type || "all";
+  const prevSort = req.query.sort || "recent";
+
+  const body = `
+    <p><b>Advanced Chat Search</b></p>
+    
+    <p>Search query:</p>
+    <input name="q" title="Search query" value="${prevQuery}" size="20" maxlength="100"/>
+    
+    <p>Chat type:</p>
+    <select name="type" title="Chat Type">
+      <option value="all" ${
+        prevType === "all" ? 'selected="selected"' : ""
+      }>All Chats</option>
+      <option value="direct" ${
+        prevType === "direct" ? 'selected="selected"' : ""
+      }>Direct Messages</option>
+      <option value="groups" ${
+        prevType === "groups" ? 'selected="selected"' : ""
+      }>Groups Only</option>
+    </select>
+    
+    <p>Sort by:</p>
+    <select name="sort" title="Sort Order">
+      <option value="recent" ${
+        prevSort === "recent" ? 'selected="selected"' : ""
+      }>Most Recent</option>
+      <option value="messages" ${
+        prevSort === "messages" ? 'selected="selected"' : ""
+      }>Most Messages</option>
+      <option value="name" ${
+        prevSort === "name" ? 'selected="selected"' : ""
+      }>Name A-Z</option>
+    </select>
+    
+    <p>Results per page:</p>
+    <select name="limit" title="Limit">
+      <option value="5">5 results</option>
+      <option value="10">10 results</option>
+      <option value="20">20 results</option>
+    </select>
+    
+    <do type="accept" label="Search">
+      <go href="/wml/chats.results.wml" method="get">
+        <postfield name="q" value="$(q)"/>
+        <postfield name="type" value="$(type)"/>
+        <postfield name="sort" value="$(sort)"/>
+        <postfield name="limit" value="$(limit)"/>
+      </go>
+    </do>
+    
+    <p><b>Quick Searches:</b></p>
+    <p>
+      <a href="/wml/chats.wml?q=unread" accesskey="1">[1] Recent Activity</a><br/>
+      <a href="/wml/chats.wml?groups=1&amp;direct=0" accesskey="2">[2] Groups Only</a><br/>
+      <a href="/wml/chats.wml?groups=0&amp;direct=1" accesskey="3">[3] Direct Only</a><br/>
+    </p>
+    
+    ${navigationBar()}
+  `;
+
+  sendWml(res, card("chats-search", "Chat Search", body));
+});
+
+// Chat search results
+app.get("/wml/chats.results.wml", (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const chatType = req.query.type || "all";
+  const sortBy = req.query.sort || "recent";
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || "20")));
+
+  if (!q || q.length < 1) {
+    sendWml(
+      res,
+      resultCard("Search Error", ["Query is required"], "/wml/chats.search.wml")
+    );
+    return;
+  }
+
+  // Build and filter chat list (similar to main chats.wml logic)
+  let chats = Array.from(chatStore.keys()).map((chatId) => {
+    const messages = chatStore.get(chatId) || [];
+    const lastMessage =
+      messages.length > 0 ? messages[messages.length - 1] : null;
+    const contact = contactStore.get(chatId);
+
+    const isGroup = chatId.endsWith("@g.us");
+    const phoneNumber = chatId
+      .replace("@s.whatsapp.net", "")
+      .replace("@g.us", "");
+
+    const chatName = isGroup
+      ? contact?.subject || `Group ${phoneNumber.slice(-8)}`
+      : contact?.name ||
+        contact?.notify ||
+        contact?.verifiedName ||
+        jidFriendly(chatId);
+
+    return {
+      id: chatId,
+      name: chatName,
+      isGroup,
+      phoneNumber: isGroup ? null : phoneNumber,
+      messageCount: messages.length,
+      lastMessage: {
+        text: lastMessage ? messageText(lastMessage) : "No messages",
+        timestamp: lastMessage ? Number(lastMessage.messageTimestamp) : 0,
+      },
+    };
+  });
+
+  // Filter by type
+  if (chatType === "direct") {
+    chats = chats.filter((c) => !c.isGroup);
+  } else if (chatType === "groups") {
+    chats = chats.filter((c) => c.isGroup);
+  }
+
+  // Apply search filter
+  const searchLower = q.toLowerCase();
+  chats = chats.filter((c) => {
+    const nameMatch = c.name.toLowerCase().includes(searchLower);
+    const numberMatch = c.phoneNumber && c.phoneNumber.includes(searchLower);
+    const messageMatch = c.lastMessage.text.toLowerCase().includes(searchLower);
+    return nameMatch || numberMatch || messageMatch;
+  });
+
+  // Sort results
+  if (sortBy === "recent") {
+    chats.sort((a, b) => b.lastMessage.timestamp - a.lastMessage.timestamp);
+  } else if (sortBy === "messages") {
+    chats.sort((a, b) => b.messageCount - a.messageCount);
+  } else if (sortBy === "name") {
+    chats.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  const results = chats.slice(0, limit);
+
+  const resultList =
+    results
+      .map((c, idx) => {
+        const typeIcon = c.isGroup ? "[GROUP]" : "[CHAT]";
+        const messagePreview = truncate(c.lastMessage.text, 50);
+        const lastActivity =
+          c.lastMessage.timestamp > 0
+            ? new Date(c.lastMessage.timestamp * 1000).toLocaleString("en-GB", {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            : "No activity";
+
+        return `<p><b>${idx + 1}.</b> ${typeIcon} ${esc(c.name)}<br/>
+      <small>${esc(messagePreview)}</small><br/>
+      <small>${lastActivity} | ${c.messageCount} msgs</small><br/>
+      <a href="/wml/chat.wml?jid=${encodeURIComponent(
+        c.id
+      )}&amp;limit=15">[Open]</a> |
+      <a href="/wml/send.text.wml?to=${encodeURIComponent(c.id)}">[Send]</a>
+    </p>`;
+      })
+      .join("") || "<p>No matching chats found.</p>";
+
+  const body = `
+    <p><b>Chat Search Results</b></p>
+    <p>Query: <b>${esc(q)}</b></p>
+    <p>Type: ${esc(chatType)} | Sort: ${esc(sortBy)}</p>
+    <p>Found: ${results.length} of ${chats.length}</p>
+    
+    ${resultList}
+    
+    <p><b>Search Again:</b></p>
+    <p>
+      <a href="/wml/chats.search.wml?q=${encodeURIComponent(
+        q
+      )}" accesskey="1">[1] Modify Search</a> |
+      <a href="/wml/chats.wml" accesskey="0">[0] All Chats</a>
+    </p>
+    
+    <do type="accept" label="Back">
+      <go href="/wml/chats.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("chat-results", "Search Results", body));
+});
+app.get("/wml/sync.chats.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      sendWml(
+        res,
+        resultCard("Error", ["Not connected to WhatsApp"], "/wml/status.wml")
+      );
+      return;
+    }
+
+    const initialCount = chatStore.size;
+
+    // Fetch groups (the main chat sync method available)
+    const groups = await sock.groupFetchAllParticipating();
+    Object.keys(groups).forEach((chatId) => {
+      if (!chatStore.has(chatId)) {
+        chatStore.set(chatId, []);
+      }
+    });
+
+    await delay(2000); // Wait for additional chat events
+
+    const finalCount = chatStore.size;
+    const newChats = finalCount - initialCount;
+
+    sendWml(
+      res,
+      resultCard(
+        "Chat Sync Complete",
+        [
+          `Groups fetched: ${Object.keys(groups).length}`,
+          `Initial chats: ${initialCount}`,
+          `Final chats: ${finalCount}`,
+          `New chats: ${newChats}`,
+        ],
+        "/wml/status.wml",
+        true
+      )
+    );
+  } catch (e) {
+    sendWml(
+      res,
+      resultCard(
+        "Chat Sync Failed",
+        [e.message || "Failed to sync chats"],
+        "/wml/status.wml"
+      )
+    );
+  }
+});
+
+// =================== ERROR HANDLING & SERVER SETUP ===================
+
+// Error handling
+app.use((err, req, res, next) => {
+  console.error("Server Error:", err);
+  res.status(500).json({
+    error: "Internal server error",
+    details: process.env.NODE_ENV === "development" ? err.message : undefined,
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Endpoint not found",
+    path: req.path,
+    method: req.method,
+    suggestion: "Check the API documentation for available endpoints",
+  });
+});
+
+module.exports = { app, sock, contactStore, chatStore, messageStore };
