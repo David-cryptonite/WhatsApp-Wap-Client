@@ -1,4 +1,4 @@
-WhatsApp WML Gateway
+WhatsApp WML Client
 A complete WhatsApp client accessible through WAP (Wireless Application Protocol) for old mobile devices like Nokia 7210, supporting text messages, media, contacts, groups, and advanced features.
 Features
 Core Messaging
