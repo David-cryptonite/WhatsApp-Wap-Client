@@ -1364,7 +1364,7 @@ ${body}
 
 app.get("/wml/chat.wml", async (req, res) => {
   const userAgent = req.headers["user-agent"] || "";
-  const isOldNokia = false;
+  const isOldNokia = true;
 
   const raw = req.query.jid || "";
   const jid = formatJid(raw);
@@ -8454,7 +8454,7 @@ app.get("/wml/chats.wml", async (req, res) => {
   if (userAgent.includes("Nokia") || userAgent.includes("UP.Browser")) {
     limit = Math.min(5, limit); // Max 5 items per page
   }
-
+  limit = Math.min(3, limit); // Max 5 i
   const search = query.q || "";
   const showGroups = query.groups !== "0"; // Default show groups
   const showDirect = query.direct !== "0"; // Default show direct chats
