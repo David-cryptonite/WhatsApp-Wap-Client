@@ -3023,29 +3023,19 @@ app.get("/wml/media-info.wml", async (req, res) => {
 <p>Size: ${size}KB</p>
 <p>Type: ${img.mimetype || "image/jpeg"}</p>
 ${caption}
-<p><b>View Image:</b></p>
+<p><b>View Image (WBMP):</b></p>
 <p>
-<a href="/wml/image-format.wml?mid=${encodeURIComponent(
+<a href="/wml/view-image.wml?mid=${encodeURIComponent(
               messageId
-            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Select Format &amp; View</a>
+            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] View in Page</a>
 </p>
-<p><b>Quick View:</b></p>
+<p><small>WAP only supports WBMP inline.<br/>
+JPG/PNG are download-only.</small></p>
+<p><b>Download Formats:</b></p>
 <p>
-<a href="/wml/view-image.wml?mid=${encodeURIComponent(
-              messageId
-            )}&amp;jid=${encodeURIComponent(jid)}&amp;format=wbmp">[WBMP]</a>
-<a href="/wml/view-image.wml?mid=${encodeURIComponent(
-              messageId
-            )}&amp;jid=${encodeURIComponent(jid)}&amp;format=jpg">[JPG]</a>
-<a href="/wml/view-image.wml?mid=${encodeURIComponent(
-              messageId
-            )}&amp;jid=${encodeURIComponent(jid)}&amp;format=png">[PNG]</a>
-</p>
-<p><b>Download:</b></p>
-<p>
-<a href="/wml/media/${encodeURIComponent(messageId)}.jpg">[JPG]</a>
-<a href="/wml/media/${encodeURIComponent(messageId)}.png">[PNG]</a>
-<a href="/wml/media/${encodeURIComponent(messageId)}.wbmp">[WBMP]</a>
+<a href="/wml/media/${encodeURIComponent(messageId)}.jpg" accesskey="6">[6] Download JPG</a><br/>
+<a href="/wml/media/${encodeURIComponent(messageId)}.png" accesskey="7">[7] Download PNG</a><br/>
+<a href="/wml/media/${encodeURIComponent(messageId)}.wbmp" accesskey="8">[8] Download WBMP</a>
 </p>
 `;
           } else if (targetMessage.message?.videoMessage) {
@@ -3061,25 +3051,18 @@ ${caption}
 <p>Size: ${size}KB | Duration: ${duration}s</p>
 <p>Type: ${vid.mimetype || "video/mp4"}</p>
 ${caption}
-<p><b>Nokia WAP Playback (1 FPS):</b></p>
+<p><b>WAP Playback (WBMP):</b></p>
 <p>
 <a href="/wml/view-video.wml?mid=${encodeURIComponent(
               messageId
-            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Play (Format: WBMP/JPG/PNG)</a>
+            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Play Frame-by-Frame (1 FPS)</a>
 </p>
-<p>Frame-by-frame with format selection<br/>
-Press [7] during playback to change</p>
-<p><b>Mobile Compatible:</b></p>
+<p><small>Displays WBMP frames inline.<br/>
+Press [7]/[8] to download JPG/PNG.</small></p>
+<p><b>Download Video:</b></p>
 <p>
-<a href="/wml/media/${encodeURIComponent(messageId)}.3gp">[3GP]</a>
-<a href="/wml/media/${encodeURIComponent(messageId)}.avi">[AVI]</a>
-</p>
-<p><b>Full Quality:</b></p>
-<p>
-<a href="/wml/media/${encodeURIComponent(
-              messageId
-            )}.original.mp4">[Original MP4]</a>
-<a href="/wml/media/${encodeURIComponent(messageId)}.original.webm">[WEBM]</a>
+<a href="/wml/media/${encodeURIComponent(messageId)}.3gp">[3GP Mobile]</a><br/>
+<a href="/wml/media/${encodeURIComponent(messageId)}.original.mp4">[MP4 Original]</a>
 </p>`;
           } // Nel blocco che gestisce i messaggi audio, aggiungi questo:
           else if (targetMessage.message?.audioMessage) {
@@ -3362,18 +3345,16 @@ app.get("/wml/view-video.wml", async (req, res) => {
     const nextLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}&amp;format=${format}`;
     const autoplayLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}&amp;autoplay=1&amp;format=${format}`;
 
-    // Format info
-    const formatNames = { wbmp: 'WBMP B&W', jpg: 'JPEG Color', png: 'PNG Color' };
-    const formatName = formatNames[format] || 'WBMP';
+    // WAP only supports WBMP inline - force WBMP for display
+    const displayFormat = 'wbmp';
 
     const body = `<p><b>Video Playback</b></p>
 <p>From: ${esc(chatName)}</p>
 <p>Frame ${currentFrame}/${frameCount}</p>
 <p>Duration: ${duration}s (1 FPS)</p>
-<p>Format: ${formatName}</p>
 
 <p align="center">
-  <img src="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=${format}" alt="Frame ${currentFrame}"/>
+  <img src="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=wbmp" alt="Frame ${currentFrame}"/>
 </p>
 
 <p>
@@ -3383,9 +3364,13 @@ app.get("/wml/view-video.wml", async (req, res) => {
 <p>
   <a href="${autoplayLink}" accesskey="5">[5] ${autoplay ? 'Playing...' : 'Play'}</a>
 </p>
+
+<p><b>Download Frame:</b></p>
 <p>
-  <a href="/wml/video-format.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${currentFrame}" accesskey="7">[7] Change Format</a>
+  <a href="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=jpg" accesskey="7">[7] JPG</a>
+  <a href="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=png" accesskey="8">[8] PNG</a>
 </p>
+
 <p>
   <a href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="0">[0] Back</a>
 </p>
@@ -3570,23 +3555,21 @@ app.get("/wml/view-image.wml", async (req, res) => {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
 
-    // Format info
-    const formatNames = { wbmp: 'WBMP B&W', jpg: 'JPEG Color', png: 'PNG Color' };
-    const formatName = formatNames[format] || 'WBMP';
-    const formatExt = format === 'wbmp' ? 'wbmp' : (format === 'jpg' ? 'jpg' : 'png');
-
+    // WAP only supports WBMP inline - always display WBMP
     const body = `<p><b>Image Viewer</b></p>
 <p>From: ${esc(chatName)}</p>
 ${caption ? `<p>Caption: ${esc(caption)}</p>` : ''}
-<p>Format: ${formatName}</p>
 
 <p align="center">
-  <img src="/wml/media/${encodeURIComponent(messageId)}.${formatExt}${format === 'wbmp' ? '?wbmp=1' : ''}" alt="Image"/>
+  <img src="/wml/media/${encodeURIComponent(messageId)}.wbmp?wbmp=1" alt="Image"/>
 </p>
 
+<p><b>Download Other Formats:</b></p>
 <p>
-  <a href="/wml/image-format.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="7">[7] Change Format</a>
+  <a href="/wml/media/${encodeURIComponent(messageId)}.jpg" accesskey="7">[7] Download JPG</a><br/>
+  <a href="/wml/media/${encodeURIComponent(messageId)}.png" accesskey="8">[8] Download PNG</a>
 </p>
+
 <p>
   <a href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="0">[0] Back</a>
 </p>
