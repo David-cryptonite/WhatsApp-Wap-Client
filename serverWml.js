@@ -5045,7 +5045,7 @@ app.post("/wml/send.image", async (req, res) => {
           `Caption: ${caption || "No caption"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5085,7 +5085,7 @@ app.post("/wml/send.video", async (req, res) => {
           `Caption: ${caption || "No caption"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5140,7 +5140,7 @@ app.post("/wml/send.tts", async (req, res) => {
           `Type: ${ptt === "true" ? "Voice Note (PTT)" : "Audio File"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5183,7 +5183,7 @@ app.post("/wml/send.audio", async (req, res) => {
           `Voice Message: ${ptt === "true" ? "Yes" : "No"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5225,7 +5225,7 @@ app.post("/wml/send.document", async (req, res) => {
           `Type: ${mimeType || "application/octet-stream"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5260,7 +5260,7 @@ app.post("/wml/send.sticker", async (req, res) => {
       resultCard(
         "Sticker Sent",
         [`To: ${jidFriendly(to)}`, `ID: ${result?.key?.id || "Unknown"}`],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5298,7 +5298,7 @@ app.post("/wml/send.location", async (req, res) => {
           `Name: ${name || "Unnamed location"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5344,7 +5344,7 @@ app.post("/wml/send.contact", async (req, res) => {
           `Phone: ${phoneNumber}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -5395,7 +5395,7 @@ app.post("/wml/send.poll", async (req, res) => {
           `Selectable: ${selectableCount}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (error) {
@@ -6215,7 +6215,7 @@ app.post("/wml/send.text", async (req, res) => {
           `Message: ${truncate(message, 50)}`,
           `ID: ${result?.key?.id || "Unknown"}`,
         ],
-        "/wml/send-menu.wml"
+        `/wml/send-menu.wml?to=${encodeURIComponent(to)}`
       )
     );
   } catch (e) {
