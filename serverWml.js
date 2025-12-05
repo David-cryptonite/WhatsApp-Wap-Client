@@ -148,6 +148,111 @@ function wavBufferToFloat32Array(wavBuffer) {
 // Inizializza il modello all'avvio
 initWhisperModel();
 
+// ============ VIDEO FRAME EXTRACTION ============
+// Cache directory for video frames
+const VIDEO_FRAMES_DIR = path.join(__dirname, "video_frames_cache");
+if (!fs.existsSync(VIDEO_FRAMES_DIR)) {
+  fs.mkdirSync(VIDEO_FRAMES_DIR, { recursive: true });
+}
+
+// Extract frames from video at 1 FPS
+async function extractVideoFrames(videoBuffer, messageId) {
+  const framesDir = path.join(VIDEO_FRAMES_DIR, messageId);
+
+  // Check if frames already exist
+  if (fs.existsSync(framesDir)) {
+    const existingFrames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png'));
+    if (existingFrames.length > 0) {
+      console.log(`Using cached frames for ${messageId}: ${existingFrames.length} frames`);
+      return { frameCount: existingFrames.length, framesDir };
+    }
+  }
+
+  // Create frames directory
+  if (!fs.existsSync(framesDir)) {
+    fs.mkdirSync(framesDir, { recursive: true });
+  }
+
+  const tempVideoPath = path.join(__dirname, `temp_video_${messageId}_${Date.now()}.mp4`);
+  const framePattern = path.join(framesDir, 'frame_%04d.png');
+
+  try {
+    // Write video buffer to temp file
+    await fs.promises.writeFile(tempVideoPath, videoBuffer);
+    console.log(`Extracting frames from video ${messageId} at 1 FPS...`);
+
+    // Extract frames using FFmpeg at 1 FPS
+    await new Promise((resolve, reject) => {
+      const ffmpegPath = require("ffmpeg-static");
+      const process = require("child_process").spawn(ffmpegPath, [
+        '-i', tempVideoPath,
+        '-vf', 'fps=1',  // 1 frame per second
+        '-s', '128x128',  // Small size for WAP devices
+        '-q:v', '2',      // High quality
+        framePattern
+      ]);
+
+      let stderr = '';
+      process.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      process.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg exited with code ${code}: ${stderr}`));
+        }
+      });
+
+      process.on('error', reject);
+    });
+
+    // Count extracted frames
+    const frames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png'));
+    console.log(`Extracted ${frames.length} frames from video ${messageId}`);
+
+    // Clean up temp video file
+    if (fs.existsSync(tempVideoPath)) {
+      fs.unlinkSync(tempVideoPath);
+    }
+
+    return { frameCount: frames.length, framesDir };
+  } catch (error) {
+    console.error('Frame extraction error:', error);
+    // Clean up on error
+    if (fs.existsSync(tempVideoPath)) {
+      fs.unlinkSync(tempVideoPath);
+    }
+    throw error;
+  }
+}
+
+// Clean up old video frames (older than 1 hour)
+function cleanupOldVideoFrames() {
+  try {
+    if (!fs.existsSync(VIDEO_FRAMES_DIR)) return;
+
+    const oneHourAgo = Date.now() - (60 * 60 * 1000);
+    const dirs = fs.readdirSync(VIDEO_FRAMES_DIR);
+
+    for (const dir of dirs) {
+      const dirPath = path.join(VIDEO_FRAMES_DIR, dir);
+      const stats = fs.statSync(dirPath);
+
+      if (stats.isDirectory() && stats.mtimeMs < oneHourAgo) {
+        console.log(`Cleaning up old video frames: ${dir}`);
+        fs.rmSync(dirPath, { recursive: true, force: true });
+      }
+    }
+  } catch (error) {
+    console.error('Error cleaning up video frames:', error);
+  }
+}
+
+// Run cleanup every 30 minutes
+setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
+
 const iconv = require("iconv-lite");
 
 const app = express();
@@ -2365,16 +2470,22 @@ ${caption}
 <p>Size: ${size}KB | Duration: ${duration}s</p>
 <p>Type: ${vid.mimetype || "video/mp4"}</p>
 ${caption}
+<p><b>Nokia WAP Playback:</b></p>
+<p>
+<a href="/wml/view-video.wml?mid=${encodeURIComponent(
+              messageId
+            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Play Frame-by-Frame (1 FPS)</a>
+</p>
 <p><b>Mobile Compatible:</b></p>
 <p>
-<a href="/wml/media/${encodeURIComponent(messageId)}.3gp">[3GP]</a> 
+<a href="/wml/media/${encodeURIComponent(messageId)}.3gp">[3GP]</a>
 <a href="/wml/media/${encodeURIComponent(messageId)}.avi">[AVI]</a>
 </p>
 <p><b>Full Quality:</b></p>
 <p>
 <a href="/wml/media/${encodeURIComponent(
               messageId
-            )}.original.mp4">[Original MP4]</a> 
+            )}.original.mp4">[Original MP4]</a>
 <a href="/wml/media/${encodeURIComponent(messageId)}.original.webm">[WEBM]</a>
 </p>`;
           } // Nel blocco che gestisce i messaggi audio, aggiungi questo:
@@ -2490,6 +2601,220 @@ ${body_full}
   } catch (error) {
     logger.error("Media info error:", error);
     res.status(500).send("Error loading media info");
+  }
+});
+
+// ============ VIDEO FRAME PLAYBACK ENDPOINTS ============
+
+// Serve individual video frame (with WBMP conversion)
+app.get("/wml/video-frame/:messageId/:frameNumber", async (req, res) => {
+  try {
+    const { messageId, frameNumber } = req.params;
+    const format = req.query.format || 'wbmp'; // wbmp, jpg, png
+
+    const framesDir = path.join(VIDEO_FRAMES_DIR, messageId);
+    const framePath = path.join(framesDir, `frame_${String(frameNumber).padStart(4, '0')}.png`);
+
+    if (!fs.existsSync(framePath)) {
+      return res.status(404).send("Frame not found");
+    }
+
+    const frameBuffer = await fs.promises.readFile(framePath);
+
+    if (format === 'wbmp') {
+      // Convert to WBMP for Nokia compatibility
+      const { data: pixels, info } = await sharp(frameBuffer)
+        .greyscale()
+        .resize(96, 96, { // Smaller for WAP devices
+          kernel: sharp.kernel.lanczos3,
+          fit: "contain",
+          position: "center",
+          background: { r: 255, g: 255, b: 255, alpha: 1 },
+        })
+        .linear(1.3, -30)
+        .normalise({ lower: 1, upper: 99 })
+        .sharpen({ sigma: 1.5, flat: 2, jagged: 3 })
+        .threshold(128, { greyscale: true, grayscale: true })
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+      // Create WBMP header
+      const width = info.width;
+      const height = info.height;
+      const header = Buffer.from([
+        0x00, // Type 0
+        0x00, // FixHeaderField
+        width,
+        height,
+      ]);
+
+      // Convert pixels to WBMP 1-bit format
+      const rowBytes = Math.ceil(width / 8);
+      const wbmpData = Buffer.alloc(rowBytes * height);
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const pixelIndex = y * width + x;
+          const pixel = pixels[pixelIndex];
+          const isBlack = pixel < 128;
+
+          if (isBlack) {
+            const byteIndex = y * rowBytes + Math.floor(x / 8);
+            const bitIndex = 7 - (x % 8);
+            wbmpData[byteIndex] |= 1 << bitIndex;
+          }
+        }
+      }
+
+      const wbmpBuffer = Buffer.concat([header, wbmpData]);
+
+      res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.send(wbmpBuffer);
+    } else if (format === 'jpg') {
+      const jpegBuffer = await sharp(frameBuffer)
+        .resize(128, 128, { fit: "contain", background: { r: 255, g: 255, b: 255 } })
+        .jpeg({ quality: 70 })
+        .toBuffer();
+
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.send(jpegBuffer);
+    } else {
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.send(frameBuffer);
+    }
+  } catch (error) {
+    logger.error("Video frame error:", error);
+    res.status(500).send("Error loading frame");
+  }
+});
+
+// Video playback WML page with frame-by-frame controls
+app.get("/wml/view-video.wml", async (req, res) => {
+  try {
+    const messageId = req.query.mid || "";
+    const jid = req.query.jid || "";
+    const frameNum = parseInt(req.query.frame || "1", 10);
+    const autoplay = req.query.autoplay === "1";
+
+    // Find message
+    const messages = chatStore.get(jid) || [];
+    const targetMessage = messages.find((m) => m.key.id === messageId);
+
+    if (!targetMessage || !targetMessage.message?.videoMessage) {
+      return sendWml(
+        res,
+        resultCard("Error", ["Video message not found"], "/wml/chats.wml")
+      );
+    }
+
+    const contact = contactStore.get(jid);
+    const chatName = contact?.name || contact?.notify || jidFriendly(jid);
+
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    // Check if frames exist, if not extract them
+    const framesDir = path.join(VIDEO_FRAMES_DIR, messageId);
+    let frameCount = 0;
+
+    if (fs.existsSync(framesDir)) {
+      const frames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png'));
+      frameCount = frames.length;
+    }
+
+    if (frameCount === 0) {
+      // Need to extract frames
+      try {
+        const mediaData = await downloadMediaMessage(
+          targetMessage,
+          "buffer",
+          {},
+          {
+            logger,
+            reuploadRequest: sock.updateMediaMessage,
+          }
+        );
+
+        const result = await extractVideoFrames(mediaData, messageId);
+        frameCount = result.frameCount;
+      } catch (error) {
+        logger.error("Frame extraction error:", error);
+        return sendWml(
+          res,
+          resultCard(
+            "Error",
+            ["Failed to extract video frames", error.message],
+            `/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&jid=${encodeURIComponent(jid)}`
+          )
+        );
+      }
+    }
+
+    const currentFrame = Math.max(1, Math.min(frameNum, frameCount));
+    const vid = targetMessage.message.videoMessage;
+    const duration = vid.seconds || 0;
+
+    // Navigation
+    const prevFrame = currentFrame > 1 ? currentFrame - 1 : frameCount;
+    const nextFrame = currentFrame < frameCount ? currentFrame + 1 : 1;
+
+    const prevLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${prevFrame}`;
+    const nextLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}`;
+    const autoplayLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}&amp;autoplay=1`;
+
+    const body = `<p><b>Video Playback</b></p>
+<p>From: ${esc(chatName)}</p>
+<p>Frame ${currentFrame}/${frameCount}</p>
+<p>Duration: ${duration}s (1 FPS)</p>
+
+<p align="center">
+  <img src="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=wbmp" alt="Frame ${currentFrame}"/>
+</p>
+
+<p>
+  <a href="${prevLink}" accesskey="4">[4] Prev</a> |
+  <a href="${nextLink}" accesskey="6">[6] Next</a>
+</p>
+<p>
+  <a href="${autoplayLink}" accesskey="5">[5] ${autoplay ? 'Playing...' : 'Play'}</a>
+</p>
+<p>
+  <a href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="0">[0] Back</a>
+</p>
+
+${autoplay ? `<onevent type="ontimer"><go href="${nextLink}&amp;autoplay=1"/></onevent><timer value="10"/>` : ''}
+
+<do type="prev" label="Prev">
+  <go href="${prevLink}"/>
+</do>
+<do type="accept" label="Next">
+  <go href="${nextLink}"/>
+</do>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="no-cache"/></head>
+<card id="video" title="Video">
+${body}
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("Video playback error:", error);
+    res.status(500).send("Error loading video");
   }
 });
 

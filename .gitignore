@@ -42,3 +42,6 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+
+# Video frame cache
+video_frames_cache/
