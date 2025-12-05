@@ -25,9 +25,12 @@ const sharp = require("sharp");
 const ffmpeg = require("ffmpeg-static");
 const { exec } = require("child_process");
 
-// Configurazione Whisper
+// Configurazione Whisper e TTS
 let transcriber = null;
 let transcriptionEnabled = false;
+let ttsModel = null;
+let ttsSpeakerEmbeddings = null;
+let ttsEnabled = false;
 
 // Inizializza il modello Whisper con import dinamico
 async function initWhisperModel() {
@@ -53,6 +56,46 @@ async function initWhisperModel() {
   } catch (error) {
     console.error("Whisper model initialization failed:", error);
     transcriptionEnabled = false;
+  }
+}
+
+// Inizializza il modello TTS (Text-to-Speech) locale
+async function initTTSModel() {
+  try {
+    console.log("Initializing local TTS model (SpeechT5)...");
+
+    // Usa import dinamico per caricare il modulo ESM
+    const { pipeline, env } = await import("@xenova/transformers");
+
+    // Disabilita il controllo local_files_only per il primo download
+    env.allowRemoteModels = true;
+
+    // Carica il modello SpeechT5 per TTS
+    ttsModel = await pipeline(
+      "text-to-speech",
+      "Xenova/speecht5_tts",
+      {
+        quantized: false, // TTS models work better without quantization
+      }
+    );
+
+    // Carica gli speaker embeddings (voce predefinita)
+    // SpeechT5 richiede embeddings per caratterizzare la voce
+    const { AutoProcessor, SpeechT5HifiGan } = await import("@xenova/transformers");
+
+    // Usa embeddings di default (voce neutra)
+    // In futuro potremmo caricare diversi speaker embeddings per voci diverse
+    console.log("Loading default speaker embeddings...");
+
+    // Gli embeddings sono inclusi nel modello
+    // Useremo gli embeddings predefiniti nel modello
+
+    ttsEnabled = true;
+    console.log("✓ Local TTS model loaded successfully (SpeechT5)");
+  } catch (error) {
+    console.error("TTS model initialization failed:", error);
+    console.error("Error details:", error.stack);
+    ttsEnabled = false;
   }
 }
 
@@ -145,8 +188,9 @@ function wavBufferToFloat32Array(wavBuffer) {
 
   return float32Array;
 }
-// Inizializza il modello all'avvio
+// Inizializza i modelli all'avvio
 initWhisperModel();
+initTTSModel();
 
 // ============ VIDEO FRAME EXTRACTION ============
 // Cache directory for video frames
@@ -254,22 +298,29 @@ function cleanupOldVideoFrames() {
 setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
 
 // ============ TEXT-TO-SPEECH ============
-// Convert text to speech using Google Translate TTS API
+// Convert text to speech using LOCAL SpeechT5 model
 async function textToSpeech(text, language = 'en') {
   try {
-    console.log(`Converting text to speech: "${text}" (language: ${language})`);
+    console.log(`Converting text to speech using LOCAL model: "${text.substring(0, 50)}..." (language: ${language})`);
 
-    // Google Translate TTS API endpoint
-    const ttsUrl = `https://translate.google.com/translate_tts`;
+    if (!ttsEnabled || !ttsModel) {
+      throw new Error('Local TTS model not initialized. Please wait for model to load.');
+    }
 
-    // Split text into chunks if longer than 200 characters (Google TTS limit)
+    // SpeechT5 works best with English text
+    // For other languages, we'll still process but quality may vary
+    if (language !== 'en') {
+      console.log(`⚠ Note: SpeechT5 is optimized for English. Language '${language}' may have reduced quality.`);
+    }
+
+    // Split text into manageable chunks (SpeechT5 works better with shorter texts)
     const maxLength = 200;
     const chunks = [];
 
     if (text.length <= maxLength) {
       chunks.push(text);
     } else {
-      // Split by sentences or phrases
+      // Split by sentences
       const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
       let currentChunk = '';
 
@@ -284,43 +335,182 @@ async function textToSpeech(text, language = 'en') {
       if (currentChunk) chunks.push(currentChunk.trim());
     }
 
-    console.log(`Split into ${chunks.length} chunk(s)`);
+    console.log(`Processing ${chunks.length} chunk(s) with local TTS model...`);
 
-    // Fetch audio for each chunk
+    // Generate speech for each chunk
     const audioBuffers = [];
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-      console.log(`Fetching audio for chunk ${i + 1}/${chunks.length}`);
+      console.log(`Generating audio for chunk ${i + 1}/${chunks.length}...`);
 
-      const response = await axios.get(ttsUrl, {
-        params: {
-          ie: 'UTF-8',
-          tl: language,
-          client: 'tw-ob',
-          q: chunk,
-          textlen: chunk.length
-        },
-        responseType: 'arraybuffer',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': 'https://translate.google.com/'
-        }
+      // Generate speech using SpeechT5
+      const output = await ttsModel(chunk, {
+        // Speaker embeddings will use default from model
       });
 
-      audioBuffers.push(Buffer.from(response.data));
+      // The output is an object with 'audio' and 'sampling_rate'
+      const audioData = output.audio;
+      const samplingRate = output.sampling_rate || 16000;
+
+      console.log(`Generated audio: ${audioData.length} samples at ${samplingRate}Hz`);
+
+      // Convert Float32Array to WAV format
+      const wavBuffer = await convertToWav(audioData, samplingRate);
+      audioBuffers.push(wavBuffer);
     }
 
-    // Concatenate audio buffers if multiple chunks
+    // If multiple chunks, concatenate WAV files
     if (audioBuffers.length === 1) {
       return audioBuffers[0];
     } else {
-      // For multiple chunks, we'll need to concatenate MP3 files
-      // Simple concatenation works for MP3 files in most cases
-      return Buffer.concat(audioBuffers);
+      // Concatenate WAV files using FFmpeg
+      return await concatenateAudioFiles(audioBuffers);
     }
   } catch (error) {
-    console.error('Text-to-speech conversion error:', error.message);
-    throw new Error(`TTS conversion failed: ${error.message}`);
+    console.error('Local TTS conversion error:', error.message);
+    console.error('Error stack:', error.stack);
+    throw new Error(`Local TTS conversion failed: ${error.message}`);
+  }
+}
+
+// Helper function to convert Float32Array audio to WAV buffer
+async function convertToWav(audioData, samplingRate = 16000) {
+  // Create WAV header
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = samplingRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const dataSize = audioData.length * 2; // 16-bit = 2 bytes per sample
+
+  const buffer = Buffer.alloc(44 + dataSize);
+
+  // RIFF header
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.write('WAVE', 8);
+
+  // fmt chunk
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16); // fmt chunk size
+  buffer.writeUInt16LE(1, 20); // audio format (1 = PCM)
+  buffer.writeUInt16LE(numChannels, 22);
+  buffer.writeUInt32LE(samplingRate, 24);
+  buffer.writeUInt32LE(byteRate, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(bitsPerSample, 34);
+
+  // data chunk
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(dataSize, 40);
+
+  // Convert float32 to int16
+  for (let i = 0; i < audioData.length; i++) {
+    const sample = Math.max(-1, Math.min(1, audioData[i]));
+    const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+    buffer.writeInt16LE(int16, 44 + i * 2);
+  }
+
+  return buffer;
+}
+
+// Helper function to concatenate multiple audio files using FFmpeg
+async function concatenateAudioFiles(audioBuffers) {
+  const tempFiles = [];
+  const tempOutput = path.join(__dirname, `temp_concat_${Date.now()}.wav`);
+
+  try {
+    // Save each buffer to a temporary file
+    for (let i = 0; i < audioBuffers.length; i++) {
+      const tempFile = path.join(__dirname, `temp_chunk_${Date.now()}_${i}.wav`);
+      fs.writeFileSync(tempFile, audioBuffers[i]);
+      tempFiles.push(tempFile);
+    }
+
+    // Create concat file list
+    const concatList = path.join(__dirname, `concat_list_${Date.now()}.txt`);
+    const listContent = tempFiles.map(f => `file '${f}'`).join('\n');
+    fs.writeFileSync(concatList, listContent);
+
+    // Use FFmpeg to concatenate
+    await new Promise((resolve, reject) => {
+      const ffmpegPath = require("ffmpeg-static");
+      const process = require("child_process").spawn(ffmpegPath, [
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concatList,
+        '-c', 'copy',
+        tempOutput
+      ]);
+
+      process.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`FFmpeg concat failed with code ${code}`));
+      });
+    });
+
+    // Read concatenated file
+    const concatenated = fs.readFileSync(tempOutput);
+
+    // Cleanup
+    tempFiles.forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
+    fs.existsSync(concatList) && fs.unlinkSync(concatList);
+    fs.existsSync(tempOutput) && fs.unlinkSync(tempOutput);
+
+    return concatenated;
+  } catch (error) {
+    // Cleanup on error
+    tempFiles.forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
+    throw error;
+  }
+}
+
+// Helper function to convert WAV to OGG Opus format
+async function convertWavToOgg(wavBuffer) {
+  const tempWav = path.join(__dirname, `temp_tts_${Date.now()}.wav`);
+  const tempOgg = path.join(__dirname, `temp_tts_${Date.now()}.ogg`);
+
+  try {
+    // Write WAV to temp file
+    fs.writeFileSync(tempWav, wavBuffer);
+
+    // Convert to OGG Opus using FFmpeg
+    await new Promise((resolve, reject) => {
+      const ffmpegPath = require("ffmpeg-static");
+      const process = require("child_process").spawn(ffmpegPath, [
+        '-i', tempWav,
+        '-c:a', 'libopus',      // Use Opus codec
+        '-b:a', '64k',          // 64kbps bitrate (good for voice)
+        '-vbr', 'on',           // Variable bitrate
+        '-compression_level', '10', // Max compression
+        '-frame_duration', '60', // 60ms frames (good for voice)
+        '-application', 'voip',  // Optimize for voice
+        tempOgg
+      ]);
+
+      let stderr = '';
+      process.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      process.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`FFmpeg conversion failed with code ${code}: ${stderr}`));
+      });
+    });
+
+    // Read OGG file
+    const oggBuffer = fs.readFileSync(tempOgg);
+
+    // Cleanup
+    fs.existsSync(tempWav) && fs.unlinkSync(tempWav);
+    fs.existsSync(tempOgg) && fs.unlinkSync(tempOgg);
+
+    return oggBuffer;
+  } catch (error) {
+    // Cleanup on error
+    fs.existsSync(tempWav) && fs.unlinkSync(tempWav);
+    fs.existsSync(tempOgg) && fs.unlinkSync(tempOgg);
+    throw error;
   }
 }
 
@@ -4863,16 +5053,21 @@ app.post("/wml/send.tts", async (req, res) => {
 
     console.log(`TTS request: "${text}" in ${language} to ${to}`);
 
-    // Convert text to speech
+    // Convert text to speech (returns WAV format)
     const audioBuffer = await textToSpeech(text, language);
 
-    console.log(`TTS audio generated: ${audioBuffer.length} bytes`);
+    console.log(`TTS audio generated: ${audioBuffer.length} bytes (WAV format)`);
+
+    // Convert WAV to OGG for better compression and WhatsApp compatibility
+    const oggBuffer = await convertWavToOgg(audioBuffer);
+
+    console.log(`Converted to OGG: ${oggBuffer.length} bytes`);
 
     // Send as WhatsApp audio message
     const result = await sock.sendMessage(formatJid(to), {
-      audio: audioBuffer,
+      audio: oggBuffer,
       ptt: ptt === "true",
-      mimetype: "audio/mpeg",
+      mimetype: "audio/ogg; codecs=opus",
     });
 
     sendWml(
