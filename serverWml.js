@@ -441,7 +441,10 @@ async function textToSpeechGoogle(text, language = 'en') {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Referer': 'https://translate.google.com/'
-        }
+        },
+        timeout: 30000, // 30 second timeout
+        maxContentLength: 10 * 1024 * 1024, // 10MB max
+        maxBodyLength: 10 * 1024 * 1024
       });
 
       audioBuffers.push(Buffer.from(response.data));
@@ -5076,7 +5079,12 @@ app.post("/wml/send.image", async (req, res) => {
     const { to, imageUrl, caption } = req.body;
     if (!sock) throw new Error("Not connected");
 
-    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const response = await axios.get(imageUrl, {
+      responseType: "arraybuffer",
+      timeout: 60000, // 60 second timeout for images
+      maxContentLength: 50 * 1024 * 1024, // 50MB max for images
+      maxBodyLength: 50 * 1024 * 1024
+    });
     const result = await sock.sendMessage(formatJid(to), {
       image: response.data,
       caption,
@@ -5111,7 +5119,12 @@ app.post("/wml/send.video", async (req, res) => {
     const { to, videoUrl, caption } = req.body;
     if (!sock) throw new Error("Not connected");
 
-    const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
+    const response = await axios.get(videoUrl, {
+      responseType: "arraybuffer",
+      timeout: 120000, // 120 second timeout for videos
+      maxContentLength: 100 * 1024 * 1024, // 100MB max for videos
+      maxBodyLength: 100 * 1024 * 1024
+    });
     const result = await sock.sendMessage(formatJid(to), {
       video: response.data,
       caption,
@@ -5212,7 +5225,12 @@ app.post("/wml/send.audio", async (req, res) => {
     const { to, audioUrl, audioType = "audio/mp4", ptt = "false" } = req.body;
     if (!sock) throw new Error("Not connected");
 
-    const response = await axios.get(audioUrl, { responseType: "arraybuffer" });
+    const response = await axios.get(audioUrl, {
+      responseType: "arraybuffer",
+      timeout: 60000, // 60 second timeout
+      maxContentLength: 50 * 1024 * 1024, // 50MB max
+      maxBodyLength: 50 * 1024 * 1024
+    });
     const result = await sock.sendMessage(formatJid(to), {
       audio: response.data,
       ptt: ptt === "true",
@@ -5251,6 +5269,9 @@ app.post("/wml/send.document", async (req, res) => {
 
     const response = await axios.get(documentUrl, {
       responseType: "arraybuffer",
+      timeout: 120000, // 120 second timeout for documents
+      maxContentLength: 100 * 1024 * 1024, // 100MB max
+      maxBodyLength: 100 * 1024 * 1024
     });
     const result = await sock.sendMessage(formatJid(to), {
       document: response.data,
@@ -5290,6 +5311,9 @@ app.post("/wml/send.sticker", async (req, res) => {
 
     const response = await axios.get(stickerUrl, {
       responseType: "arraybuffer",
+      timeout: 60000, // 60 second timeout
+      maxContentLength: 10 * 1024 * 1024, // 10MB max for stickers
+      maxBodyLength: 10 * 1024 * 1024
     });
     const result = await sock.sendMessage(formatJid(to), {
       sticker: response.data,
@@ -7963,6 +7987,9 @@ app.post("/api/send-document", async (req, res) => {
 
     const response = await axios.get(documentUrl, {
       responseType: "arraybuffer",
+      timeout: 120000, // 120 second timeout for documents
+      maxContentLength: 100 * 1024 * 1024, // 100MB max
+      maxBodyLength: 100 * 1024 * 1024
     });
     const result = await sock.sendMessage(formatJid(to), {
       document: response.data,
