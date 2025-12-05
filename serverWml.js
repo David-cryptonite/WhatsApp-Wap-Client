@@ -298,19 +298,35 @@ function cleanupOldVideoFrames() {
 setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
 
 // ============ TEXT-TO-SPEECH ============
-// Convert text to speech using LOCAL SpeechT5 model
+// Hybrid TTS: Local SpeechT5 for English (offline), Google TTS for other languages
 async function textToSpeech(text, language = 'en') {
   try {
-    console.log(`Converting text to speech using LOCAL model: "${text.substring(0, 50)}..." (language: ${language})`);
+    console.log(`TTS request: "${text.substring(0, 50)}..." (language: ${language})`);
 
-    if (!ttsEnabled || !ttsModel) {
-      throw new Error('Local TTS model not initialized. Please wait for model to load.');
+    // Use local SpeechT5 model for English (best quality, offline)
+    if (language === 'en' && ttsEnabled && ttsModel) {
+      console.log('✓ Using LOCAL SpeechT5 model for English (offline, high quality)');
+      return await textToSpeechLocal(text);
     }
 
-    // SpeechT5 works best with English text
-    // For other languages, we'll still process but quality may vary
+    // Fall back to Google TTS for other languages or if local model unavailable
     if (language !== 'en') {
-      console.log(`⚠ Note: SpeechT5 is optimized for English. Language '${language}' may have reduced quality.`);
+      console.log(`Using Google TTS for language: ${language} (requires internet)`);
+    } else {
+      console.log('Local TTS unavailable, falling back to Google TTS');
+    }
+    return await textToSpeechGoogle(text, language);
+  } catch (error) {
+    console.error('TTS conversion error:', error.message);
+    throw new Error(`TTS conversion failed: ${error.message}`);
+  }
+}
+
+// Local TTS using SpeechT5 (English only, offline)
+async function textToSpeechLocal(text) {
+  try {
+    if (!ttsEnabled || !ttsModel) {
+      throw new Error('Local TTS model not initialized');
     }
 
     // Split text into manageable chunks (SpeechT5 works better with shorter texts)
@@ -367,9 +383,75 @@ async function textToSpeech(text, language = 'en') {
       return await concatenateAudioFiles(audioBuffers);
     }
   } catch (error) {
-    console.error('Local TTS conversion error:', error.message);
-    console.error('Error stack:', error.stack);
-    throw new Error(`Local TTS conversion failed: ${error.message}`);
+    console.error('Local TTS error:', error.message);
+    throw error;
+  }
+}
+
+// Google TTS (for non-English languages or fallback)
+async function textToSpeechGoogle(text, language = 'en') {
+  try {
+    // Google Translate TTS API endpoint
+    const ttsUrl = `https://translate.google.com/translate_tts`;
+
+    // Split text into chunks if longer than 200 characters (Google TTS limit)
+    const maxLength = 200;
+    const chunks = [];
+
+    if (text.length <= maxLength) {
+      chunks.push(text);
+    } else {
+      // Split by sentences
+      const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+      let currentChunk = '';
+
+      for (const sentence of sentences) {
+        if ((currentChunk + sentence).length <= maxLength) {
+          currentChunk += sentence;
+        } else {
+          if (currentChunk) chunks.push(currentChunk.trim());
+          currentChunk = sentence;
+        }
+      }
+      if (currentChunk) chunks.push(currentChunk.trim());
+    }
+
+    console.log(`Split into ${chunks.length} chunk(s) for Google TTS`);
+
+    // Fetch audio for each chunk
+    const audioBuffers = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      console.log(`Fetching Google TTS audio for chunk ${i + 1}/${chunks.length}`);
+
+      const response = await axios.get(ttsUrl, {
+        params: {
+          ie: 'UTF-8',
+          tl: language,
+          client: 'tw-ob',
+          q: chunk,
+          textlen: chunk.length
+        },
+        responseType: 'arraybuffer',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://translate.google.com/'
+        }
+      });
+
+      audioBuffers.push(Buffer.from(response.data));
+    }
+
+    // Concatenate audio buffers if multiple chunks
+    if (audioBuffers.length === 1) {
+      return audioBuffers[0];
+    } else {
+      // Simple concatenation works for MP3 files
+      return Buffer.concat(audioBuffers);
+    }
+  } catch (error) {
+    console.error('Google TTS error:', error.message);
+    throw error;
   }
 }
 
@@ -1285,12 +1367,23 @@ app.get("/wml/settings-tts.wml", (req, res) => {
   let options = '';
   for (const [code, name] of languages) {
     const selected = code === userSettings.defaultLanguage ? ' selected="selected"' : '';
-    options += `<option value="${code}"${selected}>${name}</option>`;
+    const engine = code === 'en' ? '★ LOCAL' : 'Google';
+    options += `<option value="${code}"${selected}>${name} (${engine})</option>`;
   }
 
+  const ttsStatus = ttsEnabled && ttsModel ? '✓ Ready' : '⏳ Loading...';
+  const currentLang = languages.find(([code]) => code === userSettings.defaultLanguage);
+  const currentName = currentLang ? currentLang[1] : userSettings.defaultLanguage;
+  const currentEngine = userSettings.defaultLanguage === 'en' ? 'Local (Offline)' : 'Google (Online)';
+
   const body = `
-    <p><b>Default TTS Language</b></p>
-    <p>Current: ${esc(userSettings.defaultLanguage)}</p>
+    <p><b>TTS Language Settings</b></p>
+    <p>Local TTS: ${ttsStatus}</p>
+    <p>Current: ${esc(currentName)}</p>
+    <p>Engine: ${currentEngine}</p>
+
+    <p><b>Language Options:</b></p>
+    <p><small>★ = Offline, High Quality<br/>Google = Online, 15 Languages</small></p>
 
     <p>Select language:</p>
     <select name="language" title="Language">
@@ -4653,9 +4746,11 @@ app.get("/wml/send.video.wml", (req, res) => {
 app.get("/wml/send.tts.wml", (req, res) => {
   const to = esc(req.query.to || "");
 
+  const ttsInfo = ttsEnabled && ttsModel ? '✓ Local TTS Ready' : '⏳ Loading Local TTS...';
+
   const body = `
     <p><b>Send Voice Message (TTS)</b></p>
-    <p>Type text to convert to speech</p>
+    <p><small>${ttsInfo}</small></p>
     <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
 
     <p>Your message:</p>
@@ -4663,21 +4758,21 @@ app.get("/wml/send.tts.wml", (req, res) => {
 
     <p>Language:</p>
     <select name="language" title="Language">
-      <option value="en">English</option>
-      <option value="es">Spanish</option>
-      <option value="fr">French</option>
-      <option value="de">German</option>
-      <option value="it">Italian</option>
-      <option value="pt">Portuguese</option>
-      <option value="nl">Dutch</option>
-      <option value="ru">Russian</option>
-      <option value="ja">Japanese</option>
-      <option value="ko">Korean</option>
-      <option value="zh">Chinese</option>
-      <option value="ar">Arabic</option>
-      <option value="hi">Hindi</option>
-      <option value="id">Indonesian</option>
-      <option value="tr">Turkish</option>
+      <option value="en">English (★ LOCAL)</option>
+      <option value="es">Spanish (Google)</option>
+      <option value="fr">French (Google)</option>
+      <option value="de">German (Google)</option>
+      <option value="it">Italian (Google)</option>
+      <option value="pt">Portuguese (Google)</option>
+      <option value="nl">Dutch (Google)</option>
+      <option value="ru">Russian (Google)</option>
+      <option value="ja">Japanese (Google)</option>
+      <option value="ko">Korean (Google)</option>
+      <option value="zh">Chinese (Google)</option>
+      <option value="ar">Arabic (Google)</option>
+      <option value="hi">Hindi (Google)</option>
+      <option value="id">Indonesian (Google)</option>
+      <option value="tr">Turkish (Google)</option>
     </select>
 
     <p>Voice Message (PTT):</p>
@@ -4686,7 +4781,7 @@ app.get("/wml/send.tts.wml", (req, res) => {
       <option value="false">No (Audio File)</option>
     </select>
 
-    <p><small>Max 500 characters<br/>Free Google TTS</small></p>
+    <p><small>Max 500 characters<br/>★ = Offline, High Quality<br/>Google = Online</small></p>
 
     <do type="accept" label="Send">
       <go method="post" href="/wml/send.tts">
@@ -5053,21 +5148,31 @@ app.post("/wml/send.tts", async (req, res) => {
 
     console.log(`TTS request: "${text}" in ${language} to ${to}`);
 
-    // Convert text to speech (returns WAV format)
+    // Convert text to speech (hybrid: WAV for English, MP3 for others)
     const audioBuffer = await textToSpeech(text, language);
 
-    console.log(`TTS audio generated: ${audioBuffer.length} bytes (WAV format)`);
+    console.log(`TTS audio generated: ${audioBuffer.length} bytes`);
 
-    // Convert WAV to OGG for better compression and WhatsApp compatibility
-    const oggBuffer = await convertWavToOgg(audioBuffer);
+    // English uses local TTS (WAV) → convert to OGG
+    // Other languages use Google TTS (MP3) → send directly
+    let finalAudio = audioBuffer;
+    let mimetype = "audio/mpeg"; // Default for Google TTS (MP3)
 
-    console.log(`Converted to OGG: ${oggBuffer.length} bytes`);
+    if (language === 'en' && ttsEnabled && ttsModel) {
+      // Local TTS returns WAV, convert to OGG Opus for better compression
+      console.log('Converting WAV to OGG Opus...');
+      finalAudio = await convertWavToOgg(audioBuffer);
+      mimetype = "audio/ogg; codecs=opus";
+      console.log(`Converted to OGG: ${finalAudio.length} bytes`);
+    } else {
+      console.log('Using MP3 from Google TTS directly');
+    }
 
     // Send as WhatsApp audio message
     const result = await sock.sendMessage(formatJid(to), {
-      audio: oggBuffer,
+      audio: finalAudio,
       ptt: ptt === "true",
-      mimetype: "audio/ogg; codecs=opus",
+      mimetype: mimetype,
     });
 
     sendWml(
