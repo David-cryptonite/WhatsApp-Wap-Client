@@ -1960,7 +1960,7 @@ app.get("/wml/contact.wml", async (req, res) => {
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           jid
         )}&amp;limit=15" accesskey="4">[4] Open Chat</a><br/>
-        <a href="/wml/send.text.wml?to=${encodeURIComponent(
+        <a href="/wml/send-menu.wml?to=${encodeURIComponent(
           jid
         )}" accesskey="5">[5] Send Message</a><br/>
         <a href="/wml/block.wml?jid=${encodeURIComponent(
@@ -2777,15 +2777,15 @@ app.get("/wml/chat.wml", async (req, res) => {
 
   // Quick actions adapted to device
   const quickActions = isOldNokia
-    ? `<p><a href="/wml/send.text.wml?to=${encodeURIComponent(
+    ? `<p><a href="/wml/send-menu.wml?to=${encodeURIComponent(
         jid
       )}" accesskey="1">1-Send</a></p>
      <p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
     : `<p><b>Quick Actions:</b></p>
      <p>
-       <a href="/wml/send.text.wml?to=${encodeURIComponent(
+       <a href="/wml/send-menu.wml?to=${encodeURIComponent(
          jid
-       )}" accesskey="1">[1] Send Text</a> 
+       )}" accesskey="1">[1] Send Message</a>
        <a href="/wml/contact.wml?jid=${encodeURIComponent(
          jid
        )}" accesskey="4">[4] Contact Info</a>
@@ -2835,7 +2835,7 @@ ${quickActions}`;
 <card id="chat" title="Chat">
 ${body}
 <do type="accept" label="Send">
-  <go href="/wml/send.text.wml?to=${encodeURIComponent(jid)}"/>
+  <go href="/wml/send-menu.wml?to=${encodeURIComponent(jid)}"/>
 </do>
 <do type="options" label="Refresh">
   <go href="/wml/chat.wml?jid=${encodeURIComponent(
