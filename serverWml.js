@@ -4541,6 +4541,7 @@ app.get("/wml/send-menu.wml", (req, res) => {
   sendWml(res, card("send-menu", "Send Menu", body));
 });
 // Route di dispatch per gestire la selezione del destinatario
+// Uses simple HTTP redirect for Nokia WAP compatibility
 app.post("/wml/send-dispatch.wml", (req, res) => {
   const msgtype = req.body.msgtype || "/wml/send.text.wml";
   const target = req.body.target || "";
@@ -4571,23 +4572,15 @@ app.post("/wml/send-dispatch.wml", (req, res) => {
     return sendWml(res, card("error", "Error", body));
   }
 
-  // Redirect alla pagina del tipo di messaggio con il destinatario
+  // Simple HTTP redirect - works on all Nokia WAP devices
   const redirectUrl = `${msgtype}?to=${encodeURIComponent(finalTarget)}`;
   console.log("Redirecting to:", redirectUrl);
 
-  const body = `
-    <p>Redirecting to ${esc(msgtype)}...</p>
-    <p>Target: ${esc(finalTarget)}</p>
-    <onevent type="onenterforward">
-      <go href="${redirectUrl}"/>
-    </onevent>
-    <p><a href="${redirectUrl}">Continue</a></p>
-  `;
-
-  sendWml(res, card("dispatch", "Loading...", body));
+  // Use standard HTTP 302 redirect for Nokia compatibility
+  res.redirect(302, redirectUrl);
 });
 
-// Versione GET per fallback
+// Versione GET per fallback - Nokia WAP compatible
 app.get("/wml/send-dispatch.wml", (req, res) => {
   const msgtype = req.query.msgtype || "/wml/send.text.wml";
   const target = req.query.target || "";
@@ -4607,15 +4600,8 @@ app.get("/wml/send-dispatch.wml", (req, res) => {
 
   const redirectUrl = `${msgtype}?to=${encodeURIComponent(finalTarget)}`;
 
-  const body = `
-    <p>Redirecting...</p>
-    <onevent type="onenterforward">
-      <go href="${redirectUrl}"/>
-    </onevent>
-    <p><a href="${redirectUrl}">Continue</a></p>
-  `;
-
-  sendWml(res, card("dispatch", "Loading...", body));
+  // Use standard HTTP 302 redirect for Nokia compatibility
+  res.redirect(302, redirectUrl);
 });
 
 // Enhanced Send Text with templates
