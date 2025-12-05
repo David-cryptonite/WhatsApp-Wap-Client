@@ -253,6 +253,77 @@ function cleanupOldVideoFrames() {
 // Run cleanup every 30 minutes
 setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
 
+// ============ TEXT-TO-SPEECH ============
+// Convert text to speech using Google Translate TTS API
+async function textToSpeech(text, language = 'en') {
+  try {
+    console.log(`Converting text to speech: "${text}" (language: ${language})`);
+
+    // Google Translate TTS API endpoint
+    const ttsUrl = `https://translate.google.com/translate_tts`;
+
+    // Split text into chunks if longer than 200 characters (Google TTS limit)
+    const maxLength = 200;
+    const chunks = [];
+
+    if (text.length <= maxLength) {
+      chunks.push(text);
+    } else {
+      // Split by sentences or phrases
+      const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+      let currentChunk = '';
+
+      for (const sentence of sentences) {
+        if ((currentChunk + sentence).length <= maxLength) {
+          currentChunk += sentence;
+        } else {
+          if (currentChunk) chunks.push(currentChunk.trim());
+          currentChunk = sentence;
+        }
+      }
+      if (currentChunk) chunks.push(currentChunk.trim());
+    }
+
+    console.log(`Split into ${chunks.length} chunk(s)`);
+
+    // Fetch audio for each chunk
+    const audioBuffers = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      console.log(`Fetching audio for chunk ${i + 1}/${chunks.length}`);
+
+      const response = await axios.get(ttsUrl, {
+        params: {
+          ie: 'UTF-8',
+          tl: language,
+          client: 'tw-ob',
+          q: chunk,
+          textlen: chunk.length
+        },
+        responseType: 'arraybuffer',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://translate.google.com/'
+        }
+      });
+
+      audioBuffers.push(Buffer.from(response.data));
+    }
+
+    // Concatenate audio buffers if multiple chunks
+    if (audioBuffers.length === 1) {
+      return audioBuffers[0];
+    } else {
+      // For multiple chunks, we'll need to concatenate MP3 files
+      // Simple concatenation works for MP3 files in most cases
+      return Buffer.concat(audioBuffers);
+    }
+  } catch (error) {
+    console.error('Text-to-speech conversion error:', error.message);
+    throw new Error(`TTS conversion failed: ${error.message}`);
+  }
+}
+
 const iconv = require("iconv-lite");
 
 const app = express();
@@ -3653,6 +3724,7 @@ app.get("/wml/send-menu.wml", (req, res) => {
     <p><b>Message Types:</b></p>
     <select name="msgtype" title="Type" iname="msgtype" ivalue="/wml/send.text.wml">
       <option value="/wml/send.text.wml">Text Message</option>
+      <option value="/wml/send.tts.wml">Voice (Text-to-Speech)</option>
       <option value="/wml/send.image.wml">Image (URL)</option>
       <option value="/wml/send.video.wml">Video (URL)</option>
       <option value="/wml/send.audio.wml">Audio (URL)</option>
@@ -3900,6 +3972,65 @@ app.get("/wml/send.video.wml", (req, res) => {
 });
 
 // Endpoint per inviare audio
+// Text-to-Speech form
+app.get("/wml/send.tts.wml", (req, res) => {
+  const to = esc(req.query.to || "");
+
+  const body = `
+    <p><b>Send Voice Message (TTS)</b></p>
+    <p>Type text to convert to speech</p>
+    <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
+
+    <p>Your message:</p>
+    <input name="text" title="Message" value="" size="30" maxlength="500"/>
+
+    <p>Language:</p>
+    <select name="language" title="Language">
+      <option value="en">English</option>
+      <option value="es">Spanish</option>
+      <option value="fr">French</option>
+      <option value="de">German</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="nl">Dutch</option>
+      <option value="ru">Russian</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+      <option value="zh">Chinese</option>
+      <option value="ar">Arabic</option>
+      <option value="hi">Hindi</option>
+      <option value="id">Indonesian</option>
+      <option value="tr">Turkish</option>
+    </select>
+
+    <p>Voice Message (PTT):</p>
+    <select name="ptt" title="Voice">
+      <option value="true">Yes (Voice Note)</option>
+      <option value="false">No (Audio File)</option>
+    </select>
+
+    <p><small>Max 500 characters<br/>Free Google TTS</small></p>
+
+    <do type="accept" label="Send">
+      <go method="post" href="/wml/send.tts">
+        <postfield name="to" value="$(to)"/>
+        <postfield name="text" value="$(text)"/>
+        <postfield name="language" value="$(language)"/>
+        <postfield name="ptt" value="$(ptt)"/>
+      </go>
+    </do>
+
+    <p>
+      <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        to
+      )}" accesskey="0">[0] Back</a>
+      <a href="/wml/contacts.wml" accesskey="9">[9] Contacts</a>
+    </p>
+  `;
+
+  sendWml(res, card("send-tts", "Send Voice (TTS)", body));
+});
+
 app.get("/wml/send.audio.wml", (req, res) => {
   const to = esc(req.query.to || "");
 
@@ -4228,6 +4359,57 @@ app.post("/wml/send.video", async (req, res) => {
         "Send Failed",
         [error.message || "Failed to send video"],
         "/wml/send.video.wml"
+      )
+    );
+  }
+});
+
+// Send TTS audio message
+app.post("/wml/send.tts", async (req, res) => {
+  try {
+    const { to, text, language = "en", ptt = "true" } = req.body;
+
+    if (!sock) throw new Error("Not connected");
+    if (!text || text.trim().length === 0) {
+      throw new Error("Please enter text to convert to speech");
+    }
+
+    console.log(`TTS request: "${text}" in ${language} to ${to}`);
+
+    // Convert text to speech
+    const audioBuffer = await textToSpeech(text, language);
+
+    console.log(`TTS audio generated: ${audioBuffer.length} bytes`);
+
+    // Send as WhatsApp audio message
+    const result = await sock.sendMessage(formatJid(to), {
+      audio: audioBuffer,
+      ptt: ptt === "true",
+      mimetype: "audio/mpeg",
+    });
+
+    sendWml(
+      res,
+      resultCard(
+        "Voice Message Sent",
+        [
+          `To: ${jidFriendly(to)}`,
+          `Text: "${text.substring(0, 50)}${text.length > 50 ? "..." : ""}"`,
+          `Language: ${language}`,
+          `Type: ${ptt === "true" ? "Voice Note (PTT)" : "Audio File"}`,
+          `ID: ${result?.key?.id || "Unknown"}`,
+        ],
+        "/wml/send-menu.wml"
+      )
+    );
+  } catch (error) {
+    console.error("TTS send error:", error);
+    sendWml(
+      res,
+      resultCard(
+        "Send Failed",
+        [error.message || "Failed to send voice message"],
+        "/wml/send.tts.wml"
       )
     );
   }
