@@ -2448,13 +2448,29 @@ app.get("/wml/media-info.wml", async (req, res) => {
 <p>Size: ${size}KB</p>
 <p>Type: ${img.mimetype || "image/jpeg"}</p>
 ${caption}
-<p><b>Nokia Compatible:</b></p>
+<p><b>View Image:</b></p>
 <p>
-<a href="/wml/media/${encodeURIComponent(messageId)}.jpg">[Small JPG]</a> 
-<a href="/wml/media/${encodeURIComponent(messageId)}.png">[Small PNG]</a> 
-<a href="/wml/view-wbmp.wml?mid=${encodeURIComponent(
+<a href="/wml/image-format.wml?mid=${encodeURIComponent(
               messageId
-            )}&amp;jid=${encodeURIComponent(jid)}">[WBMP View]</a>
+            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Select Format &amp; View</a>
+</p>
+<p><b>Quick View:</b></p>
+<p>
+<a href="/wml/view-image.wml?mid=${encodeURIComponent(
+              messageId
+            )}&amp;jid=${encodeURIComponent(jid)}&amp;format=wbmp">[WBMP]</a>
+<a href="/wml/view-image.wml?mid=${encodeURIComponent(
+              messageId
+            )}&amp;jid=${encodeURIComponent(jid)}&amp;format=jpg">[JPG]</a>
+<a href="/wml/view-image.wml?mid=${encodeURIComponent(
+              messageId
+            )}&amp;jid=${encodeURIComponent(jid)}&amp;format=png">[PNG]</a>
+</p>
+<p><b>Download:</b></p>
+<p>
+<a href="/wml/media/${encodeURIComponent(messageId)}.jpg">[JPG]</a>
+<a href="/wml/media/${encodeURIComponent(messageId)}.png">[PNG]</a>
+<a href="/wml/media/${encodeURIComponent(messageId)}.wbmp">[WBMP]</a>
 </p>
 `;
           } else if (targetMessage.message?.videoMessage) {
@@ -2470,12 +2486,14 @@ ${caption}
 <p>Size: ${size}KB | Duration: ${duration}s</p>
 <p>Type: ${vid.mimetype || "video/mp4"}</p>
 ${caption}
-<p><b>Nokia WAP Playback:</b></p>
+<p><b>Nokia WAP Playback (1 FPS):</b></p>
 <p>
 <a href="/wml/view-video.wml?mid=${encodeURIComponent(
               messageId
-            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Play Frame-by-Frame (1 FPS)</a>
+            )}&amp;jid=${encodeURIComponent(jid)}" accesskey="5">[5] Play (Format: WBMP/JPG/PNG)</a>
 </p>
+<p>Frame-by-frame with format selection<br/>
+Press [7] during playback to change</p>
 <p><b>Mobile Compatible:</b></p>
 <p>
 <a href="/wml/media/${encodeURIComponent(messageId)}.3gp">[3GP]</a>
@@ -2698,6 +2716,7 @@ app.get("/wml/view-video.wml", async (req, res) => {
     const jid = req.query.jid || "";
     const frameNum = parseInt(req.query.frame || "1", 10);
     const autoplay = req.query.autoplay === "1";
+    const format = req.query.format || "wbmp"; // wbmp, jpg, png
 
     // Find message
     const messages = chatStore.get(jid) || [];
@@ -2760,21 +2779,26 @@ app.get("/wml/view-video.wml", async (req, res) => {
     const vid = targetMessage.message.videoMessage;
     const duration = vid.seconds || 0;
 
-    // Navigation
+    // Navigation with format parameter
     const prevFrame = currentFrame > 1 ? currentFrame - 1 : frameCount;
     const nextFrame = currentFrame < frameCount ? currentFrame + 1 : 1;
 
-    const prevLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${prevFrame}`;
-    const nextLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}`;
-    const autoplayLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}&amp;autoplay=1`;
+    const prevLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${prevFrame}&amp;format=${format}`;
+    const nextLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}&amp;format=${format}`;
+    const autoplayLink = `/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${nextFrame}&amp;autoplay=1&amp;format=${format}`;
+
+    // Format info
+    const formatNames = { wbmp: 'WBMP B&W', jpg: 'JPEG Color', png: 'PNG Color' };
+    const formatName = formatNames[format] || 'WBMP';
 
     const body = `<p><b>Video Playback</b></p>
 <p>From: ${esc(chatName)}</p>
 <p>Frame ${currentFrame}/${frameCount}</p>
 <p>Duration: ${duration}s (1 FPS)</p>
+<p>Format: ${formatName}</p>
 
 <p align="center">
-  <img src="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=wbmp" alt="Frame ${currentFrame}"/>
+  <img src="/wml/video-frame/${encodeURIComponent(messageId)}/${currentFrame}?format=${format}" alt="Frame ${currentFrame}"/>
 </p>
 
 <p>
@@ -2783,6 +2807,9 @@ app.get("/wml/view-video.wml", async (req, res) => {
 </p>
 <p>
   <a href="${autoplayLink}" accesskey="5">[5] ${autoplay ? 'Playing...' : 'Play'}</a>
+</p>
+<p>
+  <a href="/wml/video-format.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${currentFrame}" accesskey="7">[7] Change Format</a>
 </p>
 <p>
   <a href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="0">[0] Back</a>
@@ -2815,6 +2842,202 @@ ${body}
   } catch (error) {
     logger.error("Video playback error:", error);
     res.status(500).send("Error loading video");
+  }
+});
+
+// Video format selection page
+app.get("/wml/video-format.wml", async (req, res) => {
+  try {
+    const messageId = req.query.mid || "";
+    const jid = req.query.jid || "";
+    const frame = req.query.frame || "1";
+
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    const body = `<p><b>Select Video Format</b></p>
+<p>Choose format for frame display:</p>
+
+<p><b>1. WBMP (B&amp;W)</b></p>
+<p>Best for old Nokia devices<br/>
+96x96 pixels, 1-bit<br/>
+Smallest size, fastest</p>
+<p><a href="/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${frame}&amp;format=wbmp" accesskey="1">[1] Select WBMP</a></p>
+
+<p><b>2. JPEG (Color)</b></p>
+<p>Color support<br/>
+128x128 pixels<br/>
+Medium size</p>
+<p><a href="/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${frame}&amp;format=jpg" accesskey="2">[2] Select JPEG</a></p>
+
+<p><b>3. PNG (Color)</b></p>
+<p>High quality color<br/>
+128x128 pixels<br/>
+Larger size</p>
+<p><a href="/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${frame}&amp;format=png" accesskey="3">[3] Select PNG</a></p>
+
+<p><a href="/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${frame}" accesskey="0">[0] Back</a></p>
+
+<do type="accept" label="Back">
+  <go href="/wml/view-video.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;frame=${frame}"/>
+</do>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="no-cache"/></head>
+<card id="format" title="Format">
+${body}
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("Video format selection error:", error);
+    res.status(500).send("Error loading format selection");
+  }
+});
+
+// Image format selection page
+app.get("/wml/image-format.wml", async (req, res) => {
+  try {
+    const messageId = req.query.mid || "";
+    const jid = req.query.jid || "";
+
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    const body = `<p><b>Select Image Format</b></p>
+<p>Choose format for image display:</p>
+
+<p><b>1. WBMP (B&amp;W)</b></p>
+<p>Best for old Nokia devices<br/>
+Black &amp; white<br/>
+Smallest size, fastest</p>
+<p><a href="/wml/view-image.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;format=wbmp" accesskey="1">[1] Select WBMP</a></p>
+
+<p><b>2. JPEG (Color)</b></p>
+<p>Color support<br/>
+Medium quality<br/>
+Medium size</p>
+<p><a href="/wml/view-image.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;format=jpg" accesskey="2">[2] Select JPEG</a></p>
+
+<p><b>3. PNG (Color)</b></p>
+<p>High quality color<br/>
+Best quality<br/>
+Larger size</p>
+<p><a href="/wml/view-image.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}&amp;format=png" accesskey="3">[3] Select PNG</a></p>
+
+<p><a href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="0">[0] Back</a></p>
+
+<do type="accept" label="Back">
+  <go href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}"/>
+</do>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="no-cache"/></head>
+<card id="format" title="Format">
+${body}
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("Image format selection error:", error);
+    res.status(500).send("Error loading format selection");
+  }
+});
+
+// Image viewer with format selection
+app.get("/wml/view-image.wml", async (req, res) => {
+  try {
+    const messageId = req.query.mid || "";
+    const jid = req.query.jid || "";
+    const format = req.query.format || "wbmp"; // wbmp, jpg, png
+
+    // Find message
+    const messages = chatStore.get(jid) || [];
+    const targetMessage = messages.find((m) => m.key.id === messageId);
+
+    if (!targetMessage || !targetMessage.message?.imageMessage) {
+      return sendWml(
+        res,
+        resultCard("Error", ["Image message not found"], "/wml/chats.wml")
+      );
+    }
+
+    const contact = contactStore.get(jid);
+    const chatName = contact?.name || contact?.notify || jidFriendly(jid);
+    const img = targetMessage.message.imageMessage;
+    const caption = img.caption || "";
+
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+    // Format info
+    const formatNames = { wbmp: 'WBMP B&W', jpg: 'JPEG Color', png: 'PNG Color' };
+    const formatName = formatNames[format] || 'WBMP';
+    const formatExt = format === 'wbmp' ? 'wbmp' : (format === 'jpg' ? 'jpg' : 'png');
+
+    const body = `<p><b>Image Viewer</b></p>
+<p>From: ${esc(chatName)}</p>
+${caption ? `<p>Caption: ${esc(caption)}</p>` : ''}
+<p>Format: ${formatName}</p>
+
+<p align="center">
+  <img src="/wml/media/${encodeURIComponent(messageId)}.${formatExt}${format === 'wbmp' ? '?wbmp=1' : ''}" alt="Image"/>
+</p>
+
+<p>
+  <a href="/wml/image-format.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="7">[7] Change Format</a>
+</p>
+<p>
+  <a href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}" accesskey="0">[0] Back</a>
+</p>
+
+<do type="accept" label="Back">
+  <go href="/wml/media-info.wml?mid=${encodeURIComponent(messageId)}&amp;jid=${encodeURIComponent(jid)}"/>
+</do>`;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="no-cache"/></head>
+<card id="image" title="Image">
+${body}
+</card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Pragma", "no-cache");
+
+    const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+    res.send(encodedBuffer);
+  } catch (error) {
+    logger.error("Image viewer error:", error);
+    res.status(500).send("Error loading image");
   }
 });
 
