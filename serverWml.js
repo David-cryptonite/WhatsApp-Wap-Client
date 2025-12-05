@@ -63,39 +63,35 @@ async function initWhisperModel() {
 async function initTTSModel() {
   try {
     console.log("Initializing local TTS model (SpeechT5)...");
+    console.log("Note: If this fails, Google TTS will be used as fallback for all languages");
 
     // Usa import dinamico per caricare il modulo ESM
     const { pipeline, env } = await import("@xenova/transformers");
 
-    // Disabilita il controllo local_files_only per il primo download
+    // Configure environment for Node.js
     env.allowRemoteModels = true;
+    env.allowLocalModels = true;
+    env.useBrowserCache = false;
+    env.backends.onnx.wasm.numThreads = 1;
 
     // Carica il modello SpeechT5 per TTS
     ttsModel = await pipeline(
       "text-to-speech",
       "Xenova/speecht5_tts",
       {
-        quantized: false, // TTS models work better without quantization
+        quantized: false,
+        device: 'cpu',
       }
     );
 
-    // Carica gli speaker embeddings (voce predefinita)
-    // SpeechT5 richiede embeddings per caratterizzare la voce
-    const { AutoProcessor, SpeechT5HifiGan } = await import("@xenova/transformers");
-
-    // Usa embeddings di default (voce neutra)
-    // In futuro potremmo caricare diversi speaker embeddings per voci diverse
-    console.log("Loading default speaker embeddings...");
-
-    // Gli embeddings sono inclusi nel modello
-    // Useremo gli embeddings predefiniti nel modello
-
     ttsEnabled = true;
     console.log("✓ Local TTS model loaded successfully (SpeechT5)");
+    console.log("✓ English will use local TTS, other languages will use Google TTS");
   } catch (error) {
-    console.error("TTS model initialization failed:", error);
-    console.error("Error details:", error.stack);
+    console.error("⚠ Local TTS model initialization failed - using Google TTS for all languages");
+    console.error("Error:", error.message);
     ttsEnabled = false;
+    console.log("✓ Google TTS will be used for all languages (requires internet)");
   }
 }
 
@@ -193,7 +189,13 @@ function wavBufferToFloat32Array(wavBuffer) {
 }
 // Inizializza i modelli all'avvio
 initWhisperModel();
-initTTSModel();
+
+// ⚠ Local TTS disabled - Using Google TTS for all languages
+// Reason: ONNX Runtime has compatibility issues on Raspberry Pi
+// Google TTS works perfectly and supports 15 languages online
+// initTTSModel();
+console.log("✓ TTS: Using Google Translate TTS for all languages (15 languages supported)");
+console.log("✓ STT: Whisper model for speech-to-text (99 languages supported)");
 
 // ============ VIDEO FRAME EXTRACTION ============
 // Cache directory for video frames
@@ -303,23 +305,12 @@ function cleanupOldVideoFrames() {
 setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
 
 // ============ TEXT-TO-SPEECH ============
-// Hybrid TTS: Local SpeechT5 for English (offline), Google TTS for other languages
+// Google TTS for all languages (15 languages supported, requires internet)
 async function textToSpeech(text, language = 'en') {
   try {
     console.log(`TTS request: "${text.substring(0, 50)}..." (language: ${language})`);
+    console.log(`Using Google TTS (online)`);
 
-    // Use local SpeechT5 model for English (best quality, offline)
-    if (language === 'en' && ttsEnabled && ttsModel) {
-      console.log('✓ Using LOCAL SpeechT5 model for English (offline, high quality)');
-      return await textToSpeechLocal(text);
-    }
-
-    // Fall back to Google TTS for other languages or if local model unavailable
-    if (language !== 'en') {
-      console.log(`Using Google TTS for language: ${language} (requires internet)`);
-    } else {
-      console.log('Local TTS unavailable, falling back to Google TTS');
-    }
     return await textToSpeechGoogle(text, language);
   } catch (error) {
     console.error('TTS conversion error:', error.message);
@@ -1383,23 +1374,20 @@ app.get("/wml/settings-tts.wml", (req, res) => {
   let options = '';
   for (const [code, name] of languages) {
     const selected = code === userSettings.defaultLanguage ? ' selected="selected"' : '';
-    const engine = code === 'en' ? '★ LOCAL' : 'Google';
-    options += `<option value="${code}"${selected}>${name} (${engine})</option>`;
+    options += `<option value="${code}"${selected}>${name}</option>`;
   }
 
-  const ttsStatus = ttsEnabled && ttsModel ? '✓ Ready' : '⏳ Loading...';
   const currentLang = languages.find(([code]) => code === userSettings.defaultLanguage);
   const currentName = currentLang ? currentLang[1] : userSettings.defaultLanguage;
-  const currentEngine = userSettings.defaultLanguage === 'en' ? 'Local (Offline)' : 'Google (Online)';
 
   const body = `
     <p><b>TTS Language Settings</b></p>
-    <p>Local TTS: ${ttsStatus}</p>
+    <p>Engine: Google TTS (Online)</p>
     <p>Current: ${esc(currentName)}</p>
-    <p>Engine: ${currentEngine}</p>
+    <p>Status: ✓ Ready</p>
 
     <p><b>Language Options:</b></p>
-    <p><small>★ = Offline, High Quality<br/>Google = Online, 15 Languages</small></p>
+    <p><small>15 languages supported<br/>Requires internet connection</small></p>
 
     <p>Select language:</p>
     <select name="language" title="Language">
@@ -4754,11 +4742,9 @@ app.get("/wml/send.video.wml", (req, res) => {
 app.get("/wml/send.tts.wml", (req, res) => {
   const to = esc(req.query.to || "");
 
-  const ttsInfo = ttsEnabled && ttsModel ? '✓ Local TTS Ready' : '⏳ Loading Local TTS...';
-
   const body = `
     <p><b>Send Voice Message (TTS)</b></p>
-    <p><small>${ttsInfo}</small></p>
+    <p><small>✓ Google TTS (15 Languages)</small></p>
     <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
 
     <p>Your message:</p>
@@ -4766,21 +4752,21 @@ app.get("/wml/send.tts.wml", (req, res) => {
 
     <p>Language:</p>
     <select name="language" title="Language">
-      <option value="en">English (★ LOCAL)</option>
-      <option value="es">Spanish (Google)</option>
-      <option value="fr">French (Google)</option>
-      <option value="de">German (Google)</option>
-      <option value="it">Italian (Google)</option>
-      <option value="pt">Portuguese (Google)</option>
-      <option value="nl">Dutch (Google)</option>
-      <option value="ru">Russian (Google)</option>
-      <option value="ja">Japanese (Google)</option>
-      <option value="ko">Korean (Google)</option>
-      <option value="zh">Chinese (Google)</option>
-      <option value="ar">Arabic (Google)</option>
-      <option value="hi">Hindi (Google)</option>
-      <option value="id">Indonesian (Google)</option>
-      <option value="tr">Turkish (Google)</option>
+      <option value="en">English</option>
+      <option value="es">Spanish</option>
+      <option value="fr">French</option>
+      <option value="de">German</option>
+      <option value="it">Italian</option>
+      <option value="pt">Portuguese</option>
+      <option value="nl">Dutch</option>
+      <option value="ru">Russian</option>
+      <option value="ja">Japanese</option>
+      <option value="ko">Korean</option>
+      <option value="zh">Chinese</option>
+      <option value="ar">Arabic</option>
+      <option value="hi">Hindi</option>
+      <option value="id">Indonesian</option>
+      <option value="tr">Turkish</option>
     </select>
 
     <p>Voice Message (PTT):</p>
@@ -4789,7 +4775,7 @@ app.get("/wml/send.tts.wml", (req, res) => {
       <option value="false">No (Audio File)</option>
     </select>
 
-    <p><small>Max 500 characters<br/>★ = Offline, High Quality<br/>Google = Online</small></p>
+    <p><small>Max 500 characters<br/>Google TTS (requires internet)</small></p>
 
     <do type="accept" label="Send">
       <go method="post" href="/wml/send.tts">
@@ -5166,31 +5152,16 @@ app.post("/wml/send.tts", async (req, res) => {
 
     console.log(`TTS request: "${text}" in ${language} to ${to}`);
 
-    // Convert text to speech (hybrid: WAV for English, MP3 for others)
+    // Convert text to speech using Google TTS (returns MP3)
     const audioBuffer = await textToSpeech(text, language);
 
-    console.log(`TTS audio generated: ${audioBuffer.length} bytes`);
-
-    // English uses local TTS (WAV) → convert to OGG
-    // Other languages use Google TTS (MP3) → send directly
-    let finalAudio = audioBuffer;
-    let mimetype = "audio/mpeg"; // Default for Google TTS (MP3)
-
-    if (language === 'en' && ttsEnabled && ttsModel) {
-      // Local TTS returns WAV, convert to OGG Opus for better compression
-      console.log('Converting WAV to OGG Opus...');
-      finalAudio = await convertWavToOgg(audioBuffer);
-      mimetype = "audio/ogg; codecs=opus";
-      console.log(`Converted to OGG: ${finalAudio.length} bytes`);
-    } else {
-      console.log('Using MP3 from Google TTS directly');
-    }
+    console.log(`TTS audio generated: ${audioBuffer.length} bytes (MP3 from Google)`);
 
     // Send as WhatsApp audio message
     const result = await sock.sendMessage(formatJid(to), {
-      audio: finalAudio,
+      audio: audioBuffer,
       ptt: ptt === "true",
-      mimetype: mimetype,
+      mimetype: "audio/mpeg",
     });
 
     sendWml(
