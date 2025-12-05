@@ -289,7 +289,7 @@ function cleanupOldVideoFrames() {
 setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
 
 // ============ TEXT-TO-SPEECH ============
-// Local TTS using espeak (English only, offline)
+// Local TTS using espeak (English and Italian, offline)
 async function textToSpeech(text, language = 'en') {
   try {
     console.log(`TTS request: "${text.substring(0, 50)}..." (language: ${language})`);
@@ -298,35 +298,38 @@ async function textToSpeech(text, language = 'en') {
       throw new Error('Local TTS not available. Install espeak: sudo apt-get install espeak');
     }
 
-    if (language !== 'en') {
-      console.log(`⚠ Only English supported. Converting ${language} text with English voice.`);
+    // Support only English and Italian
+    if (language !== 'en' && language !== 'it') {
+      console.log(`⚠ Only English (en) and Italian (it) supported. Using English for ${language}.`);
+      language = 'en';
     }
 
-    return await textToSpeechLocal(text);
+    return await textToSpeechLocal(text, language);
   } catch (error) {
     console.error('TTS conversion error:', error.message);
     throw new Error(`TTS conversion failed: ${error.message}`);
   }
 }
 
-// Local TTS using espeak (Raspberry Pi compatible, English only, offline)
-async function textToSpeechLocal(text) {
+// Local TTS using espeak (Raspberry Pi compatible, English and Italian, offline)
+async function textToSpeechLocal(text, language = 'en') {
   const tempWav = path.join(__dirname, `temp_espeak_${Date.now()}.wav`);
 
   try {
-    console.log(`Generating speech with espeak (local, offline)...`);
+    const langName = language === 'it' ? 'Italian' : 'English';
+    console.log(`Generating speech with espeak (${langName}, local, offline)...`);
 
     // Use espeak to generate WAV audio
     await new Promise((resolve, reject) => {
       const { spawn } = require('child_process');
 
       // espeak command: text to WAV file
-      // -v en: English voice
+      // -v: Voice (en for English, it for Italian)
       // -s 150: Speed (words per minute)
       // -a 200: Amplitude (volume)
       // -w: Write to WAV file
       const espeak = spawn('espeak', [
-        '-v', 'en',           // English voice
+        '-v', language,       // Voice: 'en' or 'it'
         '-s', '150',          // Speed: 150 wpm (natural)
         '-a', '200',          // Volume: maximum
         '-w', tempWav,        // Output WAV file
@@ -1355,13 +1358,16 @@ app.get("/wml/settings-tts.wml", (req, res) => {
   const ttsStatus = ttsEnabled ? '✓ Ready' : '⚠ espeak not installed';
 
   const body = `
-    <p><b>TTS Language Settings</b></p>
+    <p><b>TTS Settings</b></p>
     <p>Engine: Local espeak (Offline)</p>
-    <p>Language: English only</p>
+    <p>Languages: English + Italian</p>
     <p>Status: ${ttsStatus}</p>
 
+    <p><b>Supported Languages:</b></p>
+    <p><small>• English (en)<br/>• Italian (it)</small></p>
+
     <p><b>Info:</b></p>
-    <p><small>Local TTS using espeak<br/>No internet required<br/>English language only</small></p>
+    <p><small>Local TTS using espeak<br/>No internet required<br/>2 languages supported</small></p>
 
     ${!ttsEnabled ? '<p><small>Install: sudo apt-get install espeak</small></p>' : ''}
 
@@ -4711,14 +4717,17 @@ app.get("/wml/send.tts.wml", (req, res) => {
 
   const body = `
     <p><b>Send Voice Message (TTS)</b></p>
-    <p><small>${ttsStatus} (English only, offline)</small></p>
+    <p><small>${ttsStatus} (2 languages, offline)</small></p>
     <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
 
     <p>Your message:</p>
     <input name="text" title="Message" value="" size="30" maxlength="500"/>
 
-    <p>Language: English (Local espeak)</p>
-    <input name="language" type="hidden" value="en"/>
+    <p>Language:</p>
+    <select name="language" title="Language">
+      <option value="en">English</option>
+      <option value="it">Italian (Italiano)</option>
+    </select>
 
     <p>Voice Message (PTT):</p>
     <select name="ptt" title="Voice">
@@ -4726,7 +4735,7 @@ app.get("/wml/send.tts.wml", (req, res) => {
       <option value="false">No (Audio File)</option>
     </select>
 
-    <p><small>Max 500 characters<br/>Local TTS (no internet required)</small></p>
+    <p><small>Max 500 characters<br/>Local espeak TTS (offline)</small></p>
 
     <do type="accept" label="Send">
       <go method="post" href="/wml/send.tts">
