@@ -59,39 +59,29 @@ async function initWhisperModel() {
   }
 }
 
-// Inizializza il modello TTS (Text-to-Speech) locale
+// Check if espeak is available (local TTS for Raspberry Pi)
 async function initTTSModel() {
   try {
-    console.log("Initializing local TTS model (SpeechT5)...");
-    console.log("Note: If this fails, Google TTS will be used as fallback for all languages");
+    console.log("Checking for local TTS engine (espeak)...");
 
-    // Usa import dinamico per caricare il modulo ESM
-    const { pipeline, env } = await import("@xenova/transformers");
-
-    // Configure environment for Node.js
-    env.allowRemoteModels = true;
-    env.allowLocalModels = true;
-    env.useBrowserCache = false;
-    env.backends.onnx.wasm.numThreads = 1;
-
-    // Carica il modello SpeechT5 per TTS
-    ttsModel = await pipeline(
-      "text-to-speech",
-      "Xenova/speecht5_tts",
-      {
-        quantized: false,
-        device: 'cpu',
-      }
-    );
+    // Check if espeak is installed
+    await new Promise((resolve, reject) => {
+      const { exec } = require('child_process');
+      exec('which espeak || which espeak-ng', (error, stdout) => {
+        if (error || !stdout.trim()) {
+          reject(new Error('espeak not found. Install with: sudo apt-get install espeak'));
+        } else {
+          resolve(stdout.trim());
+        }
+      });
+    });
 
     ttsEnabled = true;
-    console.log("✓ Local TTS model loaded successfully (SpeechT5)");
-    console.log("✓ English will use local TTS, other languages will use Google TTS");
+    console.log("✓ Local TTS ready (espeak) - English only, fully offline");
   } catch (error) {
-    console.error("⚠ Local TTS model initialization failed - using Google TTS for all languages");
-    console.error("Error:", error.message);
+    console.error("⚠ Local TTS not available:", error.message);
+    console.error("Install espeak: sudo apt-get install espeak");
     ttsEnabled = false;
-    console.log("✓ Google TTS will be used for all languages (requires internet)");
   }
 }
 
@@ -189,13 +179,7 @@ function wavBufferToFloat32Array(wavBuffer) {
 }
 // Inizializza i modelli all'avvio
 initWhisperModel();
-
-// ⚠ Local TTS disabled - Using Google TTS for all languages
-// Reason: ONNX Runtime has compatibility issues on Raspberry Pi
-// Google TTS works perfectly and supports 15 languages online
-// initTTSModel();
-console.log("✓ TTS: Using Google Translate TTS for all languages (15 languages supported)");
-console.log("✓ STT: Whisper model for speech-to-text (99 languages supported)");
+initTTSModel();
 
 // ============ VIDEO FRAME EXTRACTION ============
 // Cache directory for video frames
@@ -305,82 +289,86 @@ function cleanupOldVideoFrames() {
 setInterval(cleanupOldVideoFrames, 30 * 60 * 1000);
 
 // ============ TEXT-TO-SPEECH ============
-// Google TTS for all languages (15 languages supported, requires internet)
+// Local TTS using espeak (English only, offline)
 async function textToSpeech(text, language = 'en') {
   try {
     console.log(`TTS request: "${text.substring(0, 50)}..." (language: ${language})`);
-    console.log(`Using Google TTS (online)`);
 
-    return await textToSpeechGoogle(text, language);
+    if (!ttsEnabled) {
+      throw new Error('Local TTS not available. Install espeak: sudo apt-get install espeak');
+    }
+
+    if (language !== 'en') {
+      console.log(`⚠ Only English supported. Converting ${language} text with English voice.`);
+    }
+
+    return await textToSpeechLocal(text);
   } catch (error) {
     console.error('TTS conversion error:', error.message);
     throw new Error(`TTS conversion failed: ${error.message}`);
   }
 }
 
-// Local TTS using SpeechT5 (English only, offline)
+// Local TTS using espeak (Raspberry Pi compatible, English only, offline)
 async function textToSpeechLocal(text) {
+  const tempWav = path.join(__dirname, `temp_espeak_${Date.now()}.wav`);
+
   try {
-    if (!ttsEnabled || !ttsModel) {
-      throw new Error('Local TTS model not initialized');
-    }
+    console.log(`Generating speech with espeak (local, offline)...`);
 
-    // Split text into manageable chunks (SpeechT5 works better with shorter texts)
-    const maxLength = 200;
-    const chunks = [];
+    // Use espeak to generate WAV audio
+    await new Promise((resolve, reject) => {
+      const { spawn } = require('child_process');
 
-    if (text.length <= maxLength) {
-      chunks.push(text);
-    } else {
-      // Split by sentences
-      const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-      let currentChunk = '';
+      // espeak command: text to WAV file
+      // -v en: English voice
+      // -s 150: Speed (words per minute)
+      // -a 200: Amplitude (volume)
+      // -w: Write to WAV file
+      const espeak = spawn('espeak', [
+        '-v', 'en',           // English voice
+        '-s', '150',          // Speed: 150 wpm (natural)
+        '-a', '200',          // Volume: maximum
+        '-w', tempWav,        // Output WAV file
+        text
+      ]);
 
-      for (const sentence of sentences) {
-        if ((currentChunk + sentence).length <= maxLength) {
-          currentChunk += sentence;
-        } else {
-          if (currentChunk) chunks.push(currentChunk.trim());
-          currentChunk = sentence;
-        }
-      }
-      if (currentChunk) chunks.push(currentChunk.trim());
-    }
-
-    console.log(`Processing ${chunks.length} chunk(s) with local TTS model...`);
-
-    // Generate speech for each chunk
-    const audioBuffers = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      console.log(`Generating audio for chunk ${i + 1}/${chunks.length}...`);
-
-      // Generate speech using SpeechT5
-      const output = await ttsModel(chunk, {
-        // Speaker embeddings will use default from model
+      let stderr = '';
+      espeak.stderr.on('data', (data) => {
+        stderr += data.toString();
       });
 
-      // The output is an object with 'audio' and 'sampling_rate'
-      const audioData = output.audio;
-      const samplingRate = output.sampling_rate || 16000;
+      espeak.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`espeak failed with code ${code}: ${stderr}`));
+        }
+      });
 
-      console.log(`Generated audio: ${audioData.length} samples at ${samplingRate}Hz`);
+      espeak.on('error', (err) => {
+        reject(new Error(`espeak execution failed: ${err.message}`));
+      });
+    });
 
-      // Convert Float32Array to WAV format
-      const wavBuffer = await convertToWav(audioData, samplingRate);
-      audioBuffers.push(wavBuffer);
-    }
+    // Read the generated WAV file
+    const wavBuffer = await fs.promises.readFile(tempWav);
 
-    // If multiple chunks, concatenate WAV files
-    if (audioBuffers.length === 1) {
-      return audioBuffers[0];
-    } else {
-      // Concatenate WAV files using FFmpeg
-      return await concatenateAudioFiles(audioBuffers);
-    }
+    console.log(`✓ Generated ${wavBuffer.length} bytes of audio (WAV)`);
+
+    return wavBuffer;
   } catch (error) {
-    console.error('Local TTS error:', error.message);
+    console.error('espeak TTS error:', error.message);
     throw error;
+  } finally {
+    // Cleanup temp file
+    try {
+      if (fs.existsSync(tempWav)) {
+        await fs.promises.unlink(tempWav);
+      }
+    } catch (cleanupError) {
+      console.error('Cleanup error:', cleanupError);
+    }
   }
 }
 
@@ -1364,46 +1352,23 @@ app.post("/wml/settings-tts.wml", (req, res) => {
 });
 
 app.get("/wml/settings-tts.wml", (req, res) => {
-  const languages = [
-    ['en', 'English'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'],
-    ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['ru', 'Russian'],
-    ['ja', 'Japanese'], ['ko', 'Korean'], ['zh', 'Chinese'], ['ar', 'Arabic'],
-    ['hi', 'Hindi'], ['id', 'Indonesian'], ['tr', 'Turkish']
-  ];
-
-  let options = '';
-  for (const [code, name] of languages) {
-    const selected = code === userSettings.defaultLanguage ? ' selected="selected"' : '';
-    options += `<option value="${code}"${selected}>${name}</option>`;
-  }
-
-  const currentLang = languages.find(([code]) => code === userSettings.defaultLanguage);
-  const currentName = currentLang ? currentLang[1] : userSettings.defaultLanguage;
+  const ttsStatus = ttsEnabled ? '✓ Ready' : '⚠ espeak not installed';
 
   const body = `
     <p><b>TTS Language Settings</b></p>
-    <p>Engine: Google TTS (Online)</p>
-    <p>Current: ${esc(currentName)}</p>
-    <p>Status: ✓ Ready</p>
+    <p>Engine: Local espeak (Offline)</p>
+    <p>Language: English only</p>
+    <p>Status: ${ttsStatus}</p>
 
-    <p><b>Language Options:</b></p>
-    <p><small>15 languages supported<br/>Requires internet connection</small></p>
+    <p><b>Info:</b></p>
+    <p><small>Local TTS using espeak<br/>No internet required<br/>English language only</small></p>
 
-    <p>Select language:</p>
-    <select name="language" title="Language">
-      ${options}
-    </select>
-
-    <do type="accept" label="Save">
-      <go method="post" href="/wml/settings-tts.wml">
-        <postfield name="language" value="$language"/>
-      </go>
-    </do>
+    ${!ttsEnabled ? '<p><small>Install: sudo apt-get install espeak</small></p>' : ''}
 
     <p><a href="/wml/settings.wml" accesskey="0">[0] Back</a></p>
   `;
 
-  sendWml(res, card("settings-tts", "TTS Language", body));
+  sendWml(res, card("settings-tts", "TTS Settings", body));
 });
 
 // Settings - Format
@@ -4742,32 +4707,18 @@ app.get("/wml/send.video.wml", (req, res) => {
 app.get("/wml/send.tts.wml", (req, res) => {
   const to = esc(req.query.to || "");
 
+  const ttsStatus = ttsEnabled ? '✓ Local TTS Ready' : '⚠ espeak not installed';
+
   const body = `
     <p><b>Send Voice Message (TTS)</b></p>
-    <p><small>✓ Google TTS (15 Languages)</small></p>
+    <p><small>${ttsStatus} (English only, offline)</small></p>
     <p>To: <input name="to" title="Recipient" value="${to}" size="15"/></p>
 
     <p>Your message:</p>
     <input name="text" title="Message" value="" size="30" maxlength="500"/>
 
-    <p>Language:</p>
-    <select name="language" title="Language">
-      <option value="en">English</option>
-      <option value="es">Spanish</option>
-      <option value="fr">French</option>
-      <option value="de">German</option>
-      <option value="it">Italian</option>
-      <option value="pt">Portuguese</option>
-      <option value="nl">Dutch</option>
-      <option value="ru">Russian</option>
-      <option value="ja">Japanese</option>
-      <option value="ko">Korean</option>
-      <option value="zh">Chinese</option>
-      <option value="ar">Arabic</option>
-      <option value="hi">Hindi</option>
-      <option value="id">Indonesian</option>
-      <option value="tr">Turkish</option>
-    </select>
+    <p>Language: English (Local espeak)</p>
+    <input name="language" type="hidden" value="en"/>
 
     <p>Voice Message (PTT):</p>
     <select name="ptt" title="Voice">
@@ -4775,7 +4726,7 @@ app.get("/wml/send.tts.wml", (req, res) => {
       <option value="false">No (Audio File)</option>
     </select>
 
-    <p><small>Max 500 characters<br/>Google TTS (requires internet)</small></p>
+    <p><small>Max 500 characters<br/>Local TTS (no internet required)</small></p>
 
     <do type="accept" label="Send">
       <go method="post" href="/wml/send.tts">
@@ -5152,16 +5103,21 @@ app.post("/wml/send.tts", async (req, res) => {
 
     console.log(`TTS request: "${text}" in ${language} to ${to}`);
 
-    // Convert text to speech using Google TTS (returns MP3)
+    // Convert text to speech using local espeak (returns WAV)
     const audioBuffer = await textToSpeech(text, language);
 
-    console.log(`TTS audio generated: ${audioBuffer.length} bytes (MP3 from Google)`);
+    console.log(`TTS audio generated: ${audioBuffer.length} bytes (WAV from espeak)`);
+
+    // Convert WAV to OGG Opus for WhatsApp compatibility
+    console.log('Converting WAV to OGG Opus...');
+    const oggBuffer = await convertWavToOgg(audioBuffer);
+    console.log(`Converted to OGG: ${oggBuffer.length} bytes`);
 
     // Send as WhatsApp audio message
     const result = await sock.sendMessage(formatJid(to), {
-      audio: audioBuffer,
+      audio: oggBuffer,
       ptt: ptt === "true",
-      mimetype: "audio/mpeg",
+      mimetype: "audio/ogg; codecs=opus",
     });
 
     sendWml(
