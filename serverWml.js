@@ -160,7 +160,10 @@ async function transcribeAudioWithWhisper(audioBuffer) {
     return "Errore nella trascrizione";
   } finally {
     try {
-      await fs.promises.unlink(tempOutput);
+      if (fs.existsSync(tempOutput)) {
+        await fs.promises.unlink(tempOutput);
+        console.log("Temp file cleaned up successfully");
+      }
     } catch (cleanupError) {
       console.error("Cleanup failed:", cleanupError);
     }
@@ -253,22 +256,24 @@ async function extractVideoFrames(videoBuffer, messageId) {
     });
 
     // Count extracted frames
-    const frames = fs.readdirSync(framesDir).filter(f => f.endsWith('.png'));
-    console.log(`Extracted ${frames.length} frames from video ${messageId}`);
+    const frames = await fs.promises.readdir(framesDir);
+    const pngFrames = frames.filter(f => f.endsWith('.png'));
+    console.log(`Extracted ${pngFrames.length} frames from video ${messageId}`);
 
-    // Clean up temp video file
-    if (fs.existsSync(tempVideoPath)) {
-      fs.unlinkSync(tempVideoPath);
-    }
-
-    return { frameCount: frames.length, framesDir };
+    return { frameCount: pngFrames.length, framesDir };
   } catch (error) {
     console.error('Frame extraction error:', error);
-    // Clean up on error
-    if (fs.existsSync(tempVideoPath)) {
-      fs.unlinkSync(tempVideoPath);
-    }
     throw error;
+  } finally {
+    // Clean up temp video file
+    try {
+      if (fs.existsSync(tempVideoPath)) {
+        await fs.promises.unlink(tempVideoPath);
+        console.log('Temp video file cleaned up');
+      }
+    } catch (cleanupError) {
+      console.error('Temp video cleanup failed:', cleanupError);
+    }
   }
 }
 
@@ -499,19 +504,19 @@ async function convertToWav(audioData, samplingRate = 16000) {
 async function concatenateAudioFiles(audioBuffers) {
   const tempFiles = [];
   const tempOutput = path.join(__dirname, `temp_concat_${Date.now()}.wav`);
+  const concatList = path.join(__dirname, `concat_list_${Date.now()}.txt`);
 
   try {
-    // Save each buffer to a temporary file
+    // Save each buffer to a temporary file (async)
     for (let i = 0; i < audioBuffers.length; i++) {
       const tempFile = path.join(__dirname, `temp_chunk_${Date.now()}_${i}.wav`);
-      fs.writeFileSync(tempFile, audioBuffers[i]);
+      await fs.promises.writeFile(tempFile, audioBuffers[i]);
       tempFiles.push(tempFile);
     }
 
-    // Create concat file list
-    const concatList = path.join(__dirname, `concat_list_${Date.now()}.txt`);
+    // Create concat file list (async)
     const listContent = tempFiles.map(f => `file '${f}'`).join('\n');
-    fs.writeFileSync(concatList, listContent);
+    await fs.promises.writeFile(concatList, listContent);
 
     // Use FFmpeg to concatenate
     await new Promise((resolve, reject) => {
@@ -530,19 +535,24 @@ async function concatenateAudioFiles(audioBuffers) {
       });
     });
 
-    // Read concatenated file
-    const concatenated = fs.readFileSync(tempOutput);
-
-    // Cleanup
-    tempFiles.forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
-    fs.existsSync(concatList) && fs.unlinkSync(concatList);
-    fs.existsSync(tempOutput) && fs.unlinkSync(tempOutput);
+    // Read concatenated file (async)
+    const concatenated = await fs.promises.readFile(tempOutput);
 
     return concatenated;
   } catch (error) {
-    // Cleanup on error
-    tempFiles.forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
+    console.error('Audio concatenation error:', error);
     throw error;
+  } finally {
+    // Cleanup all temp files (async)
+    try {
+      for (const f of tempFiles) {
+        if (fs.existsSync(f)) await fs.promises.unlink(f);
+      }
+      if (fs.existsSync(concatList)) await fs.promises.unlink(concatList);
+      if (fs.existsSync(tempOutput)) await fs.promises.unlink(tempOutput);
+    } catch (cleanupError) {
+      console.error('Cleanup error in concatenateAudioFiles:', cleanupError);
+    }
   }
 }
 
@@ -552,8 +562,8 @@ async function convertWavToOgg(wavBuffer) {
   const tempOgg = path.join(__dirname, `temp_tts_${Date.now()}.ogg`);
 
   try {
-    // Write WAV to temp file
-    fs.writeFileSync(tempWav, wavBuffer);
+    // Write WAV to temp file (async)
+    await fs.promises.writeFile(tempWav, wavBuffer);
 
     // Convert to OGG Opus using FFmpeg
     await new Promise((resolve, reject) => {
@@ -580,19 +590,21 @@ async function convertWavToOgg(wavBuffer) {
       });
     });
 
-    // Read OGG file
-    const oggBuffer = fs.readFileSync(tempOgg);
-
-    // Cleanup
-    fs.existsSync(tempWav) && fs.unlinkSync(tempWav);
-    fs.existsSync(tempOgg) && fs.unlinkSync(tempOgg);
+    // Read OGG file (async)
+    const oggBuffer = await fs.promises.readFile(tempOgg);
 
     return oggBuffer;
   } catch (error) {
-    // Cleanup on error
-    fs.existsSync(tempWav) && fs.unlinkSync(tempWav);
-    fs.existsSync(tempOgg) && fs.unlinkSync(tempOgg);
+    console.error('WAV to OGG conversion error:', error);
     throw error;
+  } finally {
+    // Cleanup temp files (async)
+    try {
+      if (fs.existsSync(tempWav)) await fs.promises.unlink(tempWav);
+      if (fs.existsSync(tempOgg)) await fs.promises.unlink(tempOgg);
+    } catch (cleanupError) {
+      console.error('Cleanup error in convertWavToOgg:', cleanupError);
+    }
   }
 }
 
@@ -643,6 +655,7 @@ let chatStore = persistentData.chats;
 let connectionState = "disconnected";
 let isFullySynced = persistentData.meta.isFullySynced;
 let syncAttempts = persistentData.meta.syncAttempts;
+let isConnecting = false; // Prevent race conditions in connection logic
 
 // ============ USER SETTINGS & FAVORITES ============
 // Load user settings with defaults
@@ -1897,14 +1910,6 @@ app.get("/wml/contacts.wml", (req, res) => {
   res.send(encodedBuffer);
 });
 
-// Aggiungi un listener per poter eseguire il server
-const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`Server WAP in ascolto su http://localhost:${PORT}`);
-  console.log(
-    `Accedi a http://localhost:${PORT}/wml/contacts.wml per testare.`
-  );
-});
 // Enhanced Contact Detail page with WTAI integration
 app.get("/wml/contact.wml", async (req, res) => {
   try {
@@ -6353,6 +6358,14 @@ async function performInitialSync() {
 
 // Production-ready connection with better error handling
 async function connectWithBetterSync() {
+  // Prevent race conditions - only one connection attempt at a time
+  if (isConnecting) {
+    logger.warn('Connection already in progress, skipping duplicate attempt');
+    return;
+  }
+
+  isConnecting = true;
+
   try {
     const { state, saveCreds } = await useMultiFileAuthState(
       "./auth_info_baileys"
@@ -6542,7 +6555,14 @@ async function connectWithBetterSync() {
     });
   } catch (error) {
     logger.error("Connection error:", error);
+    isConnecting = false; // Reset flag before retry
     setTimeout(connectWithBetterSync, 10000);
+  } finally {
+    // Reset connection flag when done (successful connection or error)
+    // Note: For successful connections, the flag stays true until connection closes
+    if (connectionState !== 'open' && connectionState !== 'connecting') {
+      isConnecting = false;
+    }
   }
 }
 
