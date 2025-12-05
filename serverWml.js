@@ -371,6 +371,80 @@ let chatStore = persistentData.chats;
 let connectionState = "disconnected";
 let isFullySynced = persistentData.meta.isFullySynced;
 let syncAttempts = persistentData.meta.syncAttempts;
+
+// ============ USER SETTINGS & FAVORITES ============
+// Load user settings with defaults
+let userSettings = persistentData.settings || {
+  defaultLanguage: 'en',
+  defaultImageFormat: 'wbmp',
+  defaultVideoFormat: 'wbmp',
+  paginationLimit: 10,
+  autoRefresh: false,
+  showHelp: true,
+  ttsEnabled: true,
+  favorites: [] // Array of JIDs
+};
+
+// Save settings
+function saveSettings() {
+  storage.queueSave("settings", userSettings);
+}
+
+// Favorite contacts helpers
+function addFavorite(jid) {
+  if (!userSettings.favorites.includes(jid)) {
+    userSettings.favorites.push(jid);
+    saveSettings();
+    return true;
+  }
+  return false;
+}
+
+function removeFavorite(jid) {
+  const index = userSettings.favorites.indexOf(jid);
+  if (index > -1) {
+    userSettings.favorites.splice(index, 1);
+    saveSettings();
+    return true;
+  }
+  return false;
+}
+
+function isFavorite(jid) {
+  return userSettings.favorites.includes(jid);
+}
+
+// Get unread message count
+function getUnreadCount() {
+  let count = 0;
+  for (const [jid, messages] of chatStore.entries()) {
+    for (const msg of messages) {
+      if (!msg.key.fromMe && !msg.messageStubType && msg.message) {
+        // Simple heuristic: if we haven't marked it read, count it
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+// Get recent chats (last 5)
+function getRecentChats(limit = 5) {
+  const chatsWithTime = [];
+  for (const [jid, messages] of chatStore.entries()) {
+    if (messages.length > 0) {
+      const lastMsg = messages[messages.length - 1];
+      chatsWithTime.push({
+        jid,
+        timestamp: lastMsg.messageTimestamp || 0,
+        lastMessage: lastMsg
+      });
+    }
+  }
+  chatsWithTime.sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
+  return chatsWithTime.slice(0, limit);
+}
+
 // WML Constants
 const WML_DTD =
   '<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.3//EN" "http://www.wapforum.org/DTD/wml13.dtd">';
@@ -632,54 +706,84 @@ function addContact(name, number) {
 // Enhanced Home page with WMLScript integration
 app.get(["/wml", "/wml/home.wml"], (req, res) => {
   const connected = !!sock?.authState?.creds;
+  const unreadCount = 0; // TODO: Implement unread tracking
+  const recentChats = getRecentChats(3);
+
   const scripts = `
     ${wmlScript("utils")}
     ${wmlScript("wtai")}
   `;
 
+  // Favorites section
+  let favoritesHtml = '';
+  if (userSettings.favorites.length > 0) {
+    favoritesHtml = '<p><b>Favorites:</b></p><p>';
+    for (let i = 0; i < Math.min(3, userSettings.favorites.length); i++) {
+      const jid = userSettings.favorites[i];
+      const contact = contactStore.get(jid);
+      const name = contact?.name || contact?.notify || jidFriendly(jid);
+      favoritesHtml += `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${esc(name.substring(0, 15))}</a><br/>`;
+    }
+    if (userSettings.favorites.length > 3) {
+      favoritesHtml += `<a href="/wml/favorites.wml">[View All ${userSettings.favorites.length}]</a>`;
+    }
+    favoritesHtml += '</p>';
+  }
+
+  // Recent chats section
+  let recentHtml = '';
+  if (recentChats.length > 0) {
+    recentHtml = '<p><b>Recent Chats:</b></p><p>';
+    for (const chat of recentChats) {
+      const contact = contactStore.get(chat.jid);
+      const name = contact?.name || contact?.notify || jidFriendly(chat.jid);
+      recentHtml += `<a href="/wml/chat.wml?jid=${encodeURIComponent(chat.jid)}">${esc(name.substring(0, 15))}</a><br/>`;
+    }
+    recentHtml += '</p>';
+  }
+
   const body = `
-  
-    <p><b>WhatsApp WAP Client</b></p>
-    <p>Status: ${
-      connected ? "<b>Connected</b>" : "<em>Disconnected</em>"
-    }  ${esc(connectionState)}</p>
-    <p>Sync: ${isFullySynced ? "Complete" : "Pending"}  Contacts: ${
-    contactStore.size
-  }  Chats: ${chatStore.size}  Messages: ${messageStore.size}</p>
-    
-  
-    
-    <p><b>Quick Actions:</b></p>
-    <p>
-      <a href="/wml/search.wml" accesskey="1">[1] Search All</a>
-      <a href="/wml/status.wml" accesskey="2">[2] Status</a> 
-      <a href="/wml/qr.wml" accesskey="3">[3] QR Code</a> 
-      <a href="/wml/me.wml" accesskey="4">[4] Profile</a><br/>
-      <a href="/wml/presence.wml" accesskey="5">[5] Presence</a> 
-      <a href="/wml/privacy.wml" accesskey="6">[6] Privacy</a> 
-      <a href="/wml/live-status.wml" accesskey="7">[7] Live Status</a>
-    </p>
-    
+    <p><b>WhatsApp WAP</b></p>
+    <p>${connected ? "&#9679; Online" : "&#9675; Offline"} | ${
+    isFullySynced ? "Synced" : "Syncing..."
+  }</p>
+    <p>Contacts: ${contactStore.size} | Chats: ${chatStore.size}</p>
+
+    ${favoritesHtml}
+    ${recentHtml}
+
     <p><b>Main Menu:</b></p>
     <p>
-      <a href="/wml/contacts.wml?page=1&amp;limit=10" accesskey="7">[7] Contacts</a><br/>
-      <a href="/wml/chats.wml?page=1&amp;limit=10" accesskey="8">[8] Chats</a><br/>
-      <a href="/wml/send-menu.wml" accesskey="9">[9] Send Message</a><br/>
-      <a href="/wml/groups.wml" accesskey="*">[*] Groups</a><br/>
-      <a href="/wml/broadcast.wml">[#] Broadcast</a><br/>
-      <a href="/wml/debug.wml">[D] Debug</a><br/>
-      <a href="/wml/logout.wml" accesskey="0">[0] Logout</a><br/>
+      <a href="/wml/contacts.wml" accesskey="1">[1] Contacts</a><br/>
+      <a href="/wml/chats.wml" accesskey="2">[2] Chats</a><br/>
+      <a href="/wml/send-menu.wml" accesskey="3">[3] Send</a><br/>
+      <a href="/wml/groups.wml" accesskey="4">[4] Groups</a>
     </p>
-    
+
+    <p><b>Tools:</b></p>
+    <p>
+      <a href="/wml/search.wml" accesskey="5">[5] Search</a><br/>
+      <a href="/wml/settings.wml" accesskey="6">[6] Settings</a><br/>
+      <a href="/wml/help.wml" accesskey="7">[7] Help</a><br/>
+      <a href="/wml/me.wml" accesskey="8">[8] Profile</a>
+    </p>
+
+    <p><b>System:</b></p>
+    <p>
+      <a href="/wml/status.wml" accesskey="9">[9] Status</a><br/>
+      <a href="/wml/qr.wml">[*] QR Code</a><br/>
+      <a href="/wml/logout.wml" accesskey="0">[0] Logout</a>
+    </p>
+
     <do type="accept" label="Refresh">
       <go href="/wml/home.wml"/>
     </do>
-    <do type="options" label="Status">
-      <go href="/wml/status.wml"/>
+    <do type="options" label="Settings">
+      <go href="/wml/settings.wml"/>
     </do>
   `;
 
-  sendWml(res, card("home", "WhatsApp API", body, "/wml/home.wml"), scripts);
+  sendWml(res, card("home", "Home", body, "/wml/home.wml"), scripts);
 });
 
 /*
@@ -930,6 +1034,406 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
     <p><img src="/api/qr/image?format=wbmp" alt="QR Code"/></p>
   </card>
 </wml>`);
+});
+
+// ============ SETTINGS PAGE ============
+app.get("/wml/settings.wml", (req, res) => {
+  const body = `
+    <p><b>Settings</b></p>
+
+    <p><b>Defaults:</b></p>
+    <p>TTS Language: ${esc(userSettings.defaultLanguage)}<br/>
+    <a href="/wml/settings-tts.wml">[Change Language]</a></p>
+
+    <p>Image Format: ${esc(userSettings.defaultImageFormat.toUpperCase())}<br/>
+    <a href="/wml/settings-format.wml?type=image">[Change]</a></p>
+
+    <p>Video Format: ${esc(userSettings.defaultVideoFormat.toUpperCase())}<br/>
+    <a href="/wml/settings-format.wml?type=video">[Change]</a></p>
+
+    <p><b>Display:</b></p>
+    <p>Items per page: ${userSettings.paginationLimit}<br/>
+    <a href="/wml/settings-pagination.wml">[Change]</a></p>
+
+    <p><b>Favorites:</b></p>
+    <p>${userSettings.favorites.length} contacts<br/>
+    <a href="/wml/favorites.wml">[Manage]</a></p>
+
+    <p><b>About:</b></p>
+    <p>WhatsApp WAP Client v1.0<br/>
+    For Nokia 7210 &amp; WAP devices<br/>
+    <a href="/wml/help.wml">[Help &amp; Guide]</a></p>
+
+    <p><a href="/wml/home.wml" accesskey="0">[0] Home</a></p>
+
+    <do type="accept" label="Home">
+      <go href="/wml/home.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("settings", "Settings", body));
+});
+
+// Settings - TTS Language
+app.post("/wml/settings-tts.wml", (req, res) => {
+  const { language } = req.body;
+  if (language) {
+    userSettings.defaultLanguage = language;
+    saveSettings();
+  }
+  res.redirect("/wml/settings.wml");
+});
+
+app.get("/wml/settings-tts.wml", (req, res) => {
+  const languages = [
+    ['en', 'English'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'],
+    ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['ru', 'Russian'],
+    ['ja', 'Japanese'], ['ko', 'Korean'], ['zh', 'Chinese'], ['ar', 'Arabic'],
+    ['hi', 'Hindi'], ['id', 'Indonesian'], ['tr', 'Turkish']
+  ];
+
+  let options = '';
+  for (const [code, name] of languages) {
+    const selected = code === userSettings.defaultLanguage ? ' selected="selected"' : '';
+    options += `<option value="${code}"${selected}>${name}</option>`;
+  }
+
+  const body = `
+    <p><b>Default TTS Language</b></p>
+    <p>Current: ${esc(userSettings.defaultLanguage)}</p>
+
+    <p>Select language:</p>
+    <select name="language" title="Language">
+      ${options}
+    </select>
+
+    <do type="accept" label="Save">
+      <go method="post" href="/wml/settings-tts.wml">
+        <postfield name="language" value="$language"/>
+      </go>
+    </do>
+
+    <p><a href="/wml/settings.wml" accesskey="0">[0] Back</a></p>
+  `;
+
+  sendWml(res, card("settings-tts", "TTS Language", body));
+});
+
+// Settings - Format
+app.post("/wml/settings-format.wml", (req, res) => {
+  const { type, format } = req.body;
+  if (type === 'image' && format) {
+    userSettings.defaultImageFormat = format;
+  } else if (type === 'video' && format) {
+    userSettings.defaultVideoFormat = format;
+  }
+  saveSettings();
+  res.redirect("/wml/settings.wml");
+});
+
+app.get("/wml/settings-format.wml", (req, res) => {
+  const type = req.query.type || 'image';
+  const current = type === 'image' ? userSettings.defaultImageFormat : userSettings.defaultVideoFormat;
+
+  const body = `
+    <p><b>Default ${esc(type.charAt(0).toUpperCase() + type.slice(1))} Format</b></p>
+    <p>Current: ${esc(current.toUpperCase())}</p>
+
+    <p>Select format:</p>
+    <select name="format" title="Format">
+      <option value="wbmp"${current === 'wbmp' ? ' selected="selected"' : ''}>WBMP (B&amp;W, Small)</option>
+      <option value="jpg"${current === 'jpg' ? ' selected="selected"' : ''}>JPEG (Color, Medium)</option>
+      <option value="png"${current === 'png' ? ' selected="selected"' : ''}>PNG (Color, Large)</option>
+    </select>
+
+    <do type="accept" label="Save">
+      <go method="post" href="/wml/settings-format.wml">
+        <postfield name="type" value="${esc(type)}"/>
+        <postfield name="format" value="$format"/>
+      </go>
+    </do>
+
+    <p><a href="/wml/settings.wml" accesskey="0">[0] Back</a></p>
+  `;
+
+  sendWml(res, card("settings-format", "Format", body));
+});
+
+// Settings - Pagination
+app.post("/wml/settings-pagination.wml", (req, res) => {
+  const { limit } = req.body;
+  if (limit) {
+    userSettings.paginationLimit = parseInt(limit, 10) || 10;
+    saveSettings();
+  }
+  res.redirect("/wml/settings.wml");
+});
+
+app.get("/wml/settings-pagination.wml", (req, res) => {
+  const body = `
+    <p><b>Items Per Page</b></p>
+    <p>Current: ${userSettings.paginationLimit}</p>
+
+    <p>Select:</p>
+    <select name="limit" title="Limit">
+      <option value="5"${userSettings.paginationLimit === 5 ? ' selected="selected"' : ''}>5 items</option>
+      <option value="10"${userSettings.paginationLimit === 10 ? ' selected="selected"' : ''}>10 items</option>
+      <option value="15"${userSettings.paginationLimit === 15 ? ' selected="selected"' : ''}>15 items</option>
+      <option value="20"${userSettings.paginationLimit === 20 ? ' selected="selected"' : ''}>20 items</option>
+    </select>
+
+    <do type="accept" label="Save">
+      <go method="post" href="/wml/settings-pagination.wml">
+        <postfield name="limit" value="$limit"/>
+      </go>
+    </do>
+
+    <p><a href="/wml/settings.wml" accesskey="0">[0] Back</a></p>
+  `;
+
+  sendWml(res, card("settings-pagination", "Pagination", body));
+});
+
+// ============ HELP PAGE ============
+app.get("/wml/help.wml", (req, res) => {
+  const section = req.query.section || 'main';
+
+  let body = '';
+
+  if (section === 'main') {
+    body = `
+      <p><b>Help &amp; Guide</b></p>
+
+      <p><b>Quick Start:</b></p>
+      <p>1. Home has favorites &amp; recent chats<br/>
+      2. Use number keys for shortcuts<br/>
+      3. [0] always goes back/home<br/>
+      4. Add favorites for quick access</p>
+
+      <p><b>Topics:</b></p>
+      <p>
+        <a href="/wml/help.wml?section=keys" accesskey="1">[1] Keyboard Shortcuts</a><br/>
+        <a href="/wml/help.wml?section=messages" accesskey="2">[2] Sending Messages</a><br/>
+        <a href="/wml/help.wml?section=media" accesskey="3">[3] Media &amp; Files</a><br/>
+        <a href="/wml/help.wml?section=video" accesskey="4">[4] Video Playback</a><br/>
+        <a href="/wml/help.wml?section=tts" accesskey="5">[5] Voice Messages (TTS)</a><br/>
+        <a href="/wml/help.wml?section=favorites" accesskey="6">[6] Favorites</a><br/>
+        <a href="/wml/help.wml?section=tips" accesskey="7">[7] Tips &amp; Tricks</a>
+      </p>
+
+      <p><a href="/wml/home.wml" accesskey="0">[0] Home</a></p>
+    `;
+  } else if (section === 'keys') {
+    body = `
+      <p><b>Keyboard Shortcuts</b></p>
+
+      <p><b>Home Screen:</b></p>
+      <p>[1] Contacts | [2] Chats<br/>
+      [3] Send | [4] Groups<br/>
+      [5] Search | [6] Settings<br/>
+      [7] Help | [8] Profile<br/>
+      [9] Status | [0] Logout</p>
+
+      <p><b>Universal:</b></p>
+      <p>[0] Back / Home<br/>
+      [*] Quick action<br/>
+      [#] Options menu</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  } else if (section === 'messages') {
+    body = `
+      <p><b>Sending Messages</b></p>
+
+      <p><b>Types:</b></p>
+      <p>1. Text - Regular message<br/>
+      2. Voice (TTS) - Type to speech<br/>
+      3. Image - Send photos<br/>
+      4. Video - Send videos<br/>
+      5. Audio - Send audio files<br/>
+      6. Location - Share location<br/>
+      7. Contact - Share contacts<br/>
+      8. Poll - Create polls</p>
+
+      <p><b>Quick Send:</b></p>
+      <p>From Home: [3] Send<br/>
+      Select contact &amp; type</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  } else if (section === 'media') {
+    body = `
+      <p><b>Media &amp; Files</b></p>
+
+      <p><b>Format Selection:</b></p>
+      <p>Images &amp; Videos support:<br/>
+      - WBMP: B&amp;W, smallest<br/>
+      - JPEG: Color, medium<br/>
+      - PNG: Color, high quality</p>
+
+      <p><b>Change Format:</b></p>
+      <p>During viewing, press [7]<br/>
+      Or set default in Settings</p>
+
+      <p><b>Download:</b></p>
+      <p>View media info page<br/>
+      Select download format</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  } else if (section === 'video') {
+    body = `
+      <p><b>Video Playback (1 FPS)</b></p>
+
+      <p><b>How it works:</b></p>
+      <p>Videos play frame-by-frame<br/>
+      1 frame per second<br/>
+      Perfect for WAP devices!</p>
+
+      <p><b>Controls:</b></p>
+      <p>[4] Previous frame<br/>
+      [5] Play / Auto-play<br/>
+      [6] Next frame<br/>
+      [7] Change format<br/>
+      [0] Back</p>
+
+      <p><b>Formats:</b></p>
+      <p>WBMP: Fast, tiny files<br/>
+      JPEG/PNG: Color, larger</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  } else if (section === 'tts') {
+    body = `
+      <p><b>Voice Messages (TTS)</b></p>
+
+      <p><b>Text-to-Speech:</b></p>
+      <p>Type text on your Nokia<br/>
+      Converts to voice message<br/>
+      Sends as WhatsApp audio!</p>
+
+      <p><b>Features:</b></p>
+      <p>- 15 languages supported<br/>
+      - Up to 500 characters<br/>
+      - Voice note or audio file<br/>
+      - Free Google TTS</p>
+
+      <p><b>Usage:</b></p>
+      <p>Send Menu &gt; Voice (TTS)<br/>
+      Type message &gt; Send</p>
+
+      <p><b>Default Language:</b></p>
+      <p>Set in Settings &gt; TTS Language</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  } else if (section === 'favorites') {
+    body = `
+      <p><b>Favorites System</b></p>
+
+      <p><b>Quick Access:</b></p>
+      <p>Add contacts to favorites<br/>
+      Appears on home screen<br/>
+      One-tap chat access</p>
+
+      <p><b>Add Favorite:</b></p>
+      <p>1. Open contact<br/>
+      2. Select [Add to Favorites]<br/>
+      3. See on home screen</p>
+
+      <p><b>Manage:</b></p>
+      <p>Settings &gt; Favorites<br/>
+      View all &amp; remove</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  } else if (section === 'tips') {
+    body = `
+      <p><b>Tips &amp; Tricks</b></p>
+
+      <p><b>Speed Tips:</b></p>
+      <p>1. Use keyboard shortcuts<br/>
+      2. Add frequent contacts to favorites<br/>
+      3. Set WBMP as default format<br/>
+      4. Use TTS for quick voice msgs</p>
+
+      <p><b>Data Saving:</b></p>
+      <p>- Use WBMP format<br/>
+      - Reduce items per page<br/>
+      - Disable auto-refresh</p>
+
+      <p><b>Best Practices:</b></p>
+      <p>- Sync when on WiFi<br/>
+      - Keep favorites updated<br/>
+      - Use search for old msgs</p>
+
+      <p><a href="/wml/help.wml" accesskey="0">[0] Back</a></p>
+    `;
+  }
+
+  sendWml(res, card("help", "Help", body));
+});
+
+// ============ FAVORITES PAGE ============
+app.get("/wml/favorites.wml", (req, res) => {
+  let body = '<p><b>Favorite Contacts</b></p>';
+
+  if (userSettings.favorites.length === 0) {
+    body += `<p>No favorites yet.<br/>
+    Add contacts from their<br/>
+    profile or chat page.</p>
+    <p><a href="/wml/contacts.wml">[Add from Contacts]</a></p>`;
+  } else {
+    body += `<p>${userSettings.favorites.length} favorites:</p>`;
+    for (const jid of userSettings.favorites) {
+      const contact = contactStore.get(jid);
+      const name = contact?.name || contact?.notify || jidFriendly(jid);
+      body += `<p>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${esc(name)}</a><br/>
+        <a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}">[Remove]</a>
+      </p>`;
+    }
+  }
+
+  body += '<p><a href="/wml/home.wml" accesskey="0">[0] Home</a></p>';
+
+  sendWml(res, card("favorites", "Favorites", body));
+});
+
+// Remove from favorites
+app.get("/wml/favorites-remove.wml", (req, res) => {
+  const jid = req.query.jid;
+  if (jid) {
+    removeFavorite(jid);
+  }
+  res.redirect("/wml/favorites.wml");
+});
+
+// Add to favorites
+app.get("/wml/favorites-add.wml", (req, res) => {
+  const jid = req.query.jid;
+  let message = "Error";
+  let linkBack = "/wml/contacts.wml";
+
+  if (jid) {
+    if (addFavorite(jid)) {
+      const contact = contactStore.get(jid);
+      const name = contact?.name || contact?.notify || jidFriendly(jid);
+      message = `Added ${esc(name)} to favorites!`;
+      linkBack = `/wml/chat.wml?jid=${encodeURIComponent(jid)}`;
+    } else {
+      message = "Already in favorites";
+    }
+  }
+
+  const body = `
+    <p><b>${message}</b></p>
+    <p><a href="${linkBack}" accesskey="1">[1] Back</a><br/>
+    <a href="/wml/favorites.wml" accesskey="2">[2] View Favorites</a><br/>
+    <a href="/wml/home.wml" accesskey="0">[0] Home</a></p>
+  `;
+
+  sendWml(res, card("fav-add", "Favorite Added", body));
 });
 
 // Enhanced Contacts with search and pagination
