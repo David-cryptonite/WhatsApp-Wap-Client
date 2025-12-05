@@ -33,26 +33,30 @@ let ttsSpeakerEmbeddings = null;
 let ttsEnabled = false;
 
 // Inizializza il modello Whisper con import dinamico
+// Using whisper-base for better accuracy with Italian and English
 async function initWhisperModel() {
   try {
-    console.log("Initializing Whisper model...");
+    console.log("Initializing Whisper model (base - better accuracy)...");
 
     // Usa import dinamico per caricare il modulo ESM
     const { pipeline } = await import("@xenova/transformers");
 
-    // Sostituisci nel tuo codice:
+    // Using whisper-base for better transcription quality
+    // whisper-tiny: 39MB, lower accuracy
+    // whisper-base: 74MB, much better accuracy for Italian & English
     transcriber = await pipeline(
       "automatic-speech-recognition",
-      "Xenova/whisper-tiny",
+      "Xenova/whisper-base",
       {
-        // ⚡ 39MB
+        // ⚡ 74MB - better accuracy than tiny (39MB)
         quantized: true, // 🔥 Usa 8-bit per ridurre RAM
         local_files_only: false,
       }
     );
 
     transcriptionEnabled = true;
-    console.log("Whisper model loaded successfully");
+    console.log("✓ Whisper model loaded successfully (base model - high accuracy)");
+    console.log("✓ Supported languages: Italian (it) + English (en) with auto-detection");
   } catch (error) {
     console.error("Whisper model initialization failed:", error);
     transcriptionEnabled = false;
@@ -77,7 +81,7 @@ async function initTTSModel() {
     });
 
     ttsEnabled = true;
-    console.log("✓ Local TTS ready (espeak) - English only, fully offline");
+    console.log("✓ Local TTS ready (espeak) - English & Italian, fully offline");
   } catch (error) {
     console.error("⚠ Local TTS not available:", error.message);
     console.error("Install espeak: sudo apt-get install espeak");
@@ -85,16 +89,17 @@ async function initTTSModel() {
   }
 }
 
-// Funzione di trascrizione con Whisper - FIXED VERSION
-async function transcribeAudioWithWhisper(audioBuffer) {
+// Funzione di trascrizione con Whisper - IMPROVED VERSION
+// Supports Italian, English, and auto-detection for better accuracy
+async function transcribeAudioWithWhisper(audioBuffer, language = 'auto') {
   if (!transcriptionEnabled || !transcriber) {
-    return "Trascrizione non disponibile";
+    return "Trascrizione non disponibile (Whisper model not loaded)";
   }
 
   const tempOutput = path.join(__dirname, `temp_${Date.now()}.wav`);
 
   try {
-    console.log("Converting audio to WAV format...");
+    console.log(`Converting audio to WAV format (language: ${language})...`);
 
     // Usa ffmpeg-static
     const ffmpegPath = require("ffmpeg-static");
@@ -131,16 +136,41 @@ async function transcribeAudioWithWhisper(audioBuffer) {
     // Estrai i dati audio PCM dal file WAV
     const float32Array = wavBufferToFloat32Array(wavBuffer);
 
-    console.log("Transcribing with Whisper...");
-    const result = await transcriber(float32Array, {
-      language: "it",
+    console.log(`Transcribing with Whisper (base model, language: ${language})...`);
+
+    // Configure transcription options based on language
+    const transcriptionOptions = {
       chunk_length_s: 30,
       stride_length_s: 5,
-    });
+      return_timestamps: false,
+    };
+
+    // Language selection: 'auto', 'it' (Italian), or 'en' (English)
+    if (language === 'auto') {
+      // Auto-detect language (Whisper will choose the best match)
+      console.log("Using automatic language detection (Italian/English)");
+      // Don't specify language - let Whisper detect it
+    } else if (language === 'it' || language === 'en') {
+      // Explicit language selection for better accuracy
+      transcriptionOptions.language = language;
+      console.log(`Using explicit language: ${language === 'it' ? 'Italian' : 'English'}`);
+    } else {
+      // Fallback to Italian for unknown languages
+      console.log(`Unknown language '${language}', defaulting to Italian`);
+      transcriptionOptions.language = 'it';
+    }
+
+    const result = await transcriber(float32Array, transcriptionOptions);
 
     const transcription = result.text || "Nessuna trascrizione disponibile";
-    console.log("Whisper transcription successful:", transcription);
-    return transcription;
+
+    // Clean up transcription (remove extra whitespace)
+    const cleanedTranscription = transcription.trim();
+
+    console.log(`✓ Whisper transcription successful (${cleanedTranscription.length} characters)`);
+    console.log(`Transcribed text: "${cleanedTranscription.substring(0, 100)}${cleanedTranscription.length > 100 ? '...' : ''}"`);
+
+    return cleanedTranscription;
   } catch (error) {
     console.error("Transcription failed:", error);
     return "Errore nella trascrizione";
@@ -1356,25 +1386,38 @@ app.post("/wml/settings-tts.wml", (req, res) => {
 
 app.get("/wml/settings-tts.wml", (req, res) => {
   const ttsStatus = ttsEnabled ? '✓ Ready' : '⚠ espeak not installed';
+  const sttStatus = transcriptionEnabled ? '✓ Ready' : '⚠ Model not loaded';
 
   const body = `
-    <p><b>TTS Settings</b></p>
-    <p>Engine: Local espeak (Offline)</p>
+    <p><b>Speech Settings</b></p>
+
+    <p><b>TTS (Text-to-Speech):</b></p>
+    <p>Engine: espeak (Offline)</p>
     <p>Languages: English + Italian</p>
     <p>Status: ${ttsStatus}</p>
 
+    <p><b>STT (Speech-to-Text):</b></p>
+    <p>Engine: Whisper Base (Offline)</p>
+    <p>Languages: English + Italian</p>
+    <p>Status: ${sttStatus}</p>
+    <p>Detection: Auto + Manual</p>
+
     <p><b>Supported Languages:</b></p>
-    <p><small>• English (en)<br/>• Italian (it)</small></p>
+    <p><small>• English (en)<br/>• Italian (it)<br/>• Auto-detection</small></p>
+
+    <p><b>STT Quality:</b></p>
+    <p><small>Model: whisper-base (74MB)<br/>High accuracy transcription<br/>Works offline, no internet</small></p>
 
     <p><b>Info:</b></p>
-    <p><small>Local TTS using espeak<br/>No internet required<br/>2 languages supported</small></p>
+    <p><small>TTS: espeak (local)<br/>STT: Whisper (high accuracy)<br/>Both fully offline</small></p>
 
-    ${!ttsEnabled ? '<p><small>Install: sudo apt-get install espeak</small></p>' : ''}
+    ${!ttsEnabled ? '<p><small>TTS: sudo apt-get install espeak</small></p>' : ''}
+    ${!transcriptionEnabled ? '<p><small>STT: Whisper model loading...</small></p>' : ''}
 
     <p><a href="/wml/settings.wml" accesskey="0">[0] Back</a></p>
   `;
 
-  sendWml(res, card("settings-tts", "TTS Settings", body));
+  sendWml(res, card("settings-speech", "Speech Settings", body));
 });
 
 // Settings - Format
@@ -6452,7 +6495,7 @@ async function connectWithBetterSync() {
           // Gestione trascrizione audio con Whisper
           if (message.message?.audioMessage && transcriptionEnabled) {
             try {
-              console.log("Transcribing audio with Whisper...");
+              console.log("Transcribing audio with Whisper (auto-detect language)...");
               const audioBuffer = await downloadMediaMessage(message, "buffer");
 
               // Limita la dimensione dell'audio
@@ -6462,8 +6505,10 @@ async function connectWithBetterSync() {
                   "[Audio troppo lungo per la trascrizione]";
                 console.log("Audio too large for transcription");
               } else {
+                // Use 'auto' for automatic language detection (Italian/English)
                 const transcription = await transcribeAudioWithWhisper(
-                  audioBuffer
+                  audioBuffer,
+                  'auto'
                 );
                 message.transcription = transcription;
                 console.log("Whisper transcription:", transcription);
