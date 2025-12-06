@@ -4,6 +4,8 @@ const os = require("os");
 const { Worker } = require("worker_threads");
 
 const express = require("express");
+const compression = require("compression");
+const http = require("http");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -25,6 +27,21 @@ const winston = require("winston");
 const { enhancedInitialSync } = require("./loadChatUtils");
 const PersistentStorage = require("./persistentStorage");
 const sharp = require("sharp");
+
+// ============ PRODUCTION-GRADE HTTP CLIENT CONFIGURATION ============
+// Configure axios for optimal performance with connection pooling
+const axiosAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+  scheduling: 'lifo' // Last In First Out for better performance
+});
+
+axios.defaults.httpAgent = axiosAgent;
+axios.defaults.timeout = 30000;
+axios.defaults.maxRedirects = 5;
 
 // Configurazione Whisper
 const ffmpeg = require("ffmpeg-static");
@@ -634,36 +651,162 @@ const app = express();
 const port = process.env.PORT || 3500;
 const isDev = process.env.NODE_ENV !== "production";
 let sock = null;
-// Production middleware
+
+// ============ PRODUCTION-GRADE PERFORMANCE MONITORING ============
+const performanceMetrics = {
+  requests: { total: 0, success: 0, errors: 0 },
+  responseTime: { total: 0, count: 0, min: Infinity, max: 0 },
+  cache: { hits: 0, misses: 0 },
+  startTime: Date.now(),
+
+  recordRequest(success, responseTime) {
+    this.requests.total++;
+    if (success) this.requests.success++;
+    else this.requests.errors++;
+
+    this.responseTime.total += responseTime;
+    this.responseTime.count++;
+    this.responseTime.min = Math.min(this.responseTime.min, responseTime);
+    this.responseTime.max = Math.max(this.responseTime.max, responseTime);
+  },
+
+  getStats() {
+    const uptime = Date.now() - this.startTime;
+    const avgResponseTime = this.responseTime.count > 0
+      ? (this.responseTime.total / this.responseTime.count).toFixed(2)
+      : 0;
+    const successRate = this.requests.total > 0
+      ? ((this.requests.success / this.requests.total) * 100).toFixed(2)
+      : 100;
+    const cacheHitRate = (this.cache.hits + this.cache.misses) > 0
+      ? ((this.cache.hits / (this.cache.hits + this.cache.misses)) * 100).toFixed(2)
+      : 0;
+
+    return {
+      uptime: `${Math.floor(uptime / 1000)} seconds`,
+      requests: this.requests,
+      responseTime: {
+        avg: `${avgResponseTime}ms`,
+        min: `${this.responseTime.min === Infinity ? 0 : this.responseTime.min}ms`,
+        max: `${this.responseTime.max}ms`
+      },
+      successRate: `${successRate}%`,
+      cache: {
+        ...this.cache,
+        hitRate: `${cacheHitRate}%`
+      },
+      memory: {
+        rss: `${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`,
+        heapUsed: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`
+      }
+    };
+  }
+};
+
+// ============ PRODUCTION-GRADE MIDDLEWARE STACK ============
+
+// 1. COMPRESSION - Gzip/Brotli for 70-90% size reduction
+app.use(compression({
+  level: 6, // Balance between speed and compression
+  threshold: 1024, // Only compress responses > 1KB
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
+
+// 2. SECURITY - Production-grade helmet configuration
 app.use(
   helmet({
     contentSecurityPolicy: false, // Disabled for WML compatibility
     frameguard: { action: "deny" },
+    hsts: {
+      maxAge: 31536000, // 1 year
+      includeSubDomains: true,
+      preload: true
+    },
+    noSniff: true,
+    xssFilter: true
   })
 );
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: isDev ? 1000 : 100, // requests per window
-});
-app.use("/api", limiter);
+// 3. PERFORMANCE TRACKING - Request timing middleware
+app.use((req, res, next) => {
+  const startTime = Date.now();
 
-// Logging
+  res.on('finish', () => {
+    const responseTime = Date.now() - startTime;
+    const success = res.statusCode < 400;
+    performanceMetrics.recordRequest(success, responseTime);
+
+    // Log slow requests (> 1 second)
+    if (responseTime > 1000) {
+      logger.warn(`Slow request: ${req.method} ${req.path} - ${responseTime}ms`);
+    }
+  });
+
+  next();
+});
+
+// 4. RATE LIMITING - Advanced protection with different tiers
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isDev ? 1000 : 100, // API requests per window
+  message: 'Too many API requests, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => isDev && req.ip === '127.0.0.1' // Skip localhost in dev
+});
+
+const wmlLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: isDev ? 500 : 60, // WML page requests per minute
+  message: 'Too many requests, please slow down',
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+app.use("/api", apiLimiter);
+app.use("/wml", wmlLimiter);
+
+// 5. LOGGING - Production-grade Winston logger
 const logger = winston.createLogger({
   level: isDev ? "debug" : "info",
   format: winston.format.combine(
     winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
     winston.format.json()
   ),
   transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: "app.log" }),
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      )
+    }),
+    new winston.transports.File({
+      filename: "error.log",
+      level: "error",
+      maxsize: 5242880, // 5MB
+      maxFiles: 5
+    }),
+    new winston.transports.File({
+      filename: "app.log",
+      maxsize: 5242880, // 5MB
+      maxFiles: 5
+    }),
   ],
 });
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+// 6. BODY PARSERS - With size limits for security
+app.use(express.urlencoded({
+  extended: true,
+  limit: '10mb',
+  parameterLimit: 1000
+}));
+app.use(express.json({
+  limit: '10mb'
+}));
 
 // Storage with better persistence
 const storage = new PersistentStorage("./data");
@@ -677,27 +820,83 @@ let isFullySynced = persistentData.meta.isFullySynced;
 let syncAttempts = persistentData.meta.syncAttempts;
 let isConnecting = false; // Prevent race conditions in connection logic
 
-// ============ PRODUCTION-GRADE CACHING ============
-// Cache for groups list with TTL (Time To Live) for performance optimization
-const groupsCache = {
-  data: null,
-  timestamp: 0,
-  ttl: 60000, // 60 seconds cache
-  isValid() {
-    return this.data && (Date.now() - this.timestamp) < this.ttl;
-  },
-  set(data) {
-    this.data = data;
-    this.timestamp = Date.now();
-  },
-  get() {
-    return this.isValid() ? this.data : null;
-  },
-  invalidate() {
-    this.data = null;
-    this.timestamp = 0;
+// ============ PRODUCTION-GRADE ADVANCED CACHING SYSTEM ============
+// Multi-layer LRU cache with automatic memory management
+class ProductionCache {
+  constructor(maxSize = 100, ttl = 60000) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+    this.ttl = ttl;
+    this.hits = 0;
+    this.misses = 0;
   }
-};
+
+  get(key) {
+    const item = this.cache.get(key);
+
+    if (!item) {
+      this.misses++;
+      performanceMetrics.cache.misses++;
+      return null;
+    }
+
+    // Check TTL
+    if (Date.now() - item.timestamp > this.ttl) {
+      this.cache.delete(key);
+      this.misses++;
+      performanceMetrics.cache.misses++;
+      return null;
+    }
+
+    // LRU: Move to end (most recently used)
+    this.cache.delete(key);
+    this.cache.set(key, item);
+
+    this.hits++;
+    performanceMetrics.cache.hits++;
+    return item.data;
+  }
+
+  set(key, data) {
+    // Evict oldest if at capacity (LRU)
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+
+    this.cache.set(key, {
+      data,
+      timestamp: Date.now()
+    });
+  }
+
+  invalidate(key) {
+    if (key) {
+      this.cache.delete(key);
+    } else {
+      this.cache.clear();
+    }
+  }
+
+  getStats() {
+    const total = this.hits + this.misses;
+    const hitRate = total > 0 ? ((this.hits / total) * 100).toFixed(2) : 0;
+
+    return {
+      size: this.cache.size,
+      maxSize: this.maxSize,
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: `${hitRate}%`
+    };
+  }
+}
+
+// Initialize caches with different TTLs for different data types
+const groupsCache = new ProductionCache(50, 60000); // 50 groups, 60s TTL
+const contactsCache = new ProductionCache(500, 300000); // 500 contacts, 5min TTL
+const chatsCache = new ProductionCache(100, 120000); // 100 chats, 2min TTL
+const messagesCache = new ProductionCache(1000, 60000); // 1000 messages, 60s TTL
 
 // ============ USER SETTINGS & FAVORITES ============
 // Load user settings with defaults
@@ -5748,7 +5947,7 @@ app.get("/wml/groups.wml", async (req, res) => {
     const offset = (page - 1) * limit;
 
     // PRODUCTION-GRADE: Check cache first for better performance
-    let groupList = groupsCache.get();
+    let groupList = groupsCache.get('all-groups');
 
     if (!groupList) {
       // Cache miss - fetch from WhatsApp (async, non-blocking)
@@ -5757,7 +5956,7 @@ app.get("/wml/groups.wml", async (req, res) => {
         (b?.subject || "").localeCompare(a?.subject || "")
       );
       // Cache the result
-      groupsCache.set(groupList);
+      groupsCache.set('all-groups', groupList);
     }
 
     // Calcoli per la paginazione
@@ -6093,7 +6292,7 @@ app.post("/wml/group.create.action.wml", async (req, res) => {
     const group = await sock.groupCreate(groupName, participantNumbers);
 
     // Invalidate groups cache since we created a new group
-    groupsCache.invalidate();
+    groupsCache.invalidate('all-groups');
 
     const body = `
       <p><b>Group Created!</b></p>
@@ -6152,7 +6351,7 @@ app.get("/wml/group.leave.wml", async (req, res) => {
       await sock.groupLeave(gid);
 
       // Invalidate groups cache since we left a group
-      groupsCache.invalidate();
+      groupsCache.invalidate('all-groups');
 
       const body = `
         <p><b>Left Group</b></p>
@@ -7320,8 +7519,79 @@ process.on("uncaughtException", (error) => {
 
 process.on("unhandledRejection", (reason, promise) => {
   logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
 
-  //gracefulShutdown('unhandledRejection')
+// ============ PRODUCTION-GRADE HEALTH CHECKS & MONITORING ============
+
+// Health check endpoint for load balancers
+app.get("/health", (req, res) => {
+  const health = {
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    whatsapp: {
+      connected: !!sock?.authState?.creds,
+      state: connectionState,
+      synced: isFullySynced
+    }
+  };
+
+  const statusCode = health.whatsapp.connected ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+
+// Readiness check for Kubernetes/Docker
+app.get("/ready", (req, res) => {
+  const ready = !!sock?.authState?.creds && isFullySynced;
+  res.status(ready ? 200 : 503).json({
+    ready,
+    whatsapp: {
+      connected: !!sock?.authState?.creds,
+      synced: isFullySynced
+    }
+  });
+});
+
+// Liveness check
+app.get("/live", (req, res) => {
+  res.status(200).json({
+    alive: true,
+    pid: process.pid,
+    worker: cluster.worker?.id || 'master'
+  });
+});
+
+// Advanced metrics endpoint for monitoring
+app.get("/api/metrics", (req, res) => {
+  const metrics = {
+    server: performanceMetrics.getStats(),
+    caches: {
+      groups: groupsCache.getStats(),
+      contacts: contactsCache.getStats(),
+      chats: chatsCache.getStats(),
+      messages: messagesCache.getStats()
+    },
+    cluster: {
+      isMaster: cluster.isMaster || cluster.isPrimary,
+      isWorker: cluster.isWorker,
+      workerId: cluster.worker?.id || null,
+      pid: process.pid
+    },
+    whatsapp: {
+      connected: !!sock?.authState?.creds,
+      state: connectionState,
+      synced: isFullySynced,
+      syncAttempts: syncAttempts
+    },
+    stores: {
+      contacts: contactStore.size,
+      chats: chatStore.size,
+      messages: messageStore.size
+    }
+  };
+
+  res.json(metrics);
 });
 
 // Multi-core clustering for maximum performance
@@ -7374,12 +7644,67 @@ if (cluster.isMaster || cluster.isPrimary) {
   server.on("error", (error) => {
     if (error.code === "EADDRINUSE") {
       logger.error(`Port ${port} is already in use`);
-    process.exit(1);
-  } else {
-    logger.error("Server error:", error);
-    process.exit(1);
-  }
+      process.exit(1);
+    } else {
+      logger.error("Server error:", error);
+      process.exit(1);
+    }
   });
+
+  // ============ PRODUCTION-GRADE GRACEFUL SHUTDOWN ============
+  // Handles SIGTERM and SIGINT for zero-downtime deployments
+  let isShuttingDown = false;
+
+  const gracefulShutdown = (signal) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    logger.info(`\n⚠️  ${signal} received - initiating graceful shutdown`);
+
+    // Stop accepting new connections
+    server.close(() => {
+      logger.info("✓ HTTP server closed - no longer accepting connections");
+
+      // Close WhatsApp connection
+      if (sock) {
+        logger.info("Closing WhatsApp connection...");
+        sock.end();
+      }
+
+      // Save all data
+      logger.info("Saving all data...");
+      try {
+        saveAll();
+        logger.info("✓ All data saved successfully");
+      } catch (error) {
+        logger.error("Error saving data during shutdown:", error);
+      }
+
+      // Close HTTP agent connections
+      if (axiosAgent) {
+        axiosAgent.destroy();
+        logger.info("✓ HTTP connections closed");
+      }
+
+      logger.info("✅ Graceful shutdown complete");
+      process.exit(0);
+    });
+
+    // Force shutdown after 30 seconds
+    setTimeout(() => {
+      logger.error("❌ Forced shutdown - graceful shutdown timeout exceeded");
+      process.exit(1);
+    }, 30000);
+  };
+
+  // Handle shutdown signals
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+  // Set server timeout for long-running requests
+  server.timeout = 120000; // 2 minutes
+  server.keepAliveTimeout = 65000; // 65 seconds (must be > load balancer timeout)
+  server.headersTimeout = 66000; // Slightly more than keepAliveTimeout
 }
 
 // Initialize connection
