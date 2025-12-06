@@ -1,3 +1,8 @@
+// Multi-threading and clustering for high performance
+const cluster = require("cluster");
+const os = require("os");
+const { Worker } = require("worker_threads");
+
 const express = require("express");
 const {
   default: makeWASocket,
@@ -6667,35 +6672,65 @@ process.on("unhandledRejection", (reason, promise) => {
   //gracefulShutdown('unhandledRejection')
 });
 
-// Start server
-const server = app.listen(port, () => {
-  logger.info(`WhatsApp WML Gateway started on port ${port}`);
-  logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
-  logger.info("WML endpoints available at /wml/");
-  logger.info("API endpoints available at /api/");
+// Multi-core clustering for maximum performance
+// Uses all available CPU cores for load balancing
+if (cluster.isMaster || cluster.isPrimary) {
+  const numCPUs = os.cpus().length;
+  const workers = process.env.WEB_CONCURRENCY || Math.max(2, numCPUs);
 
-  setInterval(() => {
-    storage.cleanupOldMessages(messageStore, chatStore, 100);
-  }, 60 * 60 * 1000); // every hour
+  logger.info(`🚀 Master process ${process.pid} starting`);
+  logger.info(`💪 Spawning ${workers} worker processes (${numCPUs} CPUs available)`);
 
-  setInterval(() => {
-    saveAll();
-    logger.info("Periodic save completed");
-  }, 10 * 60 * 1000);
-});
+  // Fork workers
+  for (let i = 0; i < workers; i++) {
+    cluster.fork();
+  }
 
-server.on("error", (error) => {
-  if (error.code === "EADDRINUSE") {
-    logger.error(`Port ${port} is already in use`);
+  // Handle worker crashes - auto-restart for high availability
+  cluster.on('exit', (worker, code, signal) => {
+    logger.warn(`⚠️  Worker ${worker.process.pid} died (${signal || code}). Restarting...`);
+    cluster.fork();
+  });
+
+  // Log worker status
+  cluster.on('online', (worker) => {
+    logger.info(`✓ Worker ${worker.process.pid} is online`);
+  });
+
+} else {
+  // Worker process - handle actual requests
+  // Start server
+  const server = app.listen(port, () => {
+    logger.info(`🔥 Worker ${process.pid} - WhatsApp WML Gateway started on port ${port}`);
+    logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
+    logger.info("WML endpoints available at /wml/");
+    logger.info("API endpoints available at /api/");
+
+    // Only one worker handles periodic tasks (master-like behavior)
+    if (cluster.worker.id === 1) {
+      setInterval(() => {
+        storage.cleanupOldMessages(messageStore, chatStore, 100);
+      }, 60 * 60 * 1000); // every hour
+
+      setInterval(() => {
+        saveAll();
+        logger.info("Periodic save completed");
+      }, 10 * 60 * 1000);
+    }
+  });
+
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      logger.error(`Port ${port} is already in use`);
     process.exit(1);
   } else {
     logger.error("Server error:", error);
     process.exit(1);
   }
-});
+  });
+}
 
 // Initialize connection
-
 app.get("/api/status", (req, res) => {
   const isConnected = !!sock?.authState?.creds;
 
@@ -6754,6 +6789,54 @@ app.get("/api/status-detailed", async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Performance monitoring endpoint - cluster and system metrics
+app.get("/api/performance", (req, res) => {
+  const memUsage = process.memoryUsage();
+  const cpuUsage = process.cpuUsage();
+
+  res.json({
+    cluster: {
+      isMaster: cluster.isMaster || cluster.isPrimary,
+      isWorker: cluster.isWorker,
+      workerId: cluster.worker?.id || null,
+      workerPid: process.pid,
+      totalWorkers: cluster.isMaster ? Object.keys(cluster.workers || {}).length : null,
+    },
+    system: {
+      cpus: os.cpus().length,
+      platform: os.platform(),
+      arch: os.arch(),
+      totalMemory: `${(os.totalmem() / 1024 / 1024 / 1024).toFixed(2)} GB`,
+      freeMemory: `${(os.freemem() / 1024 / 1024 / 1024).toFixed(2)} GB`,
+      loadAverage: os.loadavg(),
+    },
+    process: {
+      uptime: `${Math.floor(process.uptime())} seconds`,
+      memory: {
+        rss: `${(memUsage.rss / 1024 / 1024).toFixed(2)} MB`,
+        heapTotal: `${(memUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`,
+        heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`,
+        external: `${(memUsage.external / 1024 / 1024).toFixed(2)} MB`,
+      },
+      cpu: {
+        user: `${(cpuUsage.user / 1000).toFixed(2)} ms`,
+        system: `${(cpuUsage.system / 1000).toFixed(2)} ms`,
+      },
+    },
+    optimization: {
+      clustering: cluster.isMaster || cluster.isWorker,
+      nonBlocking: true,
+      asyncIO: true,
+      multiCore: true,
+    },
+    stores: {
+      contacts: contactStore.size,
+      chats: chatStore.size,
+      messages: messageStore.size,
+    },
+  });
 });
 
 function getRecommendations(isConnected) {
