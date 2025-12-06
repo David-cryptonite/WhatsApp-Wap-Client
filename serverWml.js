@@ -783,17 +783,14 @@ app.use("/wml", (req, res, next) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
   if (!isConnected) {
-    // Send WML redirect page (WAP browsers don't handle HTTP redirects well)
+    // Instant WML redirect (no intermediate page shown)
     const wmlRedirect = `<?xml version="1.0"?>
 <!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>
-  <card id="redirect" title="Login Required">
+  <card id="redirect" title="Redirecting...">
     <onevent type="onenterforward">
       <go href="/wml/qr.wml"/>
     </onevent>
-    <p><b>Please login first</b></p>
-    <p>Redirecting to QR code page...</p>
-    <p><a href="/wml/qr.wml">[Click here if not redirected]</a></p>
   </card>
 </wml>`;
 
@@ -1338,6 +1335,8 @@ app.get(["/wml", "/wml/home.wml"], (req, res) => {
       <a href="/wml/logout.wml" accesskey="0">[0] Logout</a>
     </p>
 
+    <p><small>Server: Port ${port}</small></p>
+
     <do type="accept" label="Refresh">
       <go href="/wml/home.wml"/>
     </do>
@@ -1571,6 +1570,7 @@ app.get("/wml/qr.wml", (req, res) => {
 
   const body_full = `
     ${body}
+    <p><small>Server: Port ${port}</small></p>
     ${navigationBar()}
     <do type="accept" label="Refresh">
       <go href="/wml/qr.wml"/>
