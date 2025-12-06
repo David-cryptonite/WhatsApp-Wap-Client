@@ -32,7 +32,7 @@ function getConnectionState() {
   return connectionState;
 }
 
-async function loadChatHistory(jid, batchSize = 999999999999999999999999999) {
+async function loadChatHistory(jid, batchSize = 50) {
   const currentSock = getSock();
   if (!currentSock) {
     logger.warn('Cannot load chat history: socket not available');
@@ -40,7 +40,7 @@ async function loadChatHistory(jid, batchSize = 999999999999999999999999999) {
   }
 
   try {
-    logger.info(`Loading chat history for ${jid}`);
+    logger.info(`Loading chat history for ${jid} (max ${batchSize} messages)`);
 
     const formattedJid = formatJid(jid);
 
@@ -54,29 +54,33 @@ async function loadChatHistory(jid, batchSize = 999999999999999999999999999) {
     let keepFetching = true;
     let allMessages = [];
     let fetchCount = 0;
-    const maxFetches = 10; // Limit to prevent infinite loops
+    const maxFetches = Math.ceil(batchSize / 25); // Limit fetches based on batch size
 
-    while (keepFetching && fetchCount < maxFetches) {
+    while (keepFetching && fetchCount < maxFetches && allMessages.length < batchSize) {
       let batch;
+
+      // Fetch in smaller chunks (max 25 at a time for Raspberry Pi)
+      const chunkSize = Math.min(25, batchSize - allMessages.length);
 
       // Try the available method
       if (currentSock.loadMessages) {
-        batch = await currentSock.loadMessages(formattedJid, Math.min(batchSize, 100), cursor);
+        batch = await currentSock.loadMessages(formattedJid, chunkSize, cursor);
       } else if (currentSock.fetchMessagesFromWA) {
-        batch = await currentSock.fetchMessagesFromWA(formattedJid, Math.min(batchSize, 100), cursor);
+        batch = await currentSock.fetchMessagesFromWA(formattedJid, chunkSize, cursor);
       }
 
       if (!batch || batch.length === 0) break;
 
       for (const msg of batch) {
         if (!msg.key?.id) continue;
+        if (allMessages.length >= batchSize) break; // Stop if limit reached
         saveMessageToDB(msg, formattedJid);
         allMessages.push(msg);
       }
 
       cursor = batch[0]?.key;
       fetchCount++;
-      await delay(300);
+      await delay(500); // Longer delay to prevent rate limiting
     }
 
     logger.info(`Finished loading history for ${jid}, total: ${allMessages.length} messages`);
@@ -92,7 +96,7 @@ async function loadChatHistory(jid, batchSize = 999999999999999999999999999) {
 
 // =================== FUNZIONI DI SUPPORTO ===================
 
-async function loadAllChatsHistory(maxChatsToLoad = 999999999, messagesPerChat = 99999999) {
+async function loadAllChatsHistory(maxChatsToLoad = 20, messagesPerChat = 50) {
   const currentSock = getSock();
   const currentState = getConnectionState();
 
@@ -121,8 +125,8 @@ async function loadAllChatsHistory(maxChatsToLoad = 999999999, messagesPerChat =
           logger.debug(`Loaded ${messages.length} messages for ${chatId}`);
         }
 
-        // Delay per evitare rate limiting
-        await delay(1000);
+        // Longer delay to prevent rate limiting and reduce Raspberry Pi load
+        await delay(2000);
 
       } catch (chatError) {
         failCount++;
@@ -143,7 +147,8 @@ async function loadRecentMessages(jid, hours = 24) {
   const cutoffTime = Math.floor((Date.now() - (hours * 60 * 60 * 1000)) / 1000);
 
   try {
-    const messages = await loadChatHistory(jid, 9999999999);
+    // Load only 50 recent messages (Raspberry Pi friendly)
+    const messages = await loadChatHistory(jid, 50);
 
     logger.info(`Found ${messages.length} messages for ${jid}`);
     return messages;
@@ -175,12 +180,13 @@ async function preloadImportantChats() {
           Math.max(...messages.map(m => Number(m.messageTimestamp))) : 0
       }))
       .sort((a, b) => b.lastActivity - a.lastActivity)
-      .slice(0, 10); // Top 10 chat più attive
+      .slice(0, 5); // Top 5 chat più attive (reduced for Raspberry Pi)
 
     for (const chat of importantChats) {
       try {
-        await loadChatHistory(chat.jid, 9999999999999999999);
-        await delay(2000); // Delay maggiore per chat importanti
+        // Load only 30 messages per important chat (Raspberry Pi friendly)
+        await loadChatHistory(chat.jid, 30);
+        await delay(3000); // Longer delay to reduce Raspberry Pi load
       } catch (error) {
         logger.warn(`Failed to preload important chat ${chat.jid}:`, error.message);
       }
@@ -196,24 +202,25 @@ async function preloadImportantChats() {
 // Integrazione nel sistema esistente
 async function enhancedInitialSync() {
   try {
-    logger.info('Starting enhanced sync with message history loading...');
+    logger.info('Starting enhanced sync with message history loading (Raspberry Pi optimized)...');
 
     // Prima esegui la sync base
     if (performInitialSync) {
       await performInitialSync();
     }
 
-    // Poi carica la cronologia dei messaggi
+    // Poi carica la cronologia dei messaggi con limiti per Raspberry Pi
     if (chatStore && chatStore.size > 0) {
-      logger.info('Loading chat histories...');
+      logger.info('Loading chat histories (limited for Raspberry Pi)...');
 
-      // Carica cronologia per le prime 20 chat
-      await loadAllChatsHistory(5000, 5000);
+      // Carica cronologia solo per 10 chat con 30 messaggi ciascuna
+      // Questo previene l'esaurimento della memoria su Raspberry Pi
+      await loadAllChatsHistory(10, 30);
 
-      // Precarica chat importanti
+      // Precarica solo le 5 chat più importanti
       await preloadImportantChats();
 
-      logger.info('Enhanced sync completed successfully');
+      logger.info('Enhanced sync completed successfully (Raspberry Pi mode)');
     }
 
   } catch (error) {

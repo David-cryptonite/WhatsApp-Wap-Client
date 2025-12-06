@@ -892,11 +892,11 @@ class ProductionCache {
   }
 }
 
-// Initialize caches with different TTLs for different data types
-const groupsCache = new ProductionCache(50, 60000); // 50 groups, 60s TTL
-const contactsCache = new ProductionCache(500, 300000); // 500 contacts, 5min TTL
-const chatsCache = new ProductionCache(100, 120000); // 100 chats, 2min TTL
-const messagesCache = new ProductionCache(1000, 60000); // 1000 messages, 60s TTL
+// Initialize caches with Raspberry Pi-friendly limits
+const groupsCache = new ProductionCache(30, 60000); // 30 groups, 60s TTL (Raspberry Pi optimized)
+const contactsCache = new ProductionCache(200, 300000); // 200 contacts, 5min TTL (Raspberry Pi optimized)
+const chatsCache = new ProductionCache(50, 120000); // 50 chats, 2min TTL (Raspberry Pi optimized)
+const messagesCache = new ProductionCache(300, 60000); // 300 messages, 60s TTL (Raspberry Pi optimized)
 
 // ============ USER SETTINGS & FAVORITES ============
 // Load user settings with defaults
@@ -1282,17 +1282,18 @@ app.get(["/wml", "/wml/home.wml"], (req, res) => {
     <p>
       <a href="/wml/contacts.wml" accesskey="1">[1] Contacts</a><br/>
       <a href="/wml/chats.wml" accesskey="2">[2] Chats</a><br/>
-      <a href="/wml/send-menu.wml" accesskey="3">[3] Send</a><br/>
-      <a href="/wml/groups.wml" accesskey="4">[4] Groups</a><br/>
-      <a href="/wml/status-broadcast.wml" accesskey="5">[5] Post Status</a>
+      <a href="/wml/favorites.wml" accesskey="3">[3] Favorites ⭐</a><br/>
+      <a href="/wml/send-menu.wml" accesskey="4">[4] Send</a><br/>
+      <a href="/wml/groups.wml" accesskey="5">[5] Groups</a><br/>
+      <a href="/wml/status-broadcast.wml" accesskey="6">[6] Post Status</a>
     </p>
 
     <p><b>Tools:</b></p>
     <p>
-      <a href="/wml/search.wml" accesskey="6">[6] Search</a><br/>
-      <a href="/wml/settings.wml" accesskey="7">[7] Settings</a><br/>
-      <a href="/wml/help.wml" accesskey="8">[8] Help</a><br/>
-      <a href="/wml/me.wml" accesskey="9">[9] Profile</a>
+      <a href="/wml/search.wml" accesskey="7">[7] Search</a><br/>
+      <a href="/wml/settings.wml" accesskey="8">[8] Settings</a><br/>
+      <a href="/wml/help.wml" accesskey="9">[9] Help</a><br/>
+      <a href="/wml/me.wml">[*] Profile</a>
     </p>
 
     <p><b>System:</b></p>
@@ -7415,6 +7416,8 @@ async function connectWithBetterSync() {
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
       let newMessagesCount = 0;
+      const MAX_MESSAGES_PER_CHAT = 300; // Raspberry Pi memory limit
+
       for (const message of messages) {
         // Changed from 'msg' to 'message' to avoid conflicts
         newMessagesCount++;
@@ -7427,6 +7430,14 @@ async function connectWithBetterSync() {
           }
           const chatMessages = chatStore.get(chatId);
           chatMessages.push(message);
+
+          // Prevent memory exhaustion on Raspberry Pi
+          if (chatMessages.length > MAX_MESSAGES_PER_CHAT) {
+            const oldMsg = chatMessages.shift(); // Remove oldest message
+            if (oldMsg.key?.id) {
+              messageStore.delete(oldMsg.key.id);
+            }
+          }
 
           // Gestione trascrizione audio con Whisper
           if (message.message?.audioMessage && transcriptionEnabled) {
@@ -7671,14 +7682,33 @@ if (cluster.isMaster || cluster.isPrimary) {
 
     // Only one worker handles periodic tasks (master-like behavior)
     if (cluster.worker.id === 1) {
+      // Memory-based cleanup (only when memory usage is high)
       setInterval(() => {
-        storage.cleanupOldMessages(messageStore, chatStore, 100);
-      }, 60 * 60 * 1000); // every hour
+        const memUsage = process.memoryUsage();
+        const heapUsedMB = memUsage.heapUsed / 1024 / 1024;
+        const heapTotalMB = memUsage.heapTotal / 1024 / 1024;
+        const heapPercent = (heapUsedMB / heapTotalMB) * 100;
 
+        logger.info(`Memory usage: ${heapUsedMB.toFixed(2)}MB / ${heapTotalMB.toFixed(2)}MB (${heapPercent.toFixed(1)}%)`);
+
+        // Only cleanup if memory usage exceeds 75% on Raspberry Pi
+        if (heapPercent > 75) {
+          logger.warn(`High memory usage detected (${heapPercent.toFixed(1)}%), running cleanup...`);
+          storage.cleanupOldMessages(messageStore, chatStore, 200); // Keep 200 messages per chat
+
+          // Force garbage collection if available
+          if (global.gc) {
+            global.gc();
+            logger.info('Garbage collection forced');
+          }
+        }
+      }, 5 * 60 * 1000); // Check every 5 minutes
+
+      // Periodic save - increased interval to reduce Raspberry Pi I/O load
       setInterval(() => {
         saveAll();
         logger.info("Periodic save completed");
-      }, 10 * 60 * 1000);
+      }, 15 * 60 * 1000); // Every 15 minutes instead of 10
     }
   });
 
