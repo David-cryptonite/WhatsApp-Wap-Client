@@ -839,6 +839,7 @@ let messageStore = persistentData.messages;
 let contactStore = persistentData.contacts;
 let chatStore = persistentData.chats;
 let connectionState = "disconnected";
+let currentQR = null; // Store the current QR code
 let isFullySynced = persistentData.meta.isFullySynced;
 let syncAttempts = persistentData.meta.syncAttempts;
 let isConnecting = false; // Prevent race conditions in connection logic
