@@ -1,13 +1,12 @@
 // Multi-threading and clustering for high performance
-const cluster = require("cluster");
-const os = require("os");
-const { Worker } = require("worker_threads");
+import cluster from 'cluster';
+import os from 'os';
+import { Worker } from 'worker_threads';
 
-const express = require("express");
-const compression = require("compression");
-const http = require("http");
-const {
-  default: makeWASocket,
+import express from 'express';
+import compression from 'compression';
+import http from 'http';
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -15,18 +14,30 @@ const {
   getContentType,
   extractMessageContent,
   delay,
-} = require("@whiskeysockets/baileys");
-const fs = require("fs");
-const path = require("path");
-const axios = require("axios");
-const qrcode = require("qrcode-terminal");
-const QRCode = require("qrcode");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const winston = require("winston");
-const { initializeDependencies, enhancedInitialSync } = require("./loadChatUtils");
-const PersistentStorage = require("./persistentStorage");
-const sharp = require("sharp");
+  jidNormalizedUser,
+  areJidsSameUser,
+  jidDecode,
+} from '@whiskeysockets/baileys';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import axios from 'axios';
+import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import winston from 'winston';
+import { initializeDependencies, enhancedInitialSync } from './loadChatUtils.js';
+import PersistentStorage from './persistentStorage.js';
+import sharp from 'sharp';
+import ffmpeg from 'ffmpeg-static';
+import { exec, spawn } from 'child_process';
+import iconv from 'iconv-lite';
+
+// ESM __dirname replacement
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // ============ PRODUCTION-GRADE HTTP CLIENT CONFIGURATION ============
 // Configure axios for optimal performance with connection pooling
@@ -42,10 +53,6 @@ const axiosAgent = new http.Agent({
 axios.defaults.httpAgent = axiosAgent;
 axios.defaults.timeout = 30000;
 axios.defaults.maxRedirects = 5;
-
-// Configurazione Whisper
-const ffmpeg = require("ffmpeg-static");
-const { exec } = require("child_process");
 
 // Configurazione Whisper e TTS
 let transcriber = null;
@@ -92,7 +99,6 @@ async function initTTSModel() {
 
     // Check if espeak is installed
     await new Promise((resolve, reject) => {
-      const { exec } = require('child_process');
       exec('which espeak || which espeak-ng', (error, stdout) => {
         if (error || !stdout.trim()) {
           reject(new Error('espeak not found. Install with: sudo apt-get install espeak'));
@@ -124,10 +130,10 @@ async function transcribeAudioWithWhisper(audioBuffer, language = 'auto') {
     console.log(`Converting audio to WAV format (language: ${language})...`);
 
     // Usa ffmpeg-static
-    const ffmpegPath = require("ffmpeg-static");
+    const ffmpegPath = ffmpeg;
 
     await new Promise((resolve, reject) => {
-      const process = require("child_process").spawn(ffmpegPath, [
+      const process = spawn(ffmpegPath, [
         "-i",
         "pipe:0", // Input da stdin
         "-ar",
@@ -141,7 +147,7 @@ async function transcribeAudioWithWhisper(audioBuffer, language = 'auto') {
         "-", // Output su stdout
       ]);
 
-      const outputStream = require("fs").createWriteStream(tempOutput);
+      const outputStream = fs.createWriteStream(tempOutput);
 
       process.stdin.end(audioBuffer);
       process.stdout.pipe(outputStream);
@@ -268,8 +274,8 @@ async function extractVideoFrames(videoBuffer, messageId) {
 
     // Extract frames using FFmpeg at 1 FPS
     await new Promise((resolve, reject) => {
-      const ffmpegPath = require("ffmpeg-static");
-      const process = require("child_process").spawn(ffmpegPath, [
+      const ffmpegPath = ffmpeg;
+      const process = spawn(ffmpegPath, [
         '-i', tempVideoPath,
         '-vf', 'fps=1',  // 1 frame per second
         '-s', '128x128',  // Small size for WAP devices
@@ -373,8 +379,6 @@ async function textToSpeechLocal(text, language = 'en') {
 
     // Use espeak to generate WAV audio
     await new Promise((resolve, reject) => {
-      const { spawn } = require('child_process');
-
       // espeak command: text to WAV file
       // -v: Voice (en for English, it for Italian)
       // -s 150: Speed (words per minute)
@@ -557,8 +561,8 @@ async function concatenateAudioFiles(audioBuffers) {
 
     // Use FFmpeg to concatenate
     await new Promise((resolve, reject) => {
-      const ffmpegPath = require("ffmpeg-static");
-      const process = require("child_process").spawn(ffmpegPath, [
+      const ffmpegPath = ffmpeg;
+      const process = spawn(ffmpegPath, [
         '-f', 'concat',
         '-safe', '0',
         '-i', concatList,
@@ -604,8 +608,8 @@ async function convertWavToOgg(wavBuffer) {
 
     // Convert to OGG Opus using FFmpeg
     await new Promise((resolve, reject) => {
-      const ffmpegPath = require("ffmpeg-static");
-      const process = require("child_process").spawn(ffmpegPath, [
+      const ffmpegPath = ffmpeg;
+      const process = spawn(ffmpegPath, [
         '-i', tempWav,
         '-c:a', 'libopus',      // Use Opus codec
         '-b:a', '64k',          // 64kbps bitrate (good for voice)
@@ -644,8 +648,6 @@ async function convertWavToOgg(wavBuffer) {
     }
   }
 }
-
-const iconv = require("iconv-lite");
 
 const app = express();
 const port = process.env.PORT || 3500;
@@ -1112,7 +1114,20 @@ function parseList(str = "") {
 function formatJid(raw = "") {
   const s = String(raw).trim();
   if (!s) return s;
-  return s.includes("@") ? s : `${s}@s.whatsapp.net`;
+
+  // Handle LID (Local Identifier) support for Baileys 7.x
+  // Use jidNormalizedUser to properly normalize the JID
+  try {
+    if (s.includes("@")) {
+      // Already has domain, normalize it
+      return jidNormalizedUser(s);
+    }
+    // Add default WhatsApp domain and normalize
+    return jidNormalizedUser(`${s}@s.whatsapp.net`);
+  } catch (error) {
+    // Fallback to simple formatting if jidNormalizedUser fails
+    return s.includes("@") ? s : `${s}@s.whatsapp.net`;
+  }
 }
 
 function ensureGroupJid(raw = "") {
@@ -1135,7 +1150,20 @@ function messageText(msg) {
     if (c.videoMessage?.caption) return `[VID] ${c.videoMessage.caption || ""}`;
     if (c.audioMessage) {
       const duration = c.audioMessage.seconds || 0;
-      return `[AUDIO ${duration}s]`;
+      const transcription = msg.transcription || "";
+
+      let result = `[AUDIO ${duration}s]`;
+
+      // Add transcription indicator if available
+      if (
+        transcription &&
+        transcription !== "[Trascrizione fallita]" &&
+        transcription !== "[Audio troppo lungo per la trascrizione]"
+      ) {
+        result += " 📝";
+      }
+
+      return result;
     }
     if (c.documentMessage)
       return `[DOC] ${c.documentMessage.fileName || "Document"}`;
@@ -4248,38 +4276,6 @@ ${body}
     res.status(500).send("Error loading image");
   }
 });
-
-function messageText(msg) {
-  try {
-    const c = extractMessageContent(msg?.message);
-    if (!c) return "[unsupported]";
-
-    if (c.conversation) return c.conversation;
-    if (c.extendedTextMessage?.text) return c.extendedTextMessage.text;
-
-    if (c.audioMessage) {
-      const duration = c.audioMessage.seconds || 0;
-      const transcription = msg.transcription || "";
-
-      let result = `[AUDIO ${duration}s]`;
-
-      // Aggiungi un'icona se la trascrizione è disponibile
-      if (
-        transcription &&
-        transcription !== "[Trascrizione fallita]" &&
-        transcription !== "[Audio troppo lungo per la trascrizione]"
-      ) {
-        result += " 📝";
-      }
-
-      return result;
-    }
-
-    // ... resto del codice esistente per altri tipi di messaggi
-  } catch {
-    return "[unknown]";
-  }
-}
 
 // Nuova route per visualizzare WBMP in una pagina WAP dedicata
 app.get("/wml/view-wbmp.wml", async (req, res) => {
@@ -9421,23 +9417,33 @@ app.delete("/api/delete-message", async (req, res) => {
 });
 
 app.post("/api/read-messages", async (req, res) => {
+  // ⚠️ CRITICAL BAN PREVENTION (Baileys 7.x)
+  // Read receipts (ACKs) are DISABLED to prevent WhatsApp bans
+  // DO NOT re-enable without understanding the ban risks
   try {
-    const { messageIds } = req.body;
-    if (!sock) return res.status(500).json({ error: "Not connected" });
+    return res.status(403).json({
+      error: "Read receipts disabled for ban prevention",
+      warning: "Sending read receipts can trigger WhatsApp bans in Baileys 7.x",
+      suggestion: "Do not re-enable this feature"
+    });
 
-    const keys = messageIds
-      .map((id) => {
-        const msg = messageStore.get(id);
-        return msg ? msg.key : null;
-      })
-      .filter(Boolean);
-
-    if (keys.length === 0) {
-      return res.status(404).json({ error: "No valid messages found" });
-    }
-
-    await sock.readMessages(keys);
-    res.json({ status: "ok", markedAsRead: keys.length });
+    // DISABLED CODE (kept for reference):
+    // const { messageIds } = req.body;
+    // if (!sock) return res.status(500).json({ error: "Not connected" });
+    //
+    // const keys = messageIds
+    //   .map((id) => {
+    //     const msg = messageStore.get(id);
+    //     return msg ? msg.key : null;
+    //   })
+    //   .filter(Boolean);
+    //
+    // if (keys.length === 0) {
+    //   return res.status(404).json({ error: "No valid messages found" });
+    // }
+    //
+    // await sock.readMessages(keys);
+    // res.json({ status: "ok", markedAsRead: keys.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -11851,4 +11857,4 @@ app.use((req, res) => {
   });
 });
 
-module.exports = { app, sock, contactStore, chatStore, messageStore };
+export { app, sock, contactStore, chatStore, messageStore };

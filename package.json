@@ -1,9 +1,11 @@
 {
   "name": "whatsappwml",
-  "version": "1.0.0",
-  "description": "",
-  "main": "loadChatUtils.js",
+  "version": "2.0.0",
+  "description": "WhatsApp WAP Client with Baileys 7.x (ESM)",
+  "type": "module",
+  "main": "serverWml.js",
   "scripts": {
+    "start": "node serverWml.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

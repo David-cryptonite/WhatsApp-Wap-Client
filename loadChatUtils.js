@@ -1,4 +1,4 @@
-// =================== CHAT HISTORY UTILITIES ===================
+// =================== CHAT HISTORY UTILITIES (ESM) ===================
 // Module-level dependencies - will be set by serverWml.js
 let logger = console; // Default to console
 let sock = null;
@@ -228,8 +228,8 @@ async function enhancedInitialSync() {
   }
 }
 
-// Esporta le funzioni
-module.exports = {
+// Export functions (ESM)
+export {
   initializeDependencies,
   getSock,
   getConnectionState,

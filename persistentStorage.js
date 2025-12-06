@@ -1,6 +1,6 @@
-// persistentStorage.js - Add this as a new file
-const fs = require('fs')
-const path = require('path')
+// persistentStorage.js - ESM version for Baileys 7.x
+import fs from 'fs';
+import path from 'path';
 
 class PersistentStorage {
   constructor(dataDir = './data') {
@@ -192,4 +192,4 @@ class PersistentStorage {
   }
 }
 
-module.exports = PersistentStorage
+export default PersistentStorage;
