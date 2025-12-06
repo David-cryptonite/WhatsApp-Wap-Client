@@ -24,7 +24,7 @@ const QRCode = require("qrcode");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const winston = require("winston");
-const { enhancedInitialSync } = require("./loadChatUtils");
+const { initializeDependencies, enhancedInitialSync } = require("./loadChatUtils");
 const PersistentStorage = require("./persistentStorage");
 const sharp = require("sharp");
 
@@ -7252,6 +7252,47 @@ async function performInitialSync() {
       setTimeout(performInitialSync, 5000);
     }
   }
+}
+
+// Helper function for saving messages to DB
+function saveMessageToDB(msg, jid) {
+  if (!msg || !msg.key || !msg.key.id) return;
+
+  try {
+    // Save to message store
+    messageStore.set(msg.key.id, msg);
+
+    // Add to chat store if not exists
+    if (!chatStore.has(jid)) {
+      chatStore.set(jid, []);
+    }
+
+    const chatMessages = chatStore.get(jid);
+    if (!chatMessages.some(m => m.key?.id === msg.key.id)) {
+      chatMessages.push(msg);
+    }
+  } catch (error) {
+    logger.error('Error saving message to DB:', error.message);
+  }
+}
+
+// ============ INITIALIZE LOAD CHAT UTILS DEPENDENCIES ============
+// Pass all required dependencies to loadChatUtils module
+try {
+  initializeDependencies({
+    logger: logger,
+    sock: sock,
+    chatStore: chatStore,
+    messageStore: messageStore,
+    connectionState: connectionState,
+    formatJid: formatJid,
+    delay: delay,
+    saveMessageToDB: saveMessageToDB,
+    performInitialSync: performInitialSync
+  });
+  logger.info('✓ loadChatUtils dependencies initialized');
+} catch (error) {
+  logger.error('Failed to initialize loadChatUtils:', error.message);
 }
 
 // Production-ready connection with better error handling
