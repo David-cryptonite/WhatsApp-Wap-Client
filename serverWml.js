@@ -773,7 +773,7 @@ app.use("/wml", wmlLimiter);
 
 // ============ AUTHENTICATION MIDDLEWARE ============
 // Protect all WML pages - redirect to QR if not logged in
-app.use("/wml", (req, res, next) => {
+/*app.use("/wml", (req, res, next) => {
   // Allow access to QR code page and logout page without authentication
   const publicPages = ['/wml/qr.wml', '/wml/qr-display.wml', '/wml/logout.wml'];
 
@@ -791,7 +791,7 @@ app.use("/wml", (req, res, next) => {
 
   next();
 });
-
+*/
 // 5. LOGGING - Production-grade Winston logger
 const logger = winston.createLogger({
   level: isDev ? "debug" : "info",
@@ -1320,7 +1320,7 @@ app.get(["/wml", "/wml/home.wml"], (req, res) => {
 
   const body = `
     <p><b>WhatsApp WAP</b></p>
-    <p>${connected ? "&#9679; Online" : "&#9675; Offline"} | ${
+    <p>${connected ? "Online" : "Offline"} | ${
     isFullySynced ? "Synced" : "Syncing..."
   }</p>
     <p>Contacts: ${contactStore.size} | Chats: ${chatStore.size}</p>
@@ -1554,45 +1554,40 @@ app.get("/wml/status.wml", (req, res) => {
   sendWml(res, card("status", "Status", body, "/wml/status.wml"));
 });
 
-// Enhanced QR Code page - WAP 1.0 compatible
+// Enhanced QR Code page
 app.get("/wml/qr.wml", (req, res) => {
-  const isConnected = !!sock?.authState?.creds && connectionState === 'open';
-
-  const body = isConnected
+  const body = currentQR
     ? `
-      <p>WhatsApp Connected</p>
-      <p>You are logged in</p>
-      <p>
-        <a href="/wml/home.wml">Go to Home</a>
-      </p>
-    `
-    : currentQR
-    ? `
-      <p>Scan QR Code</p>
-      <p>1. Open WhatsApp</p>
-      <p>2. Menu - Linked Devices</p>
-      <p>3. Link a Device</p>
-      <p>4. Scan QR:</p>
-      <p><img src="/api/qr/image?format=png"/></p>
-      <p>Status: ${esc(connectionState)}</p>
-      <p>Press OK to refresh</p>
+    
+      <p><b>QR Code Available</b></p>
+      <p>Scan with WhatsApp:</p>
+      <p><img src="/api/qr/image?format=wbmp" alt="QR Code" localscr="qr.wbmp"/></p>
+      <p><small>Auto-refreshes every 30 seconds</small></p>
+      
+      <p><b>QR Formats:</b></p>
+  <p>
+  <a href="/api/qr/image?format=png">[PNG]</a> 
+  <a href="/api/qr/text">[Text]</a> |
+  <a href="/api/qr/image?format=wbmp">[WBMP]</a> 
+  <a href="/api/qr/wml-wbmp">[WML+WBMP]</a>
+</p>
     `
     : `
-      <p>Connecting...</p>
+   
+      <p><b>QR Code Not Available</b></p>
       <p>Status: ${esc(connectionState)}</p>
-      <p>QR code loading</p>
-      <p>Please wait</p>
+      <p>Please wait or check connection...</p>
     `;
 
   const body_full = `
     ${body}
-    <p>Port ${port}</p>
+    ${navigationBar()}
     <do type="accept" label="Refresh">
       <go href="/wml/qr.wml"/>
     </do>
   `;
 
-  sendWml(res, card("qr", "QR Code", body_full));
+  sendWml(res, card("qr", "QR Code", body_full, "/wml/qr.wml"));
 });
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
