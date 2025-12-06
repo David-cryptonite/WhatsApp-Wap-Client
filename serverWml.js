@@ -1553,49 +1553,43 @@ app.get("/wml/status.wml", (req, res) => {
   sendWml(res, card("status", "Status", body, "/wml/status.wml"));
 });
 
-// Enhanced QR Code page
+// Enhanced QR Code page - WAP 1.0 compatible
 app.get("/wml/qr.wml", (req, res) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
   const body = isConnected
     ? `
-      <p><b>✓ WhatsApp Connected!</b></p>
-      <p>You are now logged in.</p>
+      <p>WhatsApp Connected</p>
+      <p>You are logged in</p>
       <p>
-        <a href="/wml/home.wml" accesskey="1">[1] Go to Home</a>
+        <a href="/wml/home.wml">Go to Home</a>
       </p>
     `
     : currentQR
     ? `
-      <p><b>Scan QR Code</b></p>
-      <p>1. Open WhatsApp on your phone</p>
-      <p>2. Tap Menu → Linked Devices</p>
-      <p>3. Tap "Link a Device"</p>
-      <p>4. Scan this QR code:</p>
-
-      <p><img src="/api/qr/image?format=png" alt="QR Code"/></p>
-
-      <p><small>Status: ${esc(connectionState)}</small></p>
-      <p><small>Press OK to refresh</small></p>
+      <p>Scan QR Code</p>
+      <p>1. Open WhatsApp</p>
+      <p>2. Menu - Linked Devices</p>
+      <p>3. Link a Device</p>
+      <p>4. Scan QR:</p>
+      <p><img src="/api/qr/image?format=png"/></p>
+      <p>Status: ${esc(connectionState)}</p>
+      <p>Press OK to refresh</p>
     `
     : `
-      <p><b>Connecting to WhatsApp...</b></p>
+      <p>Connecting...</p>
       <p>Status: ${esc(connectionState)}</p>
-      <p>QR code will appear shortly.</p>
-      <p><small>Please wait...</small></p>
+      <p>QR code loading</p>
+      <p>Please wait</p>
     `;
 
   const body_full = `
     ${body}
-    <p><small>Server: Port ${port}</small></p>
-
+    <p>Port ${port}</p>
     <do type="accept" label="Refresh">
       <go href="/wml/qr.wml"/>
     </do>
   `;
-
-  // No auto-refresh - causes issues on old WAP browsers
-  // User can manually refresh with the button above
 
   sendWml(res, card("qr", "QR Code", body_full));
 });
