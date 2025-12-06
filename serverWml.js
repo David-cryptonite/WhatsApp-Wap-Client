@@ -1559,7 +1559,7 @@ app.get("/wml/qr.wml", (req, res) => {
       <p><img src="/api/qr/image?format=png" alt="QR Code"/></p>
 
       <p><small>Status: ${esc(connectionState)}</small></p>
-      <p><small>Auto-refresh in 15s...</small></p>
+      <p><small>Press OK to refresh</small></p>
     `
     : `
       <p><b>Connecting to WhatsApp...</b></p>
@@ -1571,21 +1571,16 @@ app.get("/wml/qr.wml", (req, res) => {
   const body_full = `
     ${body}
     <p><small>Server: Port ${port}</small></p>
-    ${navigationBar()}
+
     <do type="accept" label="Refresh">
       <go href="/wml/qr.wml"/>
     </do>
   `;
 
-  // Add auto-refresh when not connected (every 15 seconds)
-  const autoRefreshScript = !isConnected ? `
-    <ontimer>
-      <go href="/wml/qr.wml"/>
-    </ontimer>
-    <timer value="150"/>
-  ` : '';
+  // No auto-refresh - causes issues on old WAP browsers
+  // User can manually refresh with the button above
 
-  sendWml(res, card("qr", "QR Code", body_full, null, autoRefreshScript));
+  sendWml(res, card("qr", "QR Code", body_full));
 });
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
