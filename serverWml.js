@@ -1960,7 +1960,7 @@ app.get("/wml/contact.wml", async (req, res) => {
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           jid
         )}&amp;limit=15" accesskey="4">[4] Open Chat</a><br/>
-        <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+        <a href="/wml/send-quick.wml?to=${encodeURIComponent(
           jid
         )}" accesskey="5">[5] Send Message</a><br/>
         <a href="/wml/block.wml?jid=${encodeURIComponent(
@@ -2777,13 +2777,13 @@ app.get("/wml/chat.wml", async (req, res) => {
 
   // Quick actions adapted to device
   const quickActions = isOldNokia
-    ? `<p><a href="/wml/send-menu.wml?to=${encodeURIComponent(
+    ? `<p><a href="/wml/send-quick.wml?to=${encodeURIComponent(
         jid
       )}" accesskey="1">1-Send</a></p>
      <p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
     : `<p><b>Quick Actions:</b></p>
      <p>
-       <a href="/wml/send-menu.wml?to=${encodeURIComponent(
+       <a href="/wml/send-quick.wml?to=${encodeURIComponent(
          jid
        )}" accesskey="1">[1] Send Message</a>
        <a href="/wml/contact.wml?jid=${encodeURIComponent(
@@ -2835,7 +2835,7 @@ ${quickActions}`;
 <card id="chat" title="Chat">
 ${body}
 <do type="accept" label="Send">
-  <go href="/wml/send-menu.wml?to=${encodeURIComponent(jid)}"/>
+  <go href="/wml/send-quick.wml?to=${encodeURIComponent(jid)}"/>
 </do>
 <do type="options" label="Refresh">
   <go href="/wml/chat.wml?jid=${encodeURIComponent(
@@ -4540,6 +4540,59 @@ app.get("/wml/send-menu.wml", (req, res) => {
 
   sendWml(res, card("send-menu", "Send Menu", body));
 });
+
+// Quick Send - Streamlined for known contacts (FAST, non-blocking)
+// Use this when contact is already known from chat/contact info
+app.get("/wml/send-quick.wml", (req, res) => {
+  const to = req.query.to || "";
+
+  if (!to) {
+    // No contact specified, redirect to full menu
+    return res.redirect(302, "/wml/send-menu.wml");
+  }
+
+  // Fast lookup - non-blocking
+  const jid = formatJid(to);
+  const contact = contactStore.get?.(jid) || contactStore[jid];
+  const contactName = contact?.name || contact?.notify || jidFriendly(to);
+
+  // Minimal, fast HTML - optimized for Nokia WAP
+  const body = `
+    <p><b>Quick Send</b></p>
+    <p>To: <b>${esc(contactName)}</b></p>
+    <p>Number: ${esc(jidFriendly(to))}</p>
+
+    <p>Select type:</p>
+    <select name="msgtype" title="Type">
+      <option value="/wml/send.text.wml">Text</option>
+      <option value="/wml/send.tts.wml">Voice (TTS)</option>
+      <option value="/wml/send.image.wml">Image</option>
+      <option value="/wml/send.video.wml">Video</option>
+      <option value="/wml/send.audio.wml">Audio</option>
+      <option value="/wml/send.document.wml">Document</option>
+      <option value="/wml/send.sticker.wml">Sticker</option>
+      <option value="/wml/send.location.wml">Location</option>
+      <option value="/wml/send.contact.wml">Contact</option>
+      <option value="/wml/send.poll.wml">Poll</option>
+    </select>
+
+    <do type="accept" label="Continue">
+      <go href="/wml/send-dispatch.wml" method="get">
+        <postfield name="msgtype" value="$(msgtype)"/>
+        <postfield name="target" value="${esc(to)}"/>
+      </go>
+    </do>
+
+    <p>
+      <a href="/wml/send-menu.wml" accesskey="0">[0] Full Menu</a> |
+      <a href="/wml/chats.wml" accesskey="9">[9] Chats</a>
+    </p>
+  `;
+
+  // Fast response - minimal processing
+  sendWml(res, card("send-quick", "Quick Send", body));
+});
+
 // Route di dispatch per gestire la selezione del destinatario
 // Uses simple HTTP redirect for Nokia WAP compatibility
 app.post("/wml/send-dispatch.wml", (req, res) => {
