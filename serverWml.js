@@ -677,6 +677,28 @@ let isFullySynced = persistentData.meta.isFullySynced;
 let syncAttempts = persistentData.meta.syncAttempts;
 let isConnecting = false; // Prevent race conditions in connection logic
 
+// ============ PRODUCTION-GRADE CACHING ============
+// Cache for groups list with TTL (Time To Live) for performance optimization
+const groupsCache = {
+  data: null,
+  timestamp: 0,
+  ttl: 60000, // 60 seconds cache
+  isValid() {
+    return this.data && (Date.now() - this.timestamp) < this.ttl;
+  },
+  set(data) {
+    this.data = data;
+    this.timestamp = Date.now();
+  },
+  get() {
+    return this.isValid() ? this.data : null;
+  },
+  invalidate() {
+    this.data = null;
+    this.timestamp = 0;
+  }
+};
+
 // ============ USER SETTINGS & FAVORITES ============
 // Load user settings with defaults
 let userSettings = persistentData.settings || {
@@ -1062,20 +1084,21 @@ app.get(["/wml", "/wml/home.wml"], (req, res) => {
       <a href="/wml/contacts.wml" accesskey="1">[1] Contacts</a><br/>
       <a href="/wml/chats.wml" accesskey="2">[2] Chats</a><br/>
       <a href="/wml/send-menu.wml" accesskey="3">[3] Send</a><br/>
-      <a href="/wml/groups.wml" accesskey="4">[4] Groups</a>
+      <a href="/wml/groups.wml" accesskey="4">[4] Groups</a><br/>
+      <a href="/wml/status-broadcast.wml" accesskey="5">[5] Post Status</a>
     </p>
 
     <p><b>Tools:</b></p>
     <p>
-      <a href="/wml/search.wml" accesskey="5">[5] Search</a><br/>
-      <a href="/wml/settings.wml" accesskey="6">[6] Settings</a><br/>
-      <a href="/wml/help.wml" accesskey="7">[7] Help</a><br/>
-      <a href="/wml/me.wml" accesskey="8">[8] Profile</a>
+      <a href="/wml/search.wml" accesskey="6">[6] Search</a><br/>
+      <a href="/wml/settings.wml" accesskey="7">[7] Settings</a><br/>
+      <a href="/wml/help.wml" accesskey="8">[8] Help</a><br/>
+      <a href="/wml/me.wml" accesskey="9">[9] Profile</a>
     </p>
 
     <p><b>System:</b></p>
     <p>
-      <a href="/wml/status.wml" accesskey="9">[9] Status</a><br/>
+      <a href="/wml/status.wml">[Sys Status]</a><br/>
       <a href="/wml/qr.wml">[*] QR Code</a><br/>
       <a href="/wml/logout.wml" accesskey="0">[0] Logout</a>
     </p>
@@ -5640,10 +5663,18 @@ app.get("/wml/groups.wml", async (req, res) => {
     const limit = 5;
     const offset = (page - 1) * limit;
 
-    const groups = await sock.groupFetchAllParticipating();
-    const groupList = Object.values(groups).sort((a, b) =>
-      (b?.subject || "").localeCompare(a?.subject || "")
-    );
+    // PRODUCTION-GRADE: Check cache first for better performance
+    let groupList = groupsCache.get();
+
+    if (!groupList) {
+      // Cache miss - fetch from WhatsApp (async, non-blocking)
+      const groups = await sock.groupFetchAllParticipating();
+      groupList = Object.values(groups).sort((a, b) =>
+        (b?.subject || "").localeCompare(a?.subject || "")
+      );
+      // Cache the result
+      groupsCache.set(groupList);
+    }
 
     // Calcoli per la paginazione
     const totalGroups = groupList.length;
@@ -5783,6 +5814,538 @@ app.get("/wml/groups.wml", async (req, res) => {
     res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
     const encodedBuffer = iconv.encode(errorWml, "iso-8859-1");
     res.send(encodedBuffer);
+  }
+});
+
+// Group View - View group details, participants, settings (PRODUCTION-GRADE)
+app.get("/wml/group.view.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    const gid = req.query.gid || "";
+    if (!gid) throw new Error("No group ID provided");
+
+    // Fetch group metadata - non-blocking
+    const metadata = await sock.groupMetadata(gid);
+
+    // Extract group info
+    const groupName = metadata.subject || "Unnamed Group";
+    const groupDesc = metadata.desc || "No description";
+    const participants = metadata.participants || [];
+    const admins = participants.filter(p => p.admin).map(p => p.id);
+    const isAdmin = admins.includes(sock.user?.id);
+    const createdBy = metadata.subjectOwner || "Unknown";
+    const createdAt = metadata.creation ? new Date(metadata.creation * 1000).toLocaleDateString() : "Unknown";
+
+    // WML escape
+    const esc = (text) =>
+      (text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+
+    // Pagination for participants
+    const page = parseInt(req.query.page) || 1;
+    const limit = 10;
+    const offset = (page - 1) * limit;
+    const totalPages = Math.ceil(participants.length / limit);
+    const paginatedParticipants = participants.slice(offset, offset + limit);
+
+    // Participant list
+    const participantList = paginatedParticipants
+      .map((p, idx) => {
+        const globalIdx = offset + idx;
+        const contact = contactStore.get?.(p.id) || contactStore[p.id];
+        const name = contact?.name || contact?.notify || jidFriendly(p.id);
+        const role = p.admin ? " (Admin)" : "";
+        return `<p>${globalIdx + 1}. ${esc(name)}${role}</p>`;
+      })
+      .join("");
+
+    // Pagination controls
+    let paginationControls = "";
+    if (totalPages > 1) {
+      paginationControls = "<p><b>Pages:</b> ";
+      if (page > 1) {
+        paginationControls += `<a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}&page=${page - 1}">[&lt;]</a> `;
+      }
+      paginationControls += `<b>[${page}/${totalPages}]</b> `;
+      if (page < totalPages) {
+        paginationControls += `<a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}&page=${page + 1}">[&gt;]</a>`;
+      }
+      paginationControls += "</p>";
+    }
+
+    // Admin actions
+    const adminActions = isAdmin
+      ? `<p><b>Admin Actions:</b></p>
+         <p>
+           <a href="/wml/group.settings.wml?gid=${encodeURIComponent(gid)}" accesskey="7">[7] Settings</a><br/>
+           <a href="/wml/group.invite.wml?gid=${encodeURIComponent(gid)}" accesskey="8">[8] Invite Link</a><br/>
+           <a href="/wml/group.add-participant.wml?gid=${encodeURIComponent(gid)}" accesskey="9">[9] Add Member</a>
+         </p>`
+      : "";
+
+    // Body
+    const body = `
+      <p><b>${esc(groupName)}</b></p>
+      <p><small>${esc(groupDesc)}</small></p>
+
+      <p><b>Info:</b></p>
+      <p>Members: ${participants.length}<br/>
+      Admins: ${admins.length}<br/>
+      Created: ${esc(createdAt)}</p>
+
+      <p><b>Participants (${participants.length}):</b></p>
+      ${participantList}
+      ${paginationControls}
+
+      ${adminActions}
+
+      <p><b>Actions:</b></p>
+      <p>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(gid)}&limit=15" accesskey="1">[1] Open Chat</a><br/>
+        <a href="/wml/send-quick.wml?to=${encodeURIComponent(gid)}" accesskey="2">[2] Send Message</a><br/>
+        <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Leave Group</a>
+      </p>
+
+      <p>
+        <a href="/wml/groups.wml">[Back to Groups]</a> |
+        <a href="/wml/home.wml">[Home]</a>
+      </p>
+    `;
+
+    const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <head>
+    <meta http-equiv="Cache-Control" content="max-age=60"/>
+  </head>
+  <card id="group-view" title="${esc(groupName)}">
+    ${body}
+  </card>
+</wml>`;
+
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.send(iconv.encode(wmlOutput, "iso-8859-1"));
+  } catch (e) {
+    const errorWml = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+  <card id="error" title="Error">
+    <p><b>Error:</b></p>
+    <p>${(e.message || "Failed to load group").replace(/[<>&"']/g, "")}</p>
+    <p><a href="/wml/groups.wml">[Back to Groups]</a></p>
+  </card>
+</wml>`;
+    res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+    res.send(iconv.encode(errorWml, "iso-8859-1"));
+  }
+});
+
+// Group Create - Create new group (PRODUCTION-GRADE, NON-BLOCKING)
+app.get("/wml/group.create.wml", (req, res) => {
+  const body = `
+    <p><b>Create New Group</b></p>
+
+    <p>Enter group name:</p>
+    <p>
+      <input name="groupname" title="Group Name" value="" emptyok="false" size="20" maxlength="50"/>
+    </p>
+
+    <p>Add participants (phone numbers, one per line, without +):</p>
+    <p>
+      <input name="participants" title="Participants" value="" emptyok="true" size="20" maxlength="200"/>
+    </p>
+
+    <p><small>Example: 393331234567</small></p>
+
+    <do type="accept" label="Create">
+      <go href="/wml/group.create.action.wml" method="post">
+        <postfield name="groupname" value="$(groupname)"/>
+        <postfield name="participants" value="$(participants)"/>
+      </go>
+    </do>
+
+    <p>
+      <a href="/wml/groups.wml" accesskey="0">[0] Cancel</a>
+    </p>
+  `;
+
+  sendWml(res, card("group-create", "Create Group", body));
+});
+
+// Group Create Action - Process group creation (NON-BLOCKING)
+app.post("/wml/group.create.action.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    const groupName = (req.body.groupname || "").trim();
+    const participantsStr = (req.body.participants || "").trim();
+
+    if (!groupName) throw new Error("Group name is required");
+    if (!participantsStr) throw new Error("At least one participant is required");
+
+    // Parse participants - non-blocking
+    const participantNumbers = participantsStr
+      .split(/[\n,;]+/)
+      .map(p => p.trim())
+      .filter(p => p.length > 0)
+      .map(p => formatJid(p));
+
+    if (participantNumbers.length === 0) {
+      throw new Error("No valid participants provided");
+    }
+
+    // Create group - async operation
+    const group = await sock.groupCreate(groupName, participantNumbers);
+
+    // Invalidate groups cache since we created a new group
+    groupsCache.invalidate();
+
+    const body = `
+      <p><b>Group Created!</b></p>
+      <p>Name: ${esc(groupName)}</p>
+      <p>Members: ${participantNumbers.length}</p>
+      <p>ID: ${esc(group.id.slice(-12))}...</p>
+
+      <p>
+        <a href="/wml/group.view.wml?gid=${encodeURIComponent(group.id)}" accesskey="1">[1] View Group</a><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(group.id)}&limit=15" accesskey="2">[2] Open Chat</a><br/>
+        <a href="/wml/groups.wml" accesskey="0">[0] All Groups</a>
+      </p>
+    `;
+
+    sendWml(res, card("group-created", "Success", body));
+  } catch (e) {
+    const body = `
+      <p><b>Error Creating Group</b></p>
+      <p>${esc(e.message || "Failed to create group")}</p>
+      <p>
+        <a href="/wml/group.create.wml">[Try Again]</a><br/>
+        <a href="/wml/groups.wml">[Back to Groups]</a>
+      </p>
+    `;
+    sendWml(res, card("error", "Error", body));
+  }
+});
+
+// Group Leave - Leave group (NON-BLOCKING)
+app.get("/wml/group.leave.wml", async (req, res) => {
+  try {
+    const gid = req.query.gid || "";
+    if (!gid) throw new Error("No group ID provided");
+
+    const confirmed = req.query.confirm === "yes";
+
+    if (!confirmed) {
+      // Show confirmation page
+      const metadata = await sock.groupMetadata(gid);
+      const groupName = metadata.subject || "Unnamed Group";
+
+      const body = `
+        <p><b>Leave Group?</b></p>
+        <p>Are you sure you want to leave:</p>
+        <p><b>${esc(groupName)}</b></p>
+
+        <p>
+          <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}&confirm=yes" accesskey="1">[1] Yes, Leave</a><br/>
+          <a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Cancel</a>
+        </p>
+      `;
+
+      sendWml(res, card("leave-confirm", "Confirm", body));
+    } else {
+      // Execute leave - non-blocking
+      await sock.groupLeave(gid);
+
+      // Invalidate groups cache since we left a group
+      groupsCache.invalidate();
+
+      const body = `
+        <p><b>Left Group</b></p>
+        <p>You have left the group successfully.</p>
+        <p>
+          <a href="/wml/groups.wml" accesskey="1">[1] All Groups</a><br/>
+          <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+        </p>
+      `;
+
+      sendWml(res, card("left", "Success", body));
+    }
+  } catch (e) {
+    const body = `
+      <p><b>Error</b></p>
+      <p>${esc(e.message || "Failed to leave group")}</p>
+      <p><a href="/wml/groups.wml">[Back to Groups]</a></p>
+    `;
+    sendWml(res, card("error", "Error", body));
+  }
+});
+
+// Status Broadcast - Main page for posting status updates (PRODUCTION-GRADE)
+app.get("/wml/status-broadcast.wml", (req, res) => {
+  const body = `
+    <p><b>Status Broadcast</b></p>
+    <p>Post updates to your WhatsApp Status (visible to all your contacts for 24 hours)</p>
+
+    <p><b>Select status type:</b></p>
+    <p>
+      <a href="/wml/status.text.wml" accesskey="1">[1] Text Status</a><br/>
+      <a href="/wml/status.image.wml" accesskey="2">[2] Image Status</a><br/>
+      <a href="/wml/status.video.wml" accesskey="3">[3] Video Status</a>
+    </p>
+
+    <p><b>Info:</b></p>
+    <p><small>Status updates disappear after 24 hours and are visible to all your contacts.</small></p>
+
+    <p>
+      <a href="/wml/home.wml" accesskey="0">[0] Home</a> |
+      <a href="/wml/menu.wml">[Menu]</a>
+    </p>
+
+    <do type="accept" label="Text">
+      <go href="/wml/status.text.wml"/>
+    </do>
+  `;
+
+  sendWml(res, card("status-broadcast", "Status", body));
+});
+
+// Status Text - Post text status (FAST, NON-BLOCKING)
+app.get("/wml/status.text.wml", (req, res) => {
+  const body = `
+    <p><b>Post Text Status</b></p>
+
+    <p>Enter your status message:</p>
+    <p>
+      <input name="text" title="Status Text" value="" emptyok="false" size="25" maxlength="700"/>
+    </p>
+
+    <p><small>Max 700 characters. Visible for 24 hours.</small></p>
+
+    <do type="accept" label="Post">
+      <go href="/wml/status.text.action.wml" method="post">
+        <postfield name="text" value="$(text)"/>
+      </go>
+    </do>
+
+    <p>
+      <a href="/wml/status-broadcast.wml" accesskey="0">[0] Back</a>
+    </p>
+  `;
+
+  sendWml(res, card("status-text", "Text Status", body));
+});
+
+// Status Text Action - Post text status (NON-BLOCKING, PRODUCTION-GRADE)
+app.post("/wml/status.text.action.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    const text = (req.body.text || "").trim();
+    if (!text) throw new Error("Status text cannot be empty");
+
+    // Post status - async, non-blocking
+    const result = await sock.sendMessage("status@broadcast", { text });
+
+    const body = `
+      <p><b>Status Posted!</b></p>
+      <p><small>Your status update has been broadcast to all your contacts.</small></p>
+
+      <p><b>Preview:</b></p>
+      <p>${esc(text.substring(0, 100))}${text.length > 100 ? "..." : ""}</p>
+
+      <p><small>ID: ${result?.key?.id?.slice(-8) || "Unknown"}</small></p>
+
+      <p>
+        <a href="/wml/status-broadcast.wml" accesskey="1">[1] Post Another</a><br/>
+        <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+      </p>
+    `;
+
+    sendWml(res, card("status-posted", "Success", body));
+  } catch (e) {
+    const body = `
+      <p><b>Error Posting Status</b></p>
+      <p>${esc(e.message || "Failed to post status")}</p>
+      <p>
+        <a href="/wml/status.text.wml">[Try Again]</a><br/>
+        <a href="/wml/status-broadcast.wml">[Back]</a>
+      </p>
+    `;
+    sendWml(res, card("error", "Error", body));
+  }
+});
+
+// Status Image - Post image status (NON-BLOCKING)
+app.get("/wml/status.image.wml", (req, res) => {
+  const body = `
+    <p><b>Post Image Status</b></p>
+
+    <p>Enter image URL:</p>
+    <p>
+      <input name="url" title="Image URL" value="" emptyok="false" size="30" maxlength="500"/>
+    </p>
+
+    <p>Optional caption:</p>
+    <p>
+      <input name="caption" title="Caption" value="" emptyok="true" size="25" maxlength="200"/>
+    </p>
+
+    <p><small>Image will be visible for 24 hours.</small></p>
+
+    <do type="accept" label="Post">
+      <go href="/wml/status.image.action.wml" method="post">
+        <postfield name="url" value="$(url)"/>
+        <postfield name="caption" value="$(caption)"/>
+      </go>
+    </do>
+
+    <p>
+      <a href="/wml/status-broadcast.wml" accesskey="0">[0] Back</a>
+    </p>
+  `;
+
+  sendWml(res, card("status-image", "Image Status", body));
+});
+
+// Status Image Action - Post image status (NON-BLOCKING, PRODUCTION-GRADE)
+app.post("/wml/status.image.action.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    const url = (req.body.url || "").trim();
+    const caption = (req.body.caption || "").trim();
+
+    if (!url) throw new Error("Image URL is required");
+
+    // Download image - async, non-blocking
+    const response = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 30000,
+    });
+
+    const imageBuffer = Buffer.from(response.data);
+
+    // Post status with image - async
+    const messageOptions = { image: imageBuffer };
+    if (caption) messageOptions.caption = caption;
+
+    const result = await sock.sendMessage("status@broadcast", messageOptions);
+
+    const body = `
+      <p><b>Image Status Posted!</b></p>
+      <p><small>Your image status has been broadcast to all your contacts.</small></p>
+
+      ${caption ? `<p><b>Caption:</b> ${esc(caption)}</p>` : ""}
+
+      <p><small>ID: ${result?.key?.id?.slice(-8) || "Unknown"}</small></p>
+
+      <p>
+        <a href="/wml/status-broadcast.wml" accesskey="1">[1] Post Another</a><br/>
+        <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+      </p>
+    `;
+
+    sendWml(res, card("status-posted", "Success", body));
+  } catch (e) {
+    const body = `
+      <p><b>Error Posting Image Status</b></p>
+      <p>${esc(e.message || "Failed to post image status")}</p>
+      <p>
+        <a href="/wml/status.image.wml">[Try Again]</a><br/>
+        <a href="/wml/status-broadcast.wml">[Back]</a>
+      </p>
+    `;
+    sendWml(res, card("error", "Error", body));
+  }
+});
+
+// Status Video - Post video status (NON-BLOCKING)
+app.get("/wml/status.video.wml", (req, res) => {
+  const body = `
+    <p><b>Post Video Status</b></p>
+
+    <p>Enter video URL:</p>
+    <p>
+      <input name="url" title="Video URL" value="" emptyok="false" size="30" maxlength="500"/>
+    </p>
+
+    <p>Optional caption:</p>
+    <p>
+      <input name="caption" title="Caption" value="" emptyok="true" size="25" maxlength="200"/>
+    </p>
+
+    <p><small>Video will be visible for 24 hours.</small></p>
+
+    <do type="accept" label="Post">
+      <go href="/wml/status.video.action.wml" method="post">
+        <postfield name="url" value="$(url)"/>
+        <postfield name="caption" value="$(caption)"/>
+      </go>
+    </do>
+
+    <p>
+      <a href="/wml/status-broadcast.wml" accesskey="0">[0] Back</a>
+    </p>
+  `;
+
+  sendWml(res, card("status-video", "Video Status", body));
+});
+
+// Status Video Action - Post video status (NON-BLOCKING, PRODUCTION-GRADE)
+app.post("/wml/status.video.action.wml", async (req, res) => {
+  try {
+    if (!sock) throw new Error("Not connected");
+
+    const url = (req.body.url || "").trim();
+    const caption = (req.body.caption || "").trim();
+
+    if (!url) throw new Error("Video URL is required");
+
+    // Download video - async, non-blocking
+    const response = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 60000, // 60 seconds for larger videos
+    });
+
+    const videoBuffer = Buffer.from(response.data);
+
+    // Post status with video - async
+    const messageOptions = { video: videoBuffer };
+    if (caption) messageOptions.caption = caption;
+
+    const result = await sock.sendMessage("status@broadcast", messageOptions);
+
+    const body = `
+      <p><b>Video Status Posted!</b></p>
+      <p><small>Your video status has been broadcast to all your contacts.</small></p>
+
+      ${caption ? `<p><b>Caption:</b> ${esc(caption)}</p>` : ""}
+
+      <p><small>ID: ${result?.key?.id?.slice(-8) || "Unknown"}</small></p>
+
+      <p>
+        <a href="/wml/status-broadcast.wml" accesskey="1">[1] Post Another</a><br/>
+        <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+      </p>
+    `;
+
+    sendWml(res, card("status-posted", "Success", body));
+  } catch (e) {
+    const body = `
+      <p><b>Error Posting Video Status</b></p>
+      <p>${esc(e.message || "Failed to post video status")}</p>
+      <p>
+        <a href="/wml/status.video.wml">[Try Again]</a><br/>
+        <a href="/wml/status-broadcast.wml">[Back]</a>
+      </p>
+    `;
+    sendWml(res, card("error", "Error", body));
   }
 });
 
