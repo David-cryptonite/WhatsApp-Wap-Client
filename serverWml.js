@@ -769,6 +769,27 @@ const wmlLimiter = rateLimit({
 app.use("/api", apiLimiter);
 app.use("/wml", wmlLimiter);
 
+// ============ AUTHENTICATION MIDDLEWARE ============
+// Protect all WML pages - redirect to QR if not logged in
+app.use("/wml", (req, res, next) => {
+  // Allow access to QR code page and logout page without authentication
+  const publicPages = ['/wml/qr.wml', '/wml/qr-display.wml', '/wml/logout.wml'];
+
+  if (publicPages.includes(req.path)) {
+    return next();
+  }
+
+  // Check if WhatsApp is connected
+  const isConnected = !!sock?.authState?.creds && connectionState === 'open';
+
+  if (!isConnected) {
+    // Redirect to QR code page
+    return res.redirect('/wml/qr.wml');
+  }
+
+  next();
+});
+
 // 5. LOGGING - Production-grade Winston logger
 const logger = winston.createLogger({
   level: isDev ? "debug" : "info",
@@ -1049,10 +1070,10 @@ function sendWml(res, cards, scripts = "") {
   res.send(encodedBuffer);
 }
 
-function card(id, title, inner, ontimer = null) {
+function card(id, title, inner, ontimer = null, scripts = '') {
   const timerAttr = ontimer ? ` ontimer="${ontimer}"` : "";
   return `<card id="${esc(id)}" title="${esc(title)}"${timerAttr}>
-   
+    ${scripts}
     ${inner}
   </card>`;
 }
@@ -1504,27 +1525,34 @@ app.get("/wml/status.wml", (req, res) => {
 
 // Enhanced QR Code page
 app.get("/wml/qr.wml", (req, res) => {
-  const body = currentQR
+  const isConnected = !!sock?.authState?.creds && connectionState === 'open';
+
+  const body = isConnected
     ? `
-    
-      <p><b>QR Code Available</b></p>
-      <p>Scan with WhatsApp:</p>
-      <p><img src="/api/qr/image?format=wbmp" alt="QR Code" localscr="qr.wbmp"/></p>
-      <p><small>Auto-refreshes every 30 seconds</small></p>
-      
-      <p><b>QR Formats:</b></p>
-  <p>
-  <a href="/api/qr/image?format=png">[PNG]</a> 
-  <a href="/api/qr/text">[Text]</a> |
-  <a href="/api/qr/image?format=wbmp">[WBMP]</a> 
-  <a href="/api/qr/wml-wbmp">[WML+WBMP]</a>
-</p>
+      <p><b>✓ WhatsApp Connected!</b></p>
+      <p>You are now logged in.</p>
+      <p>
+        <a href="/wml/home.wml" accesskey="1">[1] Go to Home</a>
+      </p>
+    `
+    : currentQR
+    ? `
+      <p><b>Scan QR Code</b></p>
+      <p>1. Open WhatsApp on your phone</p>
+      <p>2. Tap Menu → Linked Devices</p>
+      <p>3. Tap "Link a Device"</p>
+      <p>4. Scan this QR code:</p>
+
+      <p><img src="/api/qr/image?format=png" alt="QR Code"/></p>
+
+      <p><small>Status: ${esc(connectionState)}</small></p>
+      <p><small>Auto-refresh in 15s...</small></p>
     `
     : `
-   
-      <p><b>QR Code Not Available</b></p>
+      <p><b>Connecting to WhatsApp...</b></p>
       <p>Status: ${esc(connectionState)}</p>
-      <p>Please wait or check connection...</p>
+      <p>QR code will appear shortly.</p>
+      <p><small>Please wait...</small></p>
     `;
 
   const body_full = `
@@ -1535,7 +1563,15 @@ app.get("/wml/qr.wml", (req, res) => {
     </do>
   `;
 
-  sendWml(res, card("qr", "QR Code", body_full, "/wml/qr.wml"));
+  // Add auto-refresh when not connected (every 15 seconds)
+  const autoRefreshScript = !isConnected ? `
+    <ontimer>
+      <go href="/wml/qr.wml"/>
+    </ontimer>
+    <timer value="150"/>
+  ` : '';
+
+  sendWml(res, card("qr", "QR Code", body_full, null, autoRefreshScript));
 });
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
@@ -8152,11 +8188,33 @@ app.get("/api/qr/image", async (req, res) => {
   const { format = "png" } = req.query;
 
   if (!currentQR) {
-    return res.status(404).json({
-      error: "QR code not available",
-      connected: !!sock?.authState?.creds,
-      status: connectionState,
-    });
+    // Return a placeholder image instead of JSON to prevent "unknown response" errors
+    const placeholderText = `No QR Code\nStatus: ${connectionState}\nPlease wait...`;
+
+    try {
+      // Generate a simple text-based QR placeholder
+      const qrBuffer = await QRCode.toBuffer(placeholderText, {
+        type: "png",
+        width: 256,
+        margin: 2,
+        color: {
+          dark: "#666666",
+          light: "#FFFFFF",
+        },
+      });
+
+      res.setHeader("Content-Type", format === "wbmp" ? "image/vnd.wap.wbmp" : "image/png");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(qrBuffer);
+    } catch (err) {
+      // Ultimate fallback: 1x1 transparent PNG
+      const transparentPng = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        "base64"
+      );
+      res.setHeader("Content-Type", "image/png");
+      return res.send(transparentPng);
+    }
   }
 
   try {
