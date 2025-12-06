@@ -785,20 +785,8 @@ app.use("/wml", (req, res, next) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
   if (!isConnected) {
-    // WAP 1.0 compatible redirect - use anchor element
-    const wmlRedirect = `<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
-<wml>
-  <card id="redirect" title="Login">
-    <p>Login required</p>
-    <p>
-      <a href="/wml/qr.wml">QR Code</a>
-    </p>
-  </card>
-</wml>`;
-
-    res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=utf-8');
-    return res.send(wmlRedirect);
+    // Redirect directly to QR page - no intermediate page
+    return res.redirect(302, '/wml/qr.wml');
   }
 
   next();
