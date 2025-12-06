@@ -1705,26 +1705,69 @@ app.get("/wml/help.wml", (req, res) => {
 
 // ============ FAVORITES PAGE ============
 app.get("/wml/favorites.wml", (req, res) => {
-  let body = '<p><b>Favorite Contacts</b></p>';
+  let body = '<p><b>Favorites</b></p>';
 
   if (userSettings.favorites.length === 0) {
     body += `<p>No favorites yet.<br/>
-    Add contacts from their<br/>
-    profile or chat page.</p>
-    <p><a href="/wml/contacts.wml">[Add from Contacts]</a></p>`;
+    Add contacts and groups from their info pages.</p>
+    <p>
+      <a href="/wml/contacts.wml">[Contacts]</a> |
+      <a href="/wml/groups.wml">[Groups]</a>
+    </p>`;
   } else {
-    body += `<p>${userSettings.favorites.length} favorites:</p>`;
+    // Separate contacts and groups
+    const contactFavs = [];
+    const groupFavs = [];
+
     for (const jid of userSettings.favorites) {
-      const contact = contactStore.get(jid);
-      const name = contact?.name || contact?.notify || jidFriendly(jid);
-      body += `<p>
-        <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${esc(name)}</a><br/>
-        <a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}">[Remove]</a>
-      </p>`;
+      if (jid.endsWith('@g.us')) {
+        groupFavs.push(jid);
+      } else {
+        contactFavs.push(jid);
+      }
+    }
+
+    body += `<p>Total: ${userSettings.favorites.length} (${contactFavs.length} contacts, ${groupFavs.length} groups)</p>`;
+
+    // Show contacts
+    if (contactFavs.length > 0) {
+      body += '<p><b>Contacts:</b></p>';
+      for (let i = 0; i < contactFavs.length; i++) {
+        const jid = contactFavs[i];
+        const contact = contactStore.get(jid);
+        const name = contact?.name || contact?.notify || jidFriendly(jid);
+        const accessKey = i < 9 ? ` accesskey="${i + 1}"` : '';
+        body += `<p>
+          <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}"${accessKey}>${i < 9 ? `[${i + 1}] ` : ''}${esc(name)}</a><br/>
+          <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}">[Info]</a> |
+          <a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}">[Remove]</a>
+        </p>`;
+      }
+    }
+
+    // Show groups
+    if (groupFavs.length > 0) {
+      body += '<p><b>Groups:</b></p>';
+      for (const jid of groupFavs) {
+        const contact = contactStore.get(jid);
+        const name = contact?.name || contact?.subject || jidFriendly(jid);
+        body += `<p>
+          <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${esc(name)}</a><br/>
+          <a href="/wml/group.view.wml?gid=${encodeURIComponent(jid)}">[Info]</a> |
+          <a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}">[Remove]</a>
+        </p>`;
+      }
     }
   }
 
-  body += '<p><a href="/wml/home.wml" accesskey="0">[0] Home</a></p>';
+  body += `
+    <p><b>Actions:</b></p>
+    <p>
+      <a href="/wml/contacts.wml">[Browse Contacts]</a><br/>
+      <a href="/wml/groups.wml">[Browse Groups]</a>
+    </p>
+    <p><a href="/wml/home.wml" accesskey="0">[0] Home</a></p>
+  `;
 
   sendWml(res, card("favorites", "Favorites", body));
 });
@@ -1732,37 +1775,62 @@ app.get("/wml/favorites.wml", (req, res) => {
 // Remove from favorites
 app.get("/wml/favorites-remove.wml", (req, res) => {
   const jid = req.query.jid;
+  const back = req.query.back || "favorites";
+
   if (jid) {
     removeFavorite(jid);
   }
-  res.redirect("/wml/favorites.wml");
+
+  // Smart redirect based on 'back' parameter
+  const redirectMap = {
+    contact: `/wml/contact.wml?jid=${encodeURIComponent(jid)}`,
+    group: `/wml/group.view.wml?gid=${encodeURIComponent(jid)}`,
+    chat: `/wml/chat.wml?jid=${encodeURIComponent(jid)}`,
+    favorites: "/wml/favorites.wml"
+  };
+
+  res.redirect(redirectMap[back] || "/wml/favorites.wml");
 });
 
 // Add to favorites
 app.get("/wml/favorites-add.wml", (req, res) => {
   const jid = req.query.jid;
+  const back = req.query.back || "chat";
   let message = "Error";
   let linkBack = "/wml/contacts.wml";
 
   if (jid) {
+    const isGroup = jid.endsWith('@g.us');
+
     if (addFavorite(jid)) {
       const contact = contactStore.get(jid);
-      const name = contact?.name || contact?.notify || jidFriendly(jid);
-      message = `Added ${esc(name)} to favorites!`;
-      linkBack = `/wml/chat.wml?jid=${encodeURIComponent(jid)}`;
+      const name = contact?.name || contact?.notify || contact?.subject || jidFriendly(jid);
+      message = `${esc(name)} added to favorites!`;
+
+      // Smart back link based on context
+      if (back === "contact") {
+        linkBack = `/wml/contact.wml?jid=${encodeURIComponent(jid)}`;
+      } else if (back === "group") {
+        linkBack = `/wml/group.view.wml?gid=${encodeURIComponent(jid)}`;
+      } else if (back === "chat") {
+        linkBack = `/wml/chat.wml?jid=${encodeURIComponent(jid)}`;
+      }
     } else {
       message = "Already in favorites";
+      linkBack = `/wml/favorites.wml`;
     }
   }
 
   const body = `
     <p><b>${message}</b></p>
-    <p><a href="${linkBack}" accesskey="1">[1] Back</a><br/>
-    <a href="/wml/favorites.wml" accesskey="2">[2] View Favorites</a><br/>
-    <a href="/wml/home.wml" accesskey="0">[0] Home</a></p>
+    <p>
+      <a href="${linkBack}" accesskey="1">[1] Back</a><br/>
+      <a href="/wml/favorites.wml" accesskey="2">[2] View Favorites</a><br/>
+      <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+    </p>
   `;
 
-  sendWml(res, card("fav-add", "Favorite Added", body));
+  sendWml(res, card("fav-add", "Success", body));
 });
 
 // Enhanced Contacts with search and pagination
@@ -1991,6 +2059,15 @@ app.get("/wml/contact.wml", async (req, res) => {
         <a href="/wml/send-quick.wml?to=${encodeURIComponent(
           jid
         )}" accesskey="5">[5] Send Message</a><br/>
+        ${
+          isFavorite(jid)
+            ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(
+                jid
+              )}&back=contact" accesskey="6">[6] Remove from Favorites</a><br/>`
+            : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(
+                jid
+              )}&back=contact" accesskey="6">[6] Add to Favorites</a><br/>`
+        }
         <a href="/wml/block.wml?jid=${encodeURIComponent(
           jid
         )}" accesskey="7">[7] Block</a><br/>
@@ -2804,10 +2881,15 @@ app.get("/wml/chat.wml", async (req, res) => {
      <p>Showing 5 messages per page (most recent first)</p>`;
 
   // Quick actions adapted to device
+  const favoriteLink = isFavorite(jid)
+    ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}&back=chat" accesskey="5">${isOldNokia ? '5-Unfav' : '[5] Remove Favorite'}</a>`
+    : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(jid)}&back=chat" accesskey="5">${isOldNokia ? '5-Fav' : '[5] Add to Favorites'}</a>`;
+
   const quickActions = isOldNokia
     ? `<p><a href="/wml/send-quick.wml?to=${encodeURIComponent(
         jid
       )}" accesskey="1">1-Send</a></p>
+     <p>${favoriteLink}</p>
      <p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
     : `<p><b>Quick Actions:</b></p>
      <p>
@@ -2827,6 +2909,8 @@ app.get("/wml/chat.wml", async (req, res) => {
            ? ` | <a href="wtai://wp/ms;${number};">[SMS]</a>`
            : ""
        }
+       <br/>
+       ${favoriteLink}
      </p>
      <p>
        <a href="/wml/chats.wml" accesskey="0">[0] Back to Chats</a> |
@@ -5908,6 +5992,11 @@ app.get("/wml/group.view.wml", async (req, res) => {
       <p>
         <a href="/wml/chat.wml?jid=${encodeURIComponent(gid)}&limit=15" accesskey="1">[1] Open Chat</a><br/>
         <a href="/wml/send-quick.wml?to=${encodeURIComponent(gid)}" accesskey="2">[2] Send Message</a><br/>
+        ${
+          isFavorite(gid)
+            ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(gid)}&back=group" accesskey="3">[3] Remove from Favorites</a><br/>`
+            : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(gid)}&back=group" accesskey="3">[3] Add to Favorites</a><br/>`
+        }
         <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Leave Group</a>
       </p>
 
