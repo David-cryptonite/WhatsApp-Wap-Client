@@ -192,4 +192,6 @@ class PersistentStorage {
   }
 }
 
+// ESM export - use both named and default for compatibility
+export { PersistentStorage };
 export default PersistentStorage;
