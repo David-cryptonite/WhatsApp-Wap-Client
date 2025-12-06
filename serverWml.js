@@ -785,14 +785,13 @@ app.use("/wml", (req, res, next) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
   if (!isConnected) {
-    // Instant WML redirect (no intermediate page shown)
+    // WML redirect using timer (more compatible with old WAP browsers)
     const wmlRedirect = `<?xml version="1.0"?>
 <!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>
-  <card id="redirect" title="Redirecting...">
-    <onevent type="onenterforward">
-      <go href="/wml/qr.wml"/>
-    </onevent>
+  <card id="redirect" title="Redirecting..." ontimer="/wml/qr.wml">
+    <timer value="1"/>
+    <p>Redirecting to login...</p>
   </card>
 </wml>`;
 
