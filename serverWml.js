@@ -785,16 +785,15 @@ app.use("/wml", (req, res, next) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
   if (!isConnected) {
-    // WAP 1.0 compatible redirect - simple link with auto-accept
+    // WAP 1.0 compatible redirect - use anchor element
     const wmlRedirect = `<?xml version="1.0"?>
 <!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
 <wml>
-  <card id="redirect" title="Login Required">
-    <do type="accept" label="Login">
-      <go href="/wml/qr.wml"/>
-    </do>
+  <card id="redirect" title="Login">
     <p>Login required</p>
-    <p><a href="/wml/qr.wml">Go to QR Code</a></p>
+    <p>
+      <a href="/wml/qr.wml">QR Code</a>
+    </p>
   </card>
 </wml>`;
 
