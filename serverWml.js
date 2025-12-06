@@ -785,13 +785,16 @@ app.use("/wml", (req, res, next) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
   if (!isConnected) {
-    // WML redirect using timer (more compatible with old WAP browsers)
+    // WAP 1.0 compatible redirect - simple link with auto-accept
     const wmlRedirect = `<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
 <wml>
-  <card id="redirect" title="Redirecting..." ontimer="/wml/qr.wml">
-    <timer value="1"/>
-    <p>Redirecting to login...</p>
+  <card id="redirect" title="Login Required">
+    <do type="accept" label="Login">
+      <go href="/wml/qr.wml"/>
+    </do>
+    <p>Login required</p>
+    <p><a href="/wml/qr.wml">Go to QR Code</a></p>
   </card>
 </wml>`;
 
@@ -1061,7 +1064,7 @@ function wmlDoc(cards, scripts = "") {
     ? `<head><meta http-equiv="Cache-Control" content="max-age=0"/>${scripts}</head>`
     : '<head><meta http-equiv="Cache-Control" content="max-age=0"/></head>';
   return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
 <wml>${head}${cards}</wml>`;
 }
 
