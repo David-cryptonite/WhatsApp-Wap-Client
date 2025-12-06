@@ -892,11 +892,11 @@ class ProductionCache {
   }
 }
 
-// Initialize caches with Raspberry Pi-friendly limits
-const groupsCache = new ProductionCache(30, 60000); // 30 groups, 60s TTL (Raspberry Pi optimized)
-const contactsCache = new ProductionCache(200, 300000); // 200 contacts, 5min TTL (Raspberry Pi optimized)
-const chatsCache = new ProductionCache(50, 120000); // 50 chats, 2min TTL (Raspberry Pi optimized)
-const messagesCache = new ProductionCache(300, 60000); // 300 messages, 60s TTL (Raspberry Pi optimized)
+// Initialize caches optimized for 4GB Raspberry Pi 4
+const groupsCache = new ProductionCache(100, 120000); // 100 groups, 2min TTL (4GB RAM optimized)
+const contactsCache = new ProductionCache(1000, 600000); // 1000 contacts, 10min TTL (4GB RAM optimized)
+const chatsCache = new ProductionCache(200, 300000); // 200 chats, 5min TTL (4GB RAM optimized)
+const messagesCache = new ProductionCache(2000, 120000); // 2000 messages, 2min TTL (4GB RAM optimized)
 
 // ============ USER SETTINGS & FAVORITES ============
 // Load user settings with defaults
@@ -7416,7 +7416,7 @@ async function connectWithBetterSync() {
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
       let newMessagesCount = 0;
-      const MAX_MESSAGES_PER_CHAT = 300; // Raspberry Pi memory limit
+      const MAX_MESSAGES_PER_CHAT = 1000; // 4GB RAM - can store many more messages
 
       for (const message of messages) {
         // Changed from 'msg' to 'message' to avoid conflicts
@@ -7431,7 +7431,7 @@ async function connectWithBetterSync() {
           const chatMessages = chatStore.get(chatId);
           chatMessages.push(message);
 
-          // Prevent memory exhaustion on Raspberry Pi
+          // Prevent memory exhaustion (generous limit for 4GB RAM)
           if (chatMessages.length > MAX_MESSAGES_PER_CHAT) {
             const oldMsg = chatMessages.shift(); // Remove oldest message
             if (oldMsg.key?.id) {
@@ -7691,10 +7691,10 @@ if (cluster.isMaster || cluster.isPrimary) {
 
         logger.info(`Memory usage: ${heapUsedMB.toFixed(2)}MB / ${heapTotalMB.toFixed(2)}MB (${heapPercent.toFixed(1)}%)`);
 
-        // Only cleanup if memory usage exceeds 75% on Raspberry Pi
-        if (heapPercent > 75) {
+        // Only cleanup if memory usage exceeds 85% (4GB RAM can handle more)
+        if (heapPercent > 85) {
           logger.warn(`High memory usage detected (${heapPercent.toFixed(1)}%), running cleanup...`);
-          storage.cleanupOldMessages(messageStore, chatStore, 200); // Keep 200 messages per chat
+          storage.cleanupOldMessages(messageStore, chatStore, 500); // Keep 500 messages per chat (4GB RAM)
 
           // Force garbage collection if available
           if (global.gc) {
@@ -7702,7 +7702,7 @@ if (cluster.isMaster || cluster.isPrimary) {
             logger.info('Garbage collection forced');
           }
         }
-      }, 5 * 60 * 1000); // Check every 5 minutes
+      }, 10 * 60 * 1000); // Check every 10 minutes (less frequent for 4GB system)
 
       // Periodic save - increased interval to reduce Raspberry Pi I/O load
       setInterval(() => {
