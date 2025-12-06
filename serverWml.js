@@ -2262,10 +2262,10 @@ app.get("/wml/contact.wml", async (req, res) => {
           isFavorite(jid)
             ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(
                 jid
-              )}&back=contact" accesskey="6">[6] Remove from Favorites</a><br/>`
+              )}&amp;back=contact" accesskey="6">[6] Remove from Favorites</a><br/>`
             : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(
                 jid
-              )}&back=contact" accesskey="6">[6] Add to Favorites</a><br/>`
+              )}&amp;back=contact" accesskey="6">[6] Add to Favorites</a><br/>`
         }
         <a href="/wml/block.wml?jid=${encodeURIComponent(
           jid
@@ -3081,8 +3081,8 @@ app.get("/wml/chat.wml", async (req, res) => {
 
   // Quick actions adapted to device
   const favoriteLink = isFavorite(jid)
-    ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}&back=chat" accesskey="5">${isOldNokia ? '5-Unfav' : '[5] Remove Favorite'}</a>`
-    : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(jid)}&back=chat" accesskey="5">${isOldNokia ? '5-Fav' : '[5] Add to Favorites'}</a>`;
+    ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(jid)}&amp;back=chat" accesskey="5">${isOldNokia ? '5-Unfav' : '[5] Remove Favorite'}</a>`
+    : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(jid)}&amp;back=chat" accesskey="5">${isOldNokia ? '5-Fav' : '[5] Add to Favorites'}</a>`;
 
   const quickActions = isOldNokia
     ? `<p><a href="/wml/send-quick.wml?to=${encodeURIComponent(
@@ -5860,10 +5860,10 @@ app.get("/wml/groups.search.wml", async (req, res) => {
     if (page > 1) {
       paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
         query
-      )}&page=1">[First]</a> `;
+      )}&amp;page=1">[First]</a> `;
       paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
         query
-      )}&page=${page - 1}">[&lt;]</a> `;
+      )}&amp;page=${page - 1}">[&lt;]</a> `;
     }
 
     const startPage = Math.max(1, page - 2);
@@ -5875,17 +5875,17 @@ app.get("/wml/groups.search.wml", async (req, res) => {
       } else {
         paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
           query
-        )}&page=${i}">[${i}]</a> `;
+        )}&amp;page=${i}">[${i}]</a> `;
       }
     }
 
     if (page < totalPages) {
       paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
         query
-      )}&page=${page + 1}">[&gt;]</a> `;
+      )}&amp;page=${page + 1}">[&gt;]</a> `;
       paginationControls += `<a href="/wml/groups.search.wml?q=${encodeURIComponent(
         query
-      )}&page=${totalPages}">[Last]</a>`;
+      )}&amp;page=${totalPages}">[Last]</a>`;
     }
 
     paginationControls += `<br/><small>Page ${page} of ${totalPages} (${totalGroups} results)</small></p>`;
@@ -6152,11 +6152,11 @@ app.get("/wml/group.view.wml", async (req, res) => {
     if (totalPages > 1) {
       paginationControls = "<p><b>Pages:</b> ";
       if (page > 1) {
-        paginationControls += `<a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}&page=${page - 1}">[&lt;]</a> `;
+        paginationControls += `<a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}&amp;page=${page - 1}">[&lt;]</a> `;
       }
       paginationControls += `<b>[${page}/${totalPages}]</b> `;
       if (page < totalPages) {
-        paginationControls += `<a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}&page=${page + 1}">[&gt;]</a>`;
+        paginationControls += `<a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}&amp;page=${page + 1}">[&gt;]</a>`;
       }
       paginationControls += "</p>";
     }
@@ -6189,12 +6189,12 @@ app.get("/wml/group.view.wml", async (req, res) => {
 
       <p><b>Actions:</b></p>
       <p>
-        <a href="/wml/chat.wml?jid=${encodeURIComponent(gid)}&limit=15" accesskey="1">[1] Open Chat</a><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(gid)}&amp;limit=15" accesskey="1">[1] Open Chat</a><br/>
         <a href="/wml/send-quick.wml?to=${encodeURIComponent(gid)}" accesskey="2">[2] Send Message</a><br/>
         ${
           isFavorite(gid)
-            ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(gid)}&back=group" accesskey="3">[3] Remove from Favorites</a><br/>`
-            : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(gid)}&back=group" accesskey="3">[3] Add to Favorites</a><br/>`
+            ? `<a href="/wml/favorites-remove.wml?jid=${encodeURIComponent(gid)}&amp;back=group" accesskey="3">[3] Remove from Favorites</a><br/>`
+            : `<a href="/wml/favorites-add.wml?jid=${encodeURIComponent(gid)}&amp;back=group" accesskey="3">[3] Add to Favorites</a><br/>`
         }
         <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Leave Group</a>
       </p>
@@ -6302,7 +6302,7 @@ app.post("/wml/group.create.action.wml", async (req, res) => {
 
       <p>
         <a href="/wml/group.view.wml?gid=${encodeURIComponent(group.id)}" accesskey="1">[1] View Group</a><br/>
-        <a href="/wml/chat.wml?jid=${encodeURIComponent(group.id)}&limit=15" accesskey="2">[2] Open Chat</a><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(group.id)}&amp;limit=15" accesskey="2">[2] Open Chat</a><br/>
         <a href="/wml/groups.wml" accesskey="0">[0] All Groups</a>
       </p>
     `;
@@ -6340,7 +6340,7 @@ app.get("/wml/group.leave.wml", async (req, res) => {
         <p><b>${esc(groupName)}</b></p>
 
         <p>
-          <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}&confirm=yes" accesskey="1">[1] Yes, Leave</a><br/>
+          <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}&amp;confirm=yes" accesskey="1">[1] Yes, Leave</a><br/>
           <a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Cancel</a>
         </p>
       `;
