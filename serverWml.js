@@ -7647,14 +7647,27 @@ app.get("/api/metrics", (req, res) => {
   res.json(metrics);
 });
 
-// Multi-core clustering for maximum performance
-// Uses all available CPU cores for load balancing
+// ============ SMART WORKER CLUSTERING ============
+// Workers are only needed for CPU-intensive tasks (TTS, media conversion, etc.)
+// For simple HTTP requests, 2 workers is optimal for Raspberry Pi 4
+//
+// WHEN TO INCREASE WORKERS:
+// - Add TTS/speech-to-speech processing → 3-4 workers
+// - Add image/video conversion → 3-4 workers
+// - Add AI/ML processing → 4+ workers
+// - High HTTP traffic (>1000 req/min) → 3-4 workers
+//
+// DEFAULT: 2 workers (Worker #1 = WhatsApp + tasks, Worker #2 = HTTP backup)
 if (cluster.isMaster || cluster.isPrimary) {
   const numCPUs = os.cpus().length;
-  const workers = process.env.WEB_CONCURRENCY || Math.max(2, numCPUs);
+
+  // Use 2 workers by default (optimal for current workload)
+  // Override with WEB_CONCURRENCY env var for heavy tasks
+  const workers = process.env.WEB_CONCURRENCY || 2;
 
   logger.info(`🚀 Master process ${process.pid} starting`);
   logger.info(`💪 Spawning ${workers} worker processes (${numCPUs} CPUs available)`);
+  logger.info(`ℹ️  Using ${workers} workers - increase WEB_CONCURRENCY env var for heavy tasks (TTS, media conversion)`);
 
   // Fork workers
   for (let i = 0; i < workers; i++) {
@@ -7718,6 +7731,7 @@ if (cluster.isMaster || cluster.isPrimary) {
     } else {
       // Other workers don't connect to WhatsApp, they just handle HTTP requests
       logger.info(`📡 Worker #${cluster.worker.id} - Handling HTTP requests only (WhatsApp handled by Worker #1)`);
+      logger.info(`💡 Worker #${cluster.worker.id} - Ready for heavy tasks (TTS, media conversion, AI processing)`);
     }
   });
 
