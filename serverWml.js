@@ -11724,7 +11724,7 @@ app.get("/wml/chats.search.wml", async (req, res) => {
 });
 
 // Chat search results
-app.get("/wml/chats.results.wml", (req, res) => {
+app.get("/wml/chats.results.wml", async (req, res) => {
   const q = String(req.query.q || "").trim();
   const chatType = req.query.type || "all";
   const sortBy = req.query.sort || "recent";
