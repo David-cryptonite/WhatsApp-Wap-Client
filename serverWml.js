@@ -1616,38 +1616,45 @@ app.get("/wml/status.wml", (req, res) => {
 
 // Enhanced QR Code page
 app.get("/wml/qr.wml", (req, res) => {
-  const body = currentQR
+  const isConnected = !!sock?.authState?.creds && connectionState === 'open';
+
+  const body = isConnected
     ? `
-    
-      <p><b>QR Code Available</b></p>
-      <p>Scan with WhatsApp:</p>
-      <p><img src="/api/qr/image?format=wbmp" alt="QR Code" localscr="qr.wbmp"/></p>
-      <p><small>Auto-refreshes every 30 seconds</small></p>
-      
-      <p><b>QR Formats:</b></p>
-  <p>
-  <a href="/api/qr/image?format=png">[PNG]</a> 
-  <a href="/api/qr/text">[Text]</a> |
-  <a href="/api/qr/image?format=wbmp">[WBMP]</a> 
-  <a href="/api/qr/wml-wbmp">[WML+WBMP]</a>
-</p>
+      <p>WhatsApp Connected</p>
+      <p>You are logged in</p>
+      <p>
+        <a href="/wml/home.wml">Go to Home</a>
+      </p>
+    `
+    : currentQR
+    ? `
+      <p>Scan QR Code</p>
+      <p>1. Open WhatsApp</p>
+      <p>2. Menu - Linked Devices</p>
+      <p>3. Link a Device</p>
+      <p>4. Scan QR:</p>
+      <p>
+        <img src="/api/qr/image?format=wbmp"/>
+      </p>
+      <p>Status: ${esc(connectionState)}</p>
+      <p>Press OK to refresh</p>
     `
     : `
-   
-      <p><b>QR Code Not Available</b></p>
+      <p>Connecting...</p>
       <p>Status: ${esc(connectionState)}</p>
-      <p>Please wait or check connection...</p>
+      <p>QR code loading</p>
+      <p>Please wait</p>
     `;
 
   const body_full = `
     ${body}
-    ${navigationBar()}
+    <p>Port ${port}</p>
     <do type="accept" label="Refresh">
       <go href="/wml/qr.wml"/>
     </do>
   `;
 
-  sendWml(res, card("qr", "QR Code", body_full, "/wml/qr.wml"));
+  sendWml(res, card("qr", "QR Code", body_full));
 });
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
