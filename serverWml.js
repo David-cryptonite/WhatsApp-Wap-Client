@@ -1094,6 +1094,66 @@ function jidFriendly(jid = "") {
   return jid;
 }
 
+// Get contact or group name with multiple fallbacks
+async function getContactName(jid, sock) {
+  if (!jid) return "Unknown";
+
+  const isGroup = jid.endsWith("@g.us");
+
+  // Try to get from contactStore first (cached)
+  const contact = contactStore.get(jid);
+
+  if (isGroup) {
+    // For groups, try multiple sources
+    if (contact?.subject) return contact.subject;
+    if (contact?.name) return contact.name;
+
+    // Try to fetch group metadata if sock is available
+    if (sock) {
+      try {
+        const groupMetadata = await sock.groupMetadata(jid);
+        if (groupMetadata?.subject) {
+          // Cache it
+          contactStore.set(jid, { ...contact, subject: groupMetadata.subject });
+          return groupMetadata.subject;
+        }
+      } catch (error) {
+        // Silently fail, use fallback
+      }
+    }
+
+    // Fallback for groups
+    const groupId = jid.replace("@g.us", "");
+    return `Group ${groupId.slice(-8)}`;
+  } else {
+    // For individual contacts
+    if (contact?.name) return contact.name;
+    if (contact?.notify) return contact.notify;
+    if (contact?.verifiedName) return contact.verifiedName;
+    if (contact?.pushName) return contact.pushName;
+
+    // Try to get from WhatsApp if sock is available
+    if (sock) {
+      try {
+        const [result] = await sock.onWhatsApp(jid);
+        if (result?.exists) {
+          const name = result.name || result.notify;
+          if (name) {
+            // Cache it
+            contactStore.set(jid, { ...contact, name: name });
+            return name;
+          }
+        }
+      } catch (error) {
+        // Silently fail, use fallback
+      }
+    }
+
+    // Fallback to formatted phone number
+    return jidFriendly(jid);
+  }
+}
+
 function parseList(str = "") {
   return String(str)
     .split(/[,;\s]+/)
@@ -2757,12 +2817,8 @@ app.get("/wml/chat.wml", async (req, res) => {
   const totalMessages = allMessages.length;
   const items = allMessages.slice(offset, offset + limit);
 
-  const contact = contactStore.get(jid);
-  const chatName =
-    contact?.name ||
-    contact?.notify ||
-    contact?.verifiedName ||
-    jidFriendly(jid);
+  // Use getContactName for better name resolution
+  const chatName = await getContactName(jid, sock);
   const number = jidFriendly(jid);
   const isGroup = jid.endsWith("@g.us");
 
@@ -11294,23 +11350,19 @@ app.get("/wml/chats.wml", async (req, res) => {
 
   // Replace your entire chat processing section with this:
 
-  let chats = Array.from(chatStore.keys()).map((chatId) => {
-    const messages = chatStore.get(chatId) || [];
-    const lastMessage =
-      messages.length > 0 ? messages[messages.length - 1] : null;
-    const contact = contactStore.get(chatId);
+  let chats = await Promise.all(
+    Array.from(chatStore.keys()).map(async (chatId) => {
+      const messages = chatStore.get(chatId) || [];
+      const lastMessage =
+        messages.length > 0 ? messages[messages.length - 1] : null;
 
-    const isGroup = chatId.endsWith("@g.us");
-    const phoneNumber = chatId
-      .replace("@s.whatsapp.net", "")
-      .replace("@g.us", "");
+      const isGroup = chatId.endsWith("@g.us");
+      const phoneNumber = chatId
+        .replace("@s.whatsapp.net", "")
+        .replace("@g.us", "");
 
-    const chatName = isGroup
-      ? contact?.subject || `Group ${phoneNumber.slice(-8)}`
-      : contact?.name ||
-        contact?.notify ||
-        contact?.verifiedName ||
-        jidFriendly(chatId);
+      // Use getContactName for better name resolution
+      const chatName = await getContactName(chatId, sock);
 
     // Fixed: Use lastMessage instead of undefined msg
     const lastMessageText = lastMessage
@@ -11347,7 +11399,8 @@ app.get("/wml/chats.wml", async (req, res) => {
       unreadCount,
       contact,
     };
-  });
+  })
+  );
 
   // Filter by chat type
   if (!showGroups) {
@@ -11681,25 +11734,21 @@ app.get("/wml/chats.results.wml", (req, res) => {
   }
 
   // Build and filter chat list (similar to main chats.wml logic)
-  let chats = Array.from(chatStore.keys()).map((chatId) => {
-    const messages = chatStore.get(chatId) || [];
-    const lastMessage =
-      messages.length > 0 ? messages[messages.length - 1] : null;
-    const contact = contactStore.get(chatId);
+  let chats = await Promise.all(
+    Array.from(chatStore.keys()).map(async (chatId) => {
+      const messages = chatStore.get(chatId) || [];
+      const lastMessage =
+        messages.length > 0 ? messages[messages.length - 1] : null;
 
-    const isGroup = chatId.endsWith("@g.us");
-    const phoneNumber = chatId
-      .replace("@s.whatsapp.net", "")
-      .replace("@g.us", "");
+      const isGroup = chatId.endsWith("@g.us");
+      const phoneNumber = chatId
+        .replace("@s.whatsapp.net", "")
+        .replace("@g.us", "");
 
-    const chatName = isGroup
-      ? contact?.subject || `Group ${phoneNumber.slice(-8)}`
-      : contact?.name ||
-        contact?.notify ||
-        contact?.verifiedName ||
-        jidFriendly(chatId);
+      // Use getContactName for better name resolution
+      const chatName = await getContactName(chatId, sock);
 
-    return {
+      return {
       id: chatId,
       name: chatName,
       isGroup,
@@ -11710,7 +11759,8 @@ app.get("/wml/chats.results.wml", (req, res) => {
         timestamp: lastMessage ? Number(lastMessage.messageTimestamp) : 0,
       },
     };
-  });
+  })
+  );
 
   // Filter by type
   if (chatType === "direct") {
