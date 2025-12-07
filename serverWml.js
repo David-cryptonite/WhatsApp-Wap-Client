@@ -1591,27 +1591,52 @@ app.get("/wml/qr.wml", (req, res) => {
 });
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
-  if (!currentQR) {
+  const isConnected = !!sock?.authState?.creds && connectionState === 'open';
+
+  if (isConnected) {
     res.set("Content-Type", "text/vnd.wap.wml");
     return res.send(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
-  "http://www.wapforum.org/DTD/wml_1.1.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
 <wml>
-  <card id="noqr" title="QR Not Available">
-    <p>QR code not available</p>
+  <card id="connected" title="WhatsApp">
+    <p>WhatsApp Connected</p>
+    <p>You are logged in</p>
+    <p>
+      <a href="/wml/home.wml">Go to Home</a>
+    </p>
   </card>
 </wml>`);
   }
 
-  // Restituisce una WML page che richiama l'immagine WBMP
+  if (!currentQR) {
+    res.set("Content-Type", "text/vnd.wap.wml");
+    return res.send(`<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
+<wml>
+  <card id="noqr" title="QR">
+    <p>Connecting...</p>
+    <p>QR code loading</p>
+    <p>Please wait</p>
+  </card>
+</wml>`);
+  }
+
+  // WAP 1.0 compatible page with WBMP QR code
   res.set("Content-Type", "text/vnd.wap.wml");
   res.send(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
-  "http://www.wapforum.org/DTD/wml_1.1.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
 <wml>
   <card id="qr" title="WhatsApp QR">
-    <p>Scansiona il QR:</p>
-    <p><img src="/api/qr/image?format=wbmp" alt="QR Code"/></p>
+    <p>Scan QR Code</p>
+    <p>1. Open WhatsApp</p>
+    <p>2. Menu - Linked Devices</p>
+    <p>3. Link a Device</p>
+    <p>4. Scan QR:</p>
+    <p><img src="/api/qr/image?format=wbmp"/></p>
+    <p>Status: ${connectionState}</p>
+    <do type="accept" label="Refresh">
+      <go href="/api/qr/wml-wbmp"/>
+    </do>
   </card>
 </wml>`);
 });
@@ -7297,24 +7322,9 @@ function saveMessageToDB(msg, jid) {
   }
 }
 
-// ============ INITIALIZE LOAD CHAT UTILS DEPENDENCIES ============
-// Pass all required dependencies to loadChatUtils module
-try {
-  initializeDependencies({
-    logger: logger,
-    sock: sock,
-    chatStore: chatStore,
-    messageStore: messageStore,
-    connectionState: connectionState,
-    formatJid: formatJid,
-    delay: delay,
-    saveMessageToDB: saveMessageToDB,
-    performInitialSync: performInitialSync
-  });
-  logger.info('✓ loadChatUtils dependencies initialized');
-} catch (error) {
-  logger.error('Failed to initialize loadChatUtils:', error.message);
-}
+// ============ LOAD CHAT UTILS DEPENDENCIES ============
+// Dependencies will be initialized after socket creation in connectWithBetterSync()
+// This ensures sock is not null when passed to loadChatUtils
 
 // Production-ready connection with better error handling
 async function connectWithBetterSync() {
@@ -7348,6 +7358,20 @@ async function connectWithBetterSync() {
       keepAliveIntervalMs: 10000,
       retryRequestDelayMs: 1000,
     });
+
+    // Initialize loadChatUtils dependencies NOW that sock is created
+    initializeDependencies({
+      logger: logger,
+      sock: sock,
+      chatStore: chatStore,
+      messageStore: messageStore,
+      connectionState: connectionState,
+      formatJid: formatJid,
+      delay: delay,
+      saveMessageToDB: saveMessageToDB,
+      performInitialSync: performInitialSync
+    });
+    logger.info('✓ loadChatUtils dependencies initialized with active socket');
 
     sock.ev.on("creds.update", saveCreds);
 
