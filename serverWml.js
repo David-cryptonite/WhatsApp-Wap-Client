@@ -3259,6 +3259,7 @@ app.get("/wml/chat.wml", async (req, res) => {
 
   const body = isOldNokia
     ? `<p>${escWml(chatTitle)}</p>
+<p>${escWml(number)}</p>
 ${pageInfo}
 ${searchForm}
 ${messageList}
@@ -11467,9 +11468,13 @@ app.get("/wml/chats.wml", async (req, res) => {
         // Safe time string access
         const timeStr = c.lastMessage?.timeStr || "Unknown time";
 
+        // Show both name and number/JID
+        const displayNumber = c.phoneNumber || c.id.replace("@s.whatsapp.net", "").replace("@g.us", "");
+
         return `<p>${start + idx + 1}. ${typeIcon} ${escWml(
           c.name
         )}${unreadBadge}<br/>
+      <small>${escWml(displayNumber)}</small><br/>
       <small>${escWml(fromIndicator + messagePreview)}</small><br/>
       <small>${escWml(timeStr)} | ${c.messageCount} msgs</small><br/>
       <a href="/wml/chat.wml?jid=${encodeURIComponent(
@@ -11652,7 +11657,7 @@ app.get("/wml/chats.wml", async (req, res) => {
 });
 
 // Advanced chat search page
-app.get("/wml/chats.search.wml", (req, res) => {
+app.get("/wml/chats.search.wml", async (req, res) => {
   const prevQuery = esc(req.query.q || "");
   const prevType = req.query.type || "all";
   const prevSort = req.query.sort || "recent";
@@ -11804,7 +11809,11 @@ app.get("/wml/chats.results.wml", (req, res) => {
               })
             : "No activity";
 
+        // Show both name and number/JID
+        const displayNumber = c.phoneNumber || c.id.replace("@s.whatsapp.net", "").replace("@g.us", "");
+
         return `<p><b>${idx + 1}.</b> ${typeIcon} ${esc(c.name)}<br/>
+      <small>${esc(displayNumber)}</small><br/>
       <small>${esc(messagePreview)}</small><br/>
       <small>${lastActivity} | ${c.messageCount} msgs</small><br/>
       <a href="/wml/chat.wml?jid=${encodeURIComponent(
