@@ -7349,6 +7349,9 @@ async function performInitialSync() {
     if (counts.contacts > 0 && counts.chats > 0) {
       isFullySynced = true;
       logger.info("Initial sync completed successfully!");
+      // Save all data to disk to persist the sync results
+      saveAll();
+      logger.info("Sync data saved to disk");
     } else if (syncAttempts < 9999999) {
       const delayMs = syncAttempts * 5000;
       logger.info(`Sync incomplete, retrying in ${delayMs / 1000}s...`);
@@ -7433,7 +7436,8 @@ async function connectWithBetterSync() {
       formatJid: formatJid,
       delay: delay,
       saveMessageToDB: saveMessageToDB,
-      performInitialSync: performInitialSync
+      performInitialSync: performInitialSync,
+      saveAll: saveAll
     });
     logger.info('✓ loadChatUtils dependencies initialized with active socket');
 
@@ -7595,6 +7599,8 @@ async function connectWithBetterSync() {
       for (const c of contacts) {
         if (c.id) contactStore.set(c.id, c);
       }
+      // Save contact updates to disk
+      saveContacts();
     });
 
     sock.ev.on("chats.set", ({ chats }) => {
@@ -7612,6 +7618,8 @@ async function connectWithBetterSync() {
           chatStore.set(c.id, []);
         }
       }
+      // Save chat updates to disk
+      saveChats();
     });
   } catch (error) {
     logger.error("Connection error:", error);
@@ -11381,6 +11389,9 @@ app.get("/wml/chats.wml", async (req, res) => {
       ? Number(lastMessage.messageTimestamp)
       : 0;
     const unreadCount = messages.filter((m) => !m.key.fromMe).length;
+
+    // Get contact info from contactStore
+    const contact = contactStore.get(chatId);
 
     // In the chat mapping section, ensure lastMessage is properly constructed:
 

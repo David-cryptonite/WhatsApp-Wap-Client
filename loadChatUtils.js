@@ -9,6 +9,7 @@ let formatJid = (jid) => jid;
 let delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 let saveMessageToDB = () => {};
 let performInitialSync = async () => {};
+let saveAll = () => {};
 
 // Initialize dependencies from main server
 function initializeDependencies(deps) {
@@ -21,6 +22,7 @@ function initializeDependencies(deps) {
   delay = deps.delay;
   saveMessageToDB = deps.saveMessageToDB;
   performInitialSync = deps.performInitialSync;
+  saveAll = deps.saveAll || (() => {});
 }
 
 // Getter for dynamic sock access
@@ -221,6 +223,10 @@ async function enhancedInitialSync() {
       await preloadImportantChats();
 
       logger.info('Enhanced sync completed successfully (4GB RAM mode)');
+
+      // Save all loaded data to disk
+      saveAll();
+      logger.info('Enhanced sync data saved to disk');
     }
 
   } catch (error) {
