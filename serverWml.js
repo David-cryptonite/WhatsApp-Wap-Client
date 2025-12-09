@@ -7863,10 +7863,12 @@ async function connectWithBetterSync() {
             const delay = Math.min(5000 * Math.pow(2, syncAttempts), 30000); // Exponential backoff
             setTimeout(connectWithBetterSync, delay);
           } else {
-            // Clear stores on logout
-            contactStore.clear();
-            chatStore.clear();
-            messageStore.clear();
+            // NEVER clear stores - keep all data persistent!
+            // Save data on logout instead
+            logger.info("💾 Saving all data before logout...");
+            saveAll();
+            logger.info("✓ All data saved - will be available on next login");
+
             isFullySynced = false;
             syncAttempts = 0;
           }
@@ -8035,38 +8037,55 @@ async function connectWithBetterSync() {
 // Keep all existing API endpoints from the original code...
 // [Include all /api/ routes here]
 
-// Graceful shutdown
+// Graceful shutdown - NEVER delete data!
 const gracefulShutdown = async (signal) => {
-  logger.info(`Received ${signal}. Shutting down gracefully...`);
+  logger.info(`\n╔═══════════════════════════════════════════════════════════╗`);
+  logger.info(`║  Received ${signal}. Shutting down gracefully...        ║`);
+  logger.info(`╚═══════════════════════════════════════════════════════════╝\n`);
+
   try {
-    // ADD THESE LINES:
-    logger.info("Saving all data before shutdown...");
+    // CRITICAL: Save ALL data before shutdown - NEVER clear stores!
+    logger.info("💾 Saving all data before shutdown (this may take a moment)...");
     await storage.saveImmediately("contacts", contactStore);
+    logger.info(`   ✓ Saved ${contactStore.size} contacts`);
+
     await storage.saveImmediately("chats", chatStore);
+    logger.info(`   ✓ Saved ${chatStore.size} chats`);
+
     await storage.saveImmediately("messages", messageStore);
+    logger.info(`   ✓ Saved ${messageStore.size} messages`);
+
     await storage.saveImmediately("meta", {
       isFullySynced,
       syncAttempts,
       lastSync: new Date().toISOString(),
+      contactsCount: contactStore.size,
+      chatsCount: chatStore.size,
+      messagesCount: messageStore.size,
     });
-    logger.info("Data saved successfully");
+    logger.info("   ✓ Saved metadata");
+    logger.info("✓ All data saved successfully - will be available on next startup!");
 
     if (typeof sock !== "undefined" && sock) {
-      logger.info("Closing WhatsApp connection...");
+      logger.info("\n📡 Closing WhatsApp connection...");
       await sock.end();
-      logger.info("WhatsApp connection closed");
+      logger.info("✓ WhatsApp connection closed");
     } else {
-      logger.info("No WhatsApp connection to close");
+      logger.info("\n⚠ No WhatsApp connection to close");
     }
 
-    contactStore.clear();
-    chatStore.clear();
-    messageStore.clear();
+    // NEVER CLEAR STORES - Data must persist!
+    // contactStore.clear();  ❌ REMOVED
+    // chatStore.clear();     ❌ REMOVED
+    // messageStore.clear();  ❌ REMOVED
 
-    logger.info("Graceful shutdown completed");
+    logger.info("\n╔═══════════════════════════════════════════════════════════╗");
+    logger.info("║  Graceful shutdown completed - All data preserved!       ║");
+    logger.info("╚═══════════════════════════════════════════════════════════╝\n");
     process.exit(0);
   } catch (error) {
-    logger.error("Error during shutdown:", error);
+    logger.error("\n✗ Error during shutdown:", error);
+    logger.error("Attempting to exit anyway...");
     process.exit(1);
   }
 };
@@ -8822,14 +8841,23 @@ app.post("/api/logout", async (req, res) => {
       fs.rmSync("./auth_info_baileys", { recursive: true });
     }
 
-    // Clear stores
-    contactStore.clear();
-    chatStore.clear();
-    messageStore.clear();
+    // NEVER clear stores - Save data instead!
+    logger.info("💾 Saving all data before logout...");
+    saveAll();
+    logger.info("✓ All data saved - will be available on next login");
+
     isFullySynced = false;
     syncAttempts = 0;
 
-    res.json({ status: "Logged out and data cleared" });
+    res.json({
+      status: "Logged out successfully",
+      message: "All data has been saved and preserved",
+      dataPreserved: {
+        contacts: contactStore.size,
+        chats: chatStore.size,
+        messages: messageStore.size
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -11602,10 +11630,12 @@ app.get("/wml/logout.confirm.wml", async (req, res) => {
       fs.rmSync("./auth_info_baileys", { recursive: true });
     }
 
-    // Clear stores
-    contactStore.clear();
-    chatStore.clear();
-    messageStore.clear();
+    // NEVER clear stores - Save data instead!
+    logger.info("💾 Saving all data before logout...");
+    saveAll();
+    logger.info(`✓ Data saved: ${contactStore.size} contacts, ${chatStore.size} chats, ${messageStore.size} messages`);
+    logger.info("✓ All data will be available on next login");
+
     isFullySynced = false;
     syncAttempts = 0;
     currentQR = null;
@@ -11617,7 +11647,9 @@ app.get("/wml/logout.confirm.wml", async (req, res) => {
         "Logged Out",
         [
           "Successfully logged out",
-          "All data cleared",
+          `Data preserved: ${contactStore.size} contacts`,
+          `${chatStore.size} chats, ${messageStore.size} messages`,
+          "All data saved for next login",
           "You can scan QR to reconnect",
         ],
         "/wml/home.wml",
