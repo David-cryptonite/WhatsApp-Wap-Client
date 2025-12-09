@@ -1812,40 +1812,196 @@ app.get('/wml/chat.wml', async (req, res) => {
 </wml>`)
 })*/
 
-// Enhanced Status page
-app.get("/wml/status.wml", (req, res) => {
-  const connected = !!sock?.authState?.creds;
-  const uptime = Math.floor(process.uptime() / 60);
+// ============ ENHANCED SYSTEM STATUS PAGE - 100% FUNCTIONAL ============
+app.get("/wml/status.wml", asyncHandler(async (req, res) => {
+  const query = sanitizeQuery(req.query);
+  const autoRefresh = query.refresh !== 'off'; // Allow disabling auto-refresh
 
+  // ===== CONNECTION STATUS =====
+  const isConnected = connectionState === 'open';
+  const isConnecting = connectionState === 'connecting';
+  const isClosed = connectionState === 'close';
+  const hasSocket = !!sock;
+  const hasAuth = !!(sock && sock.authState && sock.authState.creds);
+
+  // Connection badge
+  let connectionBadge = '';
+  let connectionStatus = '';
+  if (isConnected) {
+    connectionBadge = '[ONLINE]';
+    connectionStatus = 'Connected';
+  } else if (isConnecting) {
+    connectionBadge = '[CONNECTING]';
+    connectionStatus = 'Connecting...';
+  } else if (isClosed) {
+    connectionBadge = '[OFFLINE]';
+    connectionStatus = 'Disconnected';
+  } else {
+    connectionBadge = '[UNKNOWN]';
+    connectionStatus = connectionState || 'Unknown';
+  }
+
+  // ===== SYNC STATUS =====
+  let syncBadge = '';
+  let syncStatus = '';
+  if (isFullySynced) {
+    syncBadge = '[SYNCED]';
+    syncStatus = 'Complete';
+  } else if (syncAttempts > 0) {
+    syncBadge = '[SYNCING]';
+    syncStatus = `In Progress (attempt ${syncAttempts})`;
+  } else {
+    syncBadge = '[PENDING]';
+    syncStatus = 'Not Started';
+  }
+
+  // ===== DATA COUNTS =====
+  const contactCount = contactStore ? contactStore.size : 0;
+  const chatCount = chatStore ? chatStore.size : 0;
+  const messageCount = messageStore ? messageStore.size : 0;
+
+  // Calculate total messages across all chats
+  let totalMessages = 0;
+  if (chatStore) {
+    try {
+      for (const messages of chatStore.values()) {
+        if (Array.isArray(messages)) {
+          totalMessages += messages.length;
+        }
+      }
+    } catch (e) {
+      logger.warn('Failed to count total messages:', e.message);
+    }
+  }
+
+  // ===== SYSTEM METRICS =====
+  const uptimeSeconds = Math.floor(process.uptime());
+  const uptimeMinutes = Math.floor(uptimeSeconds / 60);
+  const uptimeHours = Math.floor(uptimeMinutes / 60);
+  const uptimeDays = Math.floor(uptimeHours / 24);
+
+  let uptimeDisplay = '';
+  if (uptimeDays > 0) {
+    uptimeDisplay = `${uptimeDays}d ${uptimeHours % 24}h ${uptimeMinutes % 60}m`;
+  } else if (uptimeHours > 0) {
+    uptimeDisplay = `${uptimeHours}h ${uptimeMinutes % 60}m`;
+  } else if (uptimeMinutes > 0) {
+    uptimeDisplay = `${uptimeMinutes}m ${uptimeSeconds % 60}s`;
+  } else {
+    uptimeDisplay = `${uptimeSeconds}s`;
+  }
+
+  // Memory usage
+  const memUsage = process.memoryUsage();
+  const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+  const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+  const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+
+  // ===== LAST SYNC INFO =====
+  let lastSyncInfo = 'Never';
+  try {
+    const metaPath = './data/meta.json';
+    const fs = await import('fs/promises');
+    try {
+      const metaData = await fs.readFile(metaPath, 'utf-8');
+      const meta = JSON.parse(metaData);
+      if (meta.lastSync) {
+        const lastSyncDate = new Date(meta.lastSync);
+        const now = new Date();
+        const diffMs = now - lastSyncDate;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMins / 60);
+        const diffDays = Math.floor(diffHours / 24);
+
+        if (diffDays > 0) {
+          lastSyncInfo = `${diffDays}d ago`;
+        } else if (diffHours > 0) {
+          lastSyncInfo = `${diffHours}h ago`;
+        } else if (diffMins > 0) {
+          lastSyncInfo = `${diffMins}m ago`;
+        } else {
+          lastSyncInfo = 'Just now';
+        }
+      }
+    } catch (e) {
+      // File doesn't exist or can't be read
+    }
+  } catch (e) {
+    // fs module import failed
+  }
+
+  // ===== QR CODE STATUS =====
+  const qrAvailable = !!currentQR;
+  const qrStatus = qrAvailable ? 'Available' : 'Not Available';
+
+  // ===== BUILD STATUS PAGE =====
   const body = `
-    <p><b>System Status</b></p>
-    <p>Connection: ${connected ? "<b>Active</b>" : "<em>Inactive</em>"}</p>
-    <p>State: ${esc(connectionState)}</p>
-    <p>QR Available: ${currentQR ? "Yes" : "No"}</p>
-    <p>Uptime: ${uptime} minutes</p>
+    <p><b>═══ SYSTEM STATUS ═══</b></p>
 
-    <p>Sync Status: ${
-      isFullySynced ? "<b>Complete</b>" : "<em>In Progress</em>"
-    }</p>
-    <p>Sync Attempts: ${syncAttempts}</p>
-    <p>Contacts: ${contactStore.size}</p>
-    <p>Chats: ${chatStore.size}</p>
-    <p>Messages: ${messageStore.size}</p>
+    <p><b>WhatsApp Connection:</b></p>
+    <p>${connectionBadge}<br/>
+    Status: ${esc(connectionStatus)}<br/>
+    Socket: ${hasSocket ? 'Active' : 'Inactive'}<br/>
+    Auth: ${hasAuth ? 'Valid' : 'Invalid'}<br/>
+    ${!isConnected && qrAvailable ? 'QR: ' + qrStatus : ''}</p>
 
-    <p><b>Sync Actions:</b></p>
+    <p><b>Synchronization:</b></p>
+    <p>${syncBadge}<br/>
+    Status: ${esc(syncStatus)}<br/>
+    Last Sync: ${esc(lastSyncInfo)}<br/>
+    Attempts: ${syncAttempts}</p>
+
+    <p><b>Data Storage:</b></p>
+    <p>Contacts: ${contactCount}<br/>
+    Chats: ${chatCount}<br/>
+    Messages in Store: ${messageCount}<br/>
+    Total Messages: ${totalMessages}</p>
+
+    <p><b>System Metrics:</b></p>
+    <p>Uptime: ${esc(uptimeDisplay)}<br/>
+    Memory (Heap): ${heapUsedMB}/${heapTotalMB} MB<br/>
+    Memory (RSS): ${rssMB} MB<br/>
+    Process ID: ${process.pid}</p>
+
+    <p><b>Quick Actions:</b></p>
     <p>
-      <a href="/wml/sync.full.wml" accesskey="1"> Sync</a>
+      ${isConnected
+        ? `<a href="/wml/sync.full.wml" accesskey="1">[1] Full Sync</a><br/>
+           <a href="/wml/sync.contacts.wml" accesskey="2">[2] Sync Contacts</a><br/>
+           <a href="/wml/sync.chats.wml" accesskey="3">[3] Sync Chats</a><br/>`
+        : `<a href="/wml/qr.wml" accesskey="1">[1] View QR Code</a><br/>
+           <a href="/wml/status.wml" accesskey="2">[2] Refresh Status</a><br/>`
+      }
+      <a href="/wml/status.wml?refresh=off" accesskey="8">[8] ${autoRefresh ? 'Stop' : 'Start'} Auto-Refresh</a><br/>
+      <a href="/wml/debug.wml" accesskey="9">[9] Debug Info</a><br/>
+      <a href="/wml" accesskey="0">[0] Home</a>
     </p>
+
+    ${autoRefresh
+      ? '<p><small>Auto-refresh: 5s</small></p>'
+      : '<p><small>Auto-refresh: OFF</small></p>'
+    }
 
     ${navigationBar()}
 
     <do type="accept" label="Refresh">
-      <go href="/wml/status.wml"/>
+      <go href="/wml/status.wml${autoRefresh ? '' : '?refresh=off'}"/>
+    </do>
+    <do type="options" label="Actions">
+      <go href="${isConnected ? '/wml/sync.full.wml' : '/wml/qr.wml'}"/>
     </do>
   `;
 
-  sendWml(res, card("status", "Status", body, "/wml/status.wml"));
-});
+  // Add auto-refresh timer if enabled (50 deciseconds = 5 seconds)
+  const timerScript = autoRefresh
+    ? `<timer value="50"/>
+       <onevent type="ontimer">
+         <go href="/wml/status.wml"/>
+       </onevent>`
+    : '';
+
+  sendWml(res, card("status", "System Status", body, null, timerScript));
+}));
 
 // Enhanced QR Code page
 app.get("/wml/qr.wml", (req, res) => {
