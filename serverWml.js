@@ -1047,6 +1047,239 @@ function saveAll() {
   saveMeta();
 }
 
+// ============ ROBUST ERROR HANDLING & VALIDATION UTILITIES ============
+
+/**
+ * Safe wrapper for async route handlers
+ * Catches all errors and sends user-friendly error pages
+ */
+function asyncHandler(fn) {
+  return async (req, res, next) => {
+    try {
+      await fn(req, res, next);
+    } catch (error) {
+      logger.error(`Route error [${req.path}]:`, error.message, error.stack);
+      try {
+        const errorCard = card(
+          "error",
+          "Error",
+          `<p><b>An error occurred:</b><br/>${esc(error.message || "Unknown error")}</p>
+           <p><a href="/wml">Home</a></p>`
+        );
+        sendWml(res, errorCard);
+      } catch (sendError) {
+        // Fallback if even error page fails
+        res.status(500).send("Internal Server Error");
+      }
+    }
+  };
+}
+
+/**
+ * Safely get a value from an object with fallback
+ */
+function safeGet(obj, path, defaultValue = null) {
+  if (!obj) return defaultValue;
+  const keys = path.split('.');
+  let result = obj;
+  for (const key of keys) {
+    if (result == null || typeof result !== 'object') return defaultValue;
+    result = result[key];
+  }
+  return result !== undefined && result !== null ? result : defaultValue;
+}
+
+/**
+ * Safely parse integer with bounds checking
+ */
+function safeParseInt(value, defaultValue = 0, min = -Infinity, max = Infinity) {
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed)) return defaultValue;
+  if (parsed < min) return min;
+  if (parsed > max) return max;
+  return parsed;
+}
+
+/**
+ * Safely format JID with null checks
+ */
+function safeFormatJid(jid) {
+  if (!jid || typeof jid !== 'string') return '';
+  try {
+    return formatJid(jid);
+  } catch (error) {
+    logger.warn(`Failed to format JID: ${jid}`, error.message);
+    return '';
+  }
+}
+
+/**
+ * Safely get message text with fallback
+ */
+function safeMessageText(msg) {
+  if (!msg) return '[No message]';
+  try {
+    return messageText(msg) || '[Empty message]';
+  } catch (error) {
+    logger.warn('Failed to extract message text:', error.message);
+    return '[Error reading message]';
+  }
+}
+
+/**
+ * Safely get contact from store with fallback
+ */
+function safeGetContact(jid) {
+  if (!jid) return null;
+  try {
+    return contactStore.get(jid) || null;
+  } catch (error) {
+    logger.warn(`Failed to get contact ${jid}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Safely get chat from store with fallback
+ */
+function safeGetChat(jid) {
+  if (!jid) return [];
+  try {
+    return chatStore.get(jid) || [];
+  } catch (error) {
+    logger.warn(`Failed to get chat ${jid}:`, error.message);
+    return [];
+  }
+}
+
+/**
+ * Validate and sanitize query parameters
+ */
+function sanitizeQuery(query) {
+  const sanitized = {};
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value !== undefined && value !== null) {
+      sanitized[key] = String(value).trim();
+    }
+  }
+  return sanitized;
+}
+
+/**
+ * Safe array filter with null checks
+ */
+function safeFilter(array, predicate) {
+  if (!Array.isArray(array)) return [];
+  try {
+    return array.filter((item) => {
+      try {
+        return item && predicate(item);
+      } catch (error) {
+        logger.warn('Filter predicate error:', error.message);
+        return false;
+      }
+    });
+  } catch (error) {
+    logger.error('Array filter error:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Safe array map with null checks
+ */
+function safeMap(array, mapper) {
+  if (!Array.isArray(array)) return [];
+  try {
+    return array.map((item, index) => {
+      try {
+        return mapper(item, index);
+      } catch (error) {
+        logger.warn(`Map function error at index ${index}:`, error.message);
+        return null;
+      }
+    }).filter(item => item !== null);
+  } catch (error) {
+    logger.error('Array map error:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Safe array sort with null checks
+ */
+function safeSort(array, compareFn) {
+  if (!Array.isArray(array)) return [];
+  try {
+    return [...array].sort((a, b) => {
+      try {
+        return compareFn(a, b);
+      } catch (error) {
+        logger.warn('Sort compare error:', error.message);
+        return 0;
+      }
+    });
+  } catch (error) {
+    logger.error('Array sort error:', error.message);
+    return array;
+  }
+}
+
+/**
+ * Safely format timestamp with fallback
+ */
+function safeFormatTime(timestamp, format = 'full') {
+  try {
+    const ts = Number(timestamp);
+    if (isNaN(ts) || ts <= 0) return 'Unknown';
+
+    const date = new Date(ts * 1000);
+    if (isNaN(date.getTime())) return 'Invalid date';
+
+    if (format === 'short') {
+      const day = date.getDate().toString().padStart(2, '0');
+      const month = (date.getMonth() + 1).toString().padStart(2, '0');
+      const hours = date.getHours().toString().padStart(2, '0');
+      const mins = date.getMinutes().toString().padStart(2, '0');
+      return `${day}/${month} ${hours}:${mins}`;
+    }
+
+    return date.toLocaleString('en-GB', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  } catch (error) {
+    logger.warn('Failed to format timestamp:', error.message);
+    return 'Unknown';
+  }
+}
+
+/**
+ * Check if socket is available and connected
+ */
+function isSocketReady() {
+  return sock && connectionState === 'open';
+}
+
+/**
+ * Safely execute function with timeout
+ */
+async function withTimeout(promise, timeoutMs = 10000, defaultValue = null) {
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Operation timeout')), timeoutMs)
+      )
+    ]);
+  } catch (error) {
+    logger.warn('Operation timed out or failed:', error.message);
+    return defaultValue;
+  }
+}
+
 function wmlDoc(cards, scripts = "") {
   const head = scripts
     ? `<head><meta http-equiv="Cache-Control" content="max-age=0"/>${scripts}</head>`
@@ -2356,22 +2589,31 @@ app.get("/wml/contacts.wml", (req, res) => {
 });
 
 // Enhanced Contact Detail page with WTAI integration
-app.get("/wml/contact.wml", async (req, res) => {
-  try {
-    if (!sock) throw new Error("Not connected");
-    const jid = formatJid(req.query.jid || "");
-    const contact = contactStore.get(jid);
-    const number = jidFriendly(jid);
+app.get("/wml/contact.wml", asyncHandler(async (req, res) => {
+    if (!isSocketReady()) {
+      throw new Error("WhatsApp not connected. Please check connection status.");
+    }
 
-    // Try to fetch additional info
+    const query = sanitizeQuery(req.query);
+    const jid = safeFormatJid(query.jid);
+
+    if (!jid) {
+      throw new Error("Invalid contact ID provided");
+    }
+
+    const contact = safeGetContact(jid);
+    const number = jidFriendly(jid) || 'Unknown';
+
+    // Try to fetch additional info with timeout
     let status = null;
     let businessProfile = null;
 
     try {
-      status = await sock.fetchStatus(jid);
-      businessProfile = await sock.getBusinessProfile(jid);
+      status = await withTimeout(sock.fetchStatus(jid), 5000);
+      businessProfile = await withTimeout(sock.getBusinessProfile(jid), 5000);
     } catch (e) {
       // Silently fail for these optional features
+      logger.debug(`Failed to fetch extended info for ${jid}:`, e.message);
     }
 
     const body = `
@@ -2431,17 +2673,7 @@ app.get("/wml/contact.wml", async (req, res) => {
     `;
 
     sendWml(res, card("contact", "Contact Info", body));
-  } catch (e) {
-    sendWml(
-      res,
-      resultCard(
-        "Error",
-        [e.message || "Failed to load contact"],
-        "/wml/contacts.wml"
-      )
-    );
-  }
-});
+}));
 /*
 app.get('/wml/chat.wml', async (req, res) => {
   const userAgent = req.headers['user-agent'] || ''
@@ -4622,13 +4854,18 @@ ${body}
   res.send(encodedBuffer)
 })*/
 // Enhanced Message Actions page
-app.get("/wml/msg.wml", (req, res) => {
-  const mid = String(req.query.mid || "");
-  const jid = formatJid(req.query.jid || "");
+app.get("/wml/msg.wml", asyncHandler(async (req, res) => {
+  const query = sanitizeQuery(req.query);
+  const mid = String(query.mid || "");
+  const jid = safeFormatJid(query.jid);
+
+  if (!jid || !mid) {
+    throw new Error("Invalid message ID or chat ID");
+  }
 
   // Find message in the specific chat (using our new system)
-  const messages = chatStore.get(jid) || [];
-  const msg = messages.find((m) => m.key.id === mid);
+  const messages = safeGetChat(jid);
+  const msg = messages.find((m) => safeGet(m, 'key.id') === mid);
 
   if (!msg) {
     sendWml(
@@ -4642,8 +4879,8 @@ app.get("/wml/msg.wml", (req, res) => {
     return;
   }
 
-  const text = truncate(messageText(msg), 150);
-  const ts = new Date(Number(msg.messageTimestamp) * 1000).toLocaleString();
+  const text = truncate(safeMessageText(msg), 150);
+  const ts = safeFormatTime(msg.messageTimestamp);
 
   // Enhanced media detection
   let mediaInfo = "";
@@ -4652,10 +4889,10 @@ app.get("/wml/msg.wml", (req, res) => {
   let transcriptionInfo = "";
   let transcriptionActions = "";
 
-  if (msg.message) {
-    if (msg.message.imageMessage) {
+  if (safeGet(msg, 'message')) {
+    if (safeGet(msg, 'message.imageMessage')) {
       const img = msg.message.imageMessage;
-      const size = Math.round((img.fileLength || 0) / 1024);
+      const size = Math.round((safeGet(img, 'fileLength', 0)) / 1024);
       mediaInfo = `<p><small>Type: Image (${size}KB)</small></p>`;
       mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
         mid
@@ -4666,10 +4903,10 @@ app.get("/wml/msg.wml", (req, res) => {
         mid
       )}.jpg" accesskey="5">[5] Download JPG</a><br/>`;
       hasMedia = true;
-    } else if (msg.message.videoMessage) {
+    } else if (safeGet(msg, 'message.videoMessage')) {
       const vid = msg.message.videoMessage;
-      const size = Math.round((vid.fileLength || 0) / 1024);
-      const duration = vid.seconds || 0;
+      const size = Math.round((safeGet(vid, 'fileLength', 0)) / 1024);
+      const duration = safeGet(vid, 'seconds', 0);
       mediaInfo = `<p><small>Type: Video (${size}KB, ${duration}s)</small></p>`;
       mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
         mid
@@ -4680,21 +4917,22 @@ app.get("/wml/msg.wml", (req, res) => {
         mid
       )}.mp4" accesskey="5">[5] Download MP4</a><br/>`;
       hasMedia = true;
-    } else if (msg.message.audioMessage) {
+    } else if (safeGet(msg, 'message.audioMessage')) {
       const aud = msg.message.audioMessage;
-      const size = Math.round((aud.fileLength || 0) / 1024);
-      const duration = aud.seconds || 0;
+      const size = Math.round((safeGet(aud, 'fileLength', 0)) / 1024);
+      const duration = safeGet(aud, 'seconds', 0);
 
       mediaInfo = `<p><small>Type: Audio (${size}KB, ${duration}s)</small></p>`;
 
       hasMedia = true;
 
       // Gestione trascrizione
-      if (msg.transcription) {
-        if (msg.transcription === "[Trascrizione fallita]") {
+      const transcription = safeGet(msg, 'transcription');
+      if (transcription) {
+        if (transcription === "[Trascrizione fallita]") {
           transcriptionInfo = `<p><small>Trascrizione: Fallita</small></p>`;
         } else if (
-          msg.transcription === "[Audio troppo lungo per la trascrizione]"
+          transcription === "[Audio troppo lungo per la trascrizione]"
         ) {
           transcriptionInfo = `<p><small>Trascrizione: Audio troppo lungo</small></p>`;
         } else {
@@ -4708,10 +4946,10 @@ app.get("/wml/msg.wml", (req, res) => {
       } else {
         transcriptionInfo = `<p><small>Trascrizione: In elaborazione...</small></p>`;
       }
-    } else if (msg.message.documentMessage) {
+    } else if (safeGet(msg, 'message.documentMessage')) {
       const doc = msg.message.documentMessage;
-      const size = Math.round((doc.fileLength || 0) / 1024);
-      const filename = doc.fileName || "document";
+      const size = Math.round((safeGet(doc, 'fileLength', 0)) / 1024);
+      const filename = safeGet(doc, 'fileName', 'document');
       mediaInfo = `<p><small>Type: Document (${size}KB)</small></p>
       <p><small>File: ${esc(filename)}</small></p>`;
       const ext = filename.split(".").pop() || "bin";
@@ -4724,9 +4962,9 @@ app.get("/wml/msg.wml", (req, res) => {
         mid
       )}.${ext}" accesskey="5">[5] Download File</a><br/>`;
       hasMedia = true;
-    } else if (msg.message.stickerMessage) {
+    } else if (safeGet(msg, 'message.stickerMessage')) {
       const sticker = msg.message.stickerMessage;
-      const size = Math.round((sticker.fileLength || 0) / 1024);
+      const size = Math.round((safeGet(sticker, 'fileLength', 0)) / 1024);
       mediaInfo = `<p><small>Type: Sticker (${size}KB)</small></p>`;
       mediaActions = `<a href="/wml/media-info.wml?mid=${encodeURIComponent(
         mid
@@ -4740,11 +4978,12 @@ app.get("/wml/msg.wml", (req, res) => {
     }
   }
 
+  const fromMe = safeGet(msg, 'key.fromMe', false);
   const body = `
     <p><b>Message Details</b></p>
     <p>${esc(text)}</p>
     <p><small>Time: ${ts}</small></p>
-    <p><small>From: ${msg.key.fromMe ? "Me" : "Them"}</small></p>
+    <p><small>From: ${fromMe ? "Me" : "Them"}</small></p>
     ${mediaInfo}
     ${transcriptionInfo}
     
@@ -4792,7 +5031,7 @@ app.get("/wml/msg.wml", (req, res) => {
   `;
 
   sendWml(res, card("msg", "Message", body));
-});
+}));
 app.get("/wml/send-menu.wml", (req, res) => {
   const to = esc(req.query.to || "");
   const search = (req.query.search || "").toLowerCase();
@@ -11932,23 +12171,67 @@ app.get("/wml/sync.chats.wml", async (req, res) => {
 
 // =================== ERROR HANDLING & SERVER SETUP ===================
 
-// Error handling
+// Enhanced error handling with WML support
 app.use((err, req, res, next) => {
-  console.error("Server Error:", err);
-  res.status(500).json({
-    error: "Internal server error",
-    details: process.env.NODE_ENV === "development" ? err.message : undefined,
-  });
+  logger.error("Server Error:", err);
+
+  // Check if this is a WML request
+  const isWmlRequest = req.path.startsWith('/wml/') || req.path === '/wml';
+  const acceptsWml = req.headers.accept && req.headers.accept.includes('wml');
+
+  if (isWmlRequest || acceptsWml) {
+    try {
+      const errorMessage = process.env.NODE_ENV === "development"
+        ? err.message || "Internal server error"
+        : "An error occurred";
+
+      const errorCard = card(
+        "error",
+        "Error",
+        `<p><b>Error:</b><br/>${esc(errorMessage)}</p>
+         <p><a href="/wml">Home</a></p>
+         <p><a href="javascript:history.back()">Go Back</a></p>`
+      );
+      sendWml(res, errorCard);
+    } catch (sendError) {
+      // Fallback if WML rendering fails
+      res.status(500).send("Internal Server Error");
+    }
+  } else {
+    res.status(500).json({
+      error: "Internal server error",
+      details: process.env.NODE_ENV === "development" ? err.message : undefined,
+    });
+  }
 });
 
-// 404 handler
+// Enhanced 404 handler with WML support
 app.use((req, res) => {
-  res.status(404).json({
-    error: "Endpoint not found",
-    path: req.path,
-    method: req.method,
-    suggestion: "Check the API documentation for available endpoints",
-  });
+  const isWmlRequest = req.path.startsWith('/wml/') || req.path === '/wml';
+  const acceptsWml = req.headers.accept && req.headers.accept.includes('wml');
+
+  if (isWmlRequest || acceptsWml) {
+    try {
+      const notFoundCard = card(
+        "notfound",
+        "Not Found",
+        `<p><b>Page not found:</b><br/>${esc(req.path)}</p>
+         <p><a href="/wml">Home</a></p>
+         <p><a href="javascript:history.back()">Go Back</a></p>`
+      );
+      res.status(404);
+      sendWml(res, notFoundCard);
+    } catch (sendError) {
+      res.status(404).send("Page Not Found");
+    }
+  } else {
+    res.status(404).json({
+      error: "Endpoint not found",
+      path: req.path,
+      method: req.method,
+      suggestion: "Check the API documentation for available endpoints",
+    });
+  }
 });
 
 export { app, sock, contactStore, chatStore, messageStore };
