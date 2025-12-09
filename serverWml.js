@@ -2518,10 +2518,10 @@ app.get('/wml/chat.wml', async (req, res) => {
     messageList = '<p>No messages</p>'
   } else {
     messageList = items.map((m, idx) => {
-      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
+      const who = m.key && m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
       const time = formatTime(m.messageTimestamp)
       const msgNumber = idx + 1
-      const mid = m.key.id
+      const mid = m.key ? m.key.id : 'unknown'
       
       // Handle different message types for Nokia
       let text = ''
@@ -2689,10 +2689,10 @@ app.get('/wml/chat.wml', async (req, res) => {
     messageList = '<p>No messages</p>'
   } else {
     messageList = items.map((m, idx) => {
-      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
+      const who = m.key && m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
       const time = formatTime(m.messageTimestamp)
       const msgNumber = idx + 1
-      const mid = m.key.id
+      const mid = m.key ? m.key.id : 'unknown'
       
       // Handle different message types for Nokia
       let text = ''
@@ -4527,10 +4527,10 @@ app.get('/wml/chat.wml', async (req, res) => {
     messageList = '<p>No messages</p>'
   } else {
     messageList = items.map((m, idx) => {
-      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
+      const who = m.key && m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
       const time = formatTime(m.messageTimestamp)
       const msgNumber = idx + 1
-      const mid = m.key.id
+      const mid = m.key ? m.key.id : 'unknown'
       
       // Handle different message types for Nokia
       let text = ''
@@ -11368,58 +11368,68 @@ app.get("/wml/chats.wml", async (req, res) => {
 
   let chats = await Promise.all(
     Array.from(chatStore.keys()).map(async (chatId) => {
-      const messages = chatStore.get(chatId) || [];
-      const lastMessage =
-        messages.length > 0 ? messages[messages.length - 1] : null;
+      try {
+        const messages = chatStore.get(chatId) || [];
+        const lastMessage =
+          messages.length > 0 ? messages[messages.length - 1] : null;
 
-      const isGroup = chatId.endsWith("@g.us");
-      const phoneNumber = chatId
-        .replace("@s.whatsapp.net", "")
-        .replace("@g.us", "");
+        const isGroup = chatId.endsWith("@g.us");
+        const phoneNumber = chatId
+          .replace("@s.whatsapp.net", "")
+          .replace("@g.us", "");
 
-      // Use getContactName for better name resolution
-      const chatName = await getContactName(chatId, sock);
+        // Use getContactName for better name resolution
+        const chatName = await getContactName(chatId, sock);
 
-    // Fixed: Use lastMessage instead of undefined msg
-    const lastMessageText = lastMessage
-      ? messageText(lastMessage)
-      : "No messages";
+        // Fixed: Use lastMessage instead of undefined msg
+        const lastMessageText = lastMessage
+          ? messageText(lastMessage)
+          : "No messages";
 
-    const lastTimestamp = lastMessage
-      ? Number(lastMessage.messageTimestamp)
-      : 0;
-    const unreadCount = messages.filter((m) => !m.key.fromMe).length;
+        const lastTimestamp = lastMessage
+          ? Number(lastMessage.messageTimestamp)
+          : 0;
 
-    // Get contact info from contactStore
-    const contact = contactStore.get(chatId);
+        // Safe filter with null checks
+        const unreadCount = messages.filter((m) => m && m.key && !m.key.fromMe).length;
 
-    // In the chat mapping section, ensure lastMessage is properly constructed:
+        // Get contact info from contactStore
+        const contact = contactStore.get(chatId) || null;
 
-    return {
-      id: chatId,
-      name: chatName,
-      isGroup,
-      phoneNumber: isGroup ? null : phoneNumber,
-      messageCount: messages.length,
-      lastMessage: {
-        text: lastMessageText || "No message text", // Ensure text is never undefined
-        timestamp: lastTimestamp,
-        fromMe: lastMessage ? lastMessage.key.fromMe : false,
-        timeStr:
-          lastTimestamp > 0
-            ? new Date(lastTimestamp * 1000).toLocaleString("en-GB", {
-                month: "short",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-              })
-            : "Never",
-      },
-      unreadCount,
-      contact,
-    };
-  })
+        // In the chat mapping section, ensure lastMessage is properly constructed:
+
+        return {
+          id: chatId,
+          name: chatName || phoneNumber || "Unknown",
+          isGroup,
+          phoneNumber: isGroup ? null : phoneNumber,
+          messageCount: messages.length,
+          lastMessage: {
+            text: lastMessageText || "No message text", // Ensure text is never undefined
+            timestamp: lastTimestamp,
+            fromMe: lastMessage && lastMessage.key ? lastMessage.key.fromMe : false,
+            timeStr:
+              lastTimestamp > 0
+                ? new Date(lastTimestamp * 1000).toLocaleString("en-GB", {
+                    month: "short",
+                    day: "numeric",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })
+                : "Never",
+          },
+          unreadCount,
+          contact: contact || null,
+        };
+      } catch (error) {
+        logger.error(`Error processing chat ${chatId}:`, error.message);
+        return null; // Return null for failed chats
+      }
+    })
   );
+
+  // Filter out null entries (failed chats)
+  chats = chats.filter((c) => c !== null);
 
   // Filter by chat type
   if (!showGroups) {
@@ -11433,17 +11443,21 @@ app.get("/wml/chats.wml", async (req, res) => {
   if (search) {
     const searchLower = search.toLowerCase();
     chats = chats.filter((c) => {
-      const nameMatch = c.name.toLowerCase().includes(searchLower);
+      const nameMatch = c.name ? c.name.toLowerCase().includes(searchLower) : false;
       const numberMatch = c.phoneNumber && c.phoneNumber.includes(searchLower);
-      const messageMatch = c.lastMessage.text
-        .toLowerCase()
-        .includes(searchLower);
+      const messageMatch = c.lastMessage && c.lastMessage.text
+        ? c.lastMessage.text.toLowerCase().includes(searchLower)
+        : false;
       return nameMatch || numberMatch || messageMatch;
     });
   }
 
   // Sort by last message timestamp (most recent first)
-  chats.sort((a, b) => b.lastMessage.timestamp - a.lastMessage.timestamp);
+  chats.sort((a, b) => {
+    const aTime = a.lastMessage && a.lastMessage.timestamp ? a.lastMessage.timestamp : 0;
+    const bTime = b.lastMessage && b.lastMessage.timestamp ? b.lastMessage.timestamp : 0;
+    return bTime - aTime;
+  });
 
   const total = chats.length;
   const start = (page - 1) * limit;
