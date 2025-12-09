@@ -34,7 +34,7 @@ function getConnectionState() {
   return connectionState;
 }
 
-async function loadChatHistory(jid, batchSize = 100) {
+async function loadChatHistory(jid, batchSize = Infinity) {
   const currentSock = getSock();
   if (!currentSock) {
     logger.warn('Cannot load chat history: socket not available');
@@ -42,7 +42,7 @@ async function loadChatHistory(jid, batchSize = 100) {
   }
 
   try {
-    logger.info(`Loading chat history for ${jid} (max ${batchSize} messages)`);
+    logger.info(`Loading FULL chat history for ${jid} (unlimited mode)`);
 
     const formattedJid = formatJid(jid);
 
@@ -56,13 +56,13 @@ async function loadChatHistory(jid, batchSize = 100) {
     let keepFetching = true;
     let allMessages = [];
     let fetchCount = 0;
-    const maxFetches = Math.ceil(batchSize / 50); // Optimized for 4GB RAM
 
-    while (keepFetching && fetchCount < maxFetches && allMessages.length < batchSize) {
+    // UNLIMITED MODE - Continue until no more messages
+    while (keepFetching) {
       let batch;
 
-      // Fetch in larger chunks for 4GB Raspberry Pi 4
-      const chunkSize = Math.min(50, batchSize - allMessages.length);
+      // Fetch in optimal chunks (50 messages per request)
+      const chunkSize = 50;
 
       // Try the available method
       if (currentSock.loadMessages) {
@@ -71,21 +71,30 @@ async function loadChatHistory(jid, batchSize = 100) {
         batch = await currentSock.fetchMessagesFromWA(formattedJid, chunkSize, cursor);
       }
 
-      if (!batch || batch.length === 0) break;
+      if (!batch || batch.length === 0) {
+        logger.info(`No more messages for ${jid}, stopping at ${allMessages.length} messages`);
+        break;
+      }
 
       for (const msg of batch) {
         if (!msg.key?.id) continue;
-        if (allMessages.length >= batchSize) break; // Stop if limit reached
         saveMessageToDB(msg, formattedJid);
         allMessages.push(msg);
       }
 
       cursor = batch[0]?.key;
       fetchCount++;
-      await delay(300); // Faster for 4GB system
+
+      // Progress logging every 10 batches (500 messages)
+      if (fetchCount % 10 === 0) {
+        logger.info(`Progress: ${allMessages.length} messages loaded for ${jid}...`);
+      }
+
+      // Small delay to avoid rate limiting
+      await delay(200);
     }
 
-    logger.info(`Finished loading history for ${jid}, total: ${allMessages.length} messages`);
+    logger.info(`✓ Finished loading FULL history for ${jid}: ${allMessages.length} messages in ${fetchCount} batches`);
     return allMessages;
   } catch (err) {
     logger.error(`Failed to load chat history for ${jid}:`, err.message);
@@ -98,7 +107,7 @@ async function loadChatHistory(jid, batchSize = 100) {
 
 // =================== FUNZIONI DI SUPPORTO ===================
 
-async function loadAllChatsHistory(maxChatsToLoad = 50, messagesPerChat = 100) {
+async function loadAllChatsHistory(maxChatsToLoad = Infinity, messagesPerChat = Infinity) {
   const currentSock = getSock();
   const currentState = getConnectionState();
 
@@ -108,35 +117,64 @@ async function loadAllChatsHistory(maxChatsToLoad = 50, messagesPerChat = 100) {
   }
 
   try {
-    logger.info(`Starting bulk chat history load: ${maxChatsToLoad} chats, ${messagesPerChat} messages each (4GB RAM mode)`);
-
     if (!chatStore || !chatStore.keys) {
       logger.warn('chatStore not available');
       return false;
     }
 
-    const chatIds = Array.from(chatStore.keys()).slice(0, maxChatsToLoad);
+    const allChatIds = Array.from(chatStore.keys());
+    const totalChats = allChatIds.length;
+
+    logger.info(`═══════════════════════════════════════════════════`);
+    logger.info(`🚀 FULL UNLIMITED SYNC STARTING`);
+    logger.info(`   Total chats to process: ${totalChats}`);
+    logger.info(`   Messages per chat: UNLIMITED`);
+    logger.info(`   This will download EVERYTHING!`);
+    logger.info(`═══════════════════════════════════════════════════`);
+
     let successCount = 0;
     let failCount = 0;
+    let totalMessagesLoaded = 0;
+    let processedChats = 0;
 
-    for (const chatId of chatIds) {
+    for (const chatId of allChatIds) {
       try {
+        processedChats++;
+        logger.info(`\n[${processedChats}/${totalChats}] Processing chat: ${chatId}`);
+
         const messages = await loadChatHistory(chatId, messagesPerChat);
         if (messages.length > 0) {
           successCount++;
-          logger.debug(`Loaded ${messages.length} messages for ${chatId}`);
+          totalMessagesLoaded += messages.length;
+          logger.info(`✓ Chat ${chatId}: ${messages.length} messages loaded`);
+
+          // Save progress every 10 chats
+          if (successCount % 10 === 0) {
+            logger.info(`\n💾 Saving progress... (${successCount} chats completed)`);
+            saveAll();
+          }
+        } else {
+          logger.info(`⚠ Chat ${chatId}: No messages found`);
         }
 
-        // Optimized delay for 4GB system
-        await delay(1000);
+        // Delay between chats to avoid rate limiting
+        await delay(500);
 
       } catch (chatError) {
         failCount++;
-        logger.error(`Failed to load history for ${chatId}:`, chatError.message);
+        logger.error(`✗ Failed to load history for ${chatId}:`, chatError.message);
+        // Continue with next chat even if one fails
       }
     }
 
-    logger.info(`Bulk history load complete: ${successCount} success, ${failCount} failed`);
+    logger.info(`\n═══════════════════════════════════════════════════`);
+    logger.info(`✓ FULL UNLIMITED SYNC COMPLETED!`);
+    logger.info(`   Total chats processed: ${processedChats}`);
+    logger.info(`   Successful: ${successCount}`);
+    logger.info(`   Failed: ${failCount}`);
+    logger.info(`   Total messages loaded: ${totalMessagesLoaded}`);
+    logger.info(`═══════════════════════════════════════════════════`);
+
     return successCount > 0;
 
   } catch (error) {
@@ -149,8 +187,8 @@ async function loadRecentMessages(jid, hours = 24) {
   const cutoffTime = Math.floor((Date.now() - (hours * 60 * 60 * 1000)) / 1000);
 
   try {
-    // Load 100 recent messages (4GB RAM optimized)
-    const messages = await loadChatHistory(jid, 100);
+    // Load ALL messages (unlimited)
+    const messages = await loadChatHistory(jid, Infinity);
 
     logger.info(`Found ${messages.length} messages for ${jid}`);
     return messages;
@@ -166,14 +204,14 @@ async function preloadImportantChats() {
   if (!currentSock) return;
 
   try {
-    logger.info('Preloading important chats...');
+    logger.info('Preloading ALL important chats (unlimited mode)...');
 
     if (!chatStore || !chatStore.entries) {
       logger.warn('chatStore not available for preloading');
       return;
     }
 
-    // Identifica chat importanti (con molti messaggi o attività recente)
+    // Identifica TUTTE le chat con attività recente (senza limite)
     const importantChats = Array.from(chatStore.entries())
       .map(([jid, messages]) => ({
         jid,
@@ -181,20 +219,23 @@ async function preloadImportantChats() {
         lastActivity: messages.length > 0 ?
           Math.max(...messages.map(m => Number(m.messageTimestamp))) : 0
       }))
-      .sort((a, b) => b.lastActivity - a.lastActivity)
-      .slice(0, 10); // Top 10 chat più attive (4GB RAM optimized)
+      .filter(chat => chat.lastActivity > 0) // Solo chat con messaggi
+      .sort((a, b) => b.lastActivity - a.lastActivity);
+      // NO LIMIT - Process ALL chats!
+
+    logger.info(`Found ${importantChats.length} chats with activity`);
 
     for (const chat of importantChats) {
       try {
-        // Load 100 messages per important chat (4GB RAM optimized)
-        await loadChatHistory(chat.jid, 100);
-        await delay(1500); // Optimized delay for 4GB system
+        // Load ALL messages for each chat (unlimited)
+        await loadChatHistory(chat.jid, Infinity);
+        await delay(500);
       } catch (error) {
-        logger.warn(`Failed to preload important chat ${chat.jid}:`, error.message);
+        logger.warn(`Failed to preload chat ${chat.jid}:`, error.message);
       }
     }
 
-    logger.info(`Preloaded ${importantChats.length} important chats`);
+    logger.info(`✓ Preloaded ${importantChats.length} important chats`);
 
   } catch (error) {
     logger.error('Important chats preload failed:', error.message);
@@ -204,33 +245,53 @@ async function preloadImportantChats() {
 // Integrazione nel sistema esistente
 async function enhancedInitialSync() {
   try {
-    logger.info('Starting enhanced sync with message history loading (4GB RAM optimized)...');
+    logger.info('\n');
+    logger.info('╔═══════════════════════════════════════════════════════════╗');
+    logger.info('║  ENHANCED UNLIMITED SYNC - DOWNLOADING EVERYTHING!       ║');
+    logger.info('╚═══════════════════════════════════════════════════════════╝');
+    logger.info('');
 
-    // Prima esegui la sync base
+    // Prima esegui la sync base (contatti e lista chat)
     if (performInitialSync) {
+      logger.info('📋 Step 1/2: Base sync (contacts & chat list)...');
       await performInitialSync();
+      logger.info('✓ Base sync completed');
     }
 
-    // Poi carica la cronologia dei messaggi - ottimizzato per 4GB RAM
+    // Poi carica TUTTA la cronologia dei messaggi - NESSUN LIMITE!
     if (chatStore && chatStore.size > 0) {
-      logger.info('Loading chat histories (4GB RAM mode)...');
+      logger.info('\n📥 Step 2/2: Loading FULL chat histories (UNLIMITED MODE)...');
+      logger.info(`   Found ${chatStore.size} chats to process`);
+      logger.info('   This will download ALL messages from ALL chats!');
+      logger.info('   Depending on your data, this may take a while...\n');
 
-      // Carica cronologia per 30 chat con 100 messaggi ciascuna
-      // 4GB RAM può gestire molto più dati
-      await loadAllChatsHistory(30, 100);
+      // UNLIMITED SYNC - Scarica TUTTO!
+      // No limits on chats, no limits on messages
+      const success = await loadAllChatsHistory(Infinity, Infinity);
 
-      // Precarica le 10 chat più importanti
-      await preloadImportantChats();
+      if (success) {
+        logger.info('\n✓ Enhanced sync completed successfully - ALL DATA DOWNLOADED!');
+      } else {
+        logger.warn('\n⚠ Enhanced sync completed with warnings');
+      }
 
-      logger.info('Enhanced sync completed successfully (4GB RAM mode)');
-
-      // Save all loaded data to disk
+      // Final save of all data
+      logger.info('\n💾 Saving all synchronized data to disk...');
       saveAll();
-      logger.info('Enhanced sync data saved to disk');
+      logger.info('✓ All data saved successfully!');
+    } else {
+      logger.warn('⚠ No chats found to sync');
     }
+
+    logger.info('\n');
+    logger.info('╔═══════════════════════════════════════════════════════════╗');
+    logger.info('║  SYNC COMPLETE - ALL YOUR DATA IS NOW AVAILABLE!        ║');
+    logger.info('╚═══════════════════════════════════════════════════════════╝');
+    logger.info('');
 
   } catch (error) {
-    logger.error('Enhanced sync failed:', error.message);
+    logger.error('\n✗ Enhanced sync failed:', error.message);
+    logger.error(error.stack);
   }
 }
 
