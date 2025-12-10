@@ -1180,7 +1180,7 @@ function truncate(s = "", max = 64) {
 
 
 async function getContactName(jid, sock) {
-  if (!jid) return "Unknown";
+  if (!jid) return jidFriendly(jid) || "Contact";
 
   const isGroup = jid.endsWith("@g.us");
 
@@ -1200,7 +1200,7 @@ async function getContactName(jid, sock) {
       const phoneNumber = jidFriendly(jid);
       // Look through all contacts to find a match by phone number
       for (const [key, value] of contactStore.entries()) {
-        if (value.phoneNumber === phoneNumber || 
+        if (value.phoneNumber === phoneNumber ||
             (value.id && value.id.includes(phoneNumber)) ||
             (key.includes(phoneNumber))) {
           contact = value;
@@ -1229,29 +1229,21 @@ async function getContactName(jid, sock) {
       }
     }
 
-    // Fallback for groups
+    // Fallback for groups - use last 8 chars of group ID
     const groupId = jid.replace("@g.us", "");
     return `Group ${groupId.slice(-8)}`;
   } else {
-    // For individual contacts - handle LID vs PN
-    if (contact?.id) {
-      // If we have a contact with id field
-      if (contact.phoneNumber) {
-        return contact.phoneNumber; // Show phone number if available
-      } else if (contact.lid) {
-        return `LID:${contact.lid.substring(4)}`; // Show LID
-      }
-    }
-    
-    // Fallback to traditional fields
+    // For individual contacts - try all available fields
+
+    // Priority 1: Human-readable names
     if (contact?.name) return contact.name;
     if (contact?.notify) return contact.notify;
     if (contact?.verifiedName) return contact.verifiedName;
+    if (contact?.pushName) return contact.pushName;
 
-    // Try to get from WhatsApp if sock is available
+    // Priority 2: Try to fetch from WhatsApp if sock is available
     if (sock) {
       try {
-        // Check if it's a LID or PN
         const isLid = jid.startsWith('lid:');
 
         // IMPORTANT: onWhatsApp() does NOT support LIDs, only phone numbers
@@ -1260,7 +1252,7 @@ async function getContactName(jid, sock) {
           const queryJid = formatJid(jid);
           const [result] = await sock.onWhatsApp(queryJid);
           if (result?.exists) {
-            const name = result.name || result.notify;
+            const name = result.name || result.notify || result.verifiedName;
             if (name) {
               // Merge with existing contact to preserve data
               const existing = contactStore.get(jid) || {};
@@ -1281,8 +1273,26 @@ async function getContactName(jid, sock) {
       }
     }
 
-    // Fallback to formatted phone number
-    return jidFriendly(jid);
+    // Priority 3: Phone number (formatted nicely)
+    if (contact?.phoneNumber) {
+      return `+${contact.phoneNumber}`;
+    }
+
+    // Priority 4: Extract phone from JID
+    const friendlyNumber = jidFriendly(jid);
+    if (friendlyNumber && friendlyNumber !== jid) {
+      return `+${friendlyNumber}`;
+    }
+
+    // Priority 5: LID - show last 8 characters
+    if (jid.startsWith('lid:')) {
+      const lidPart = jid.replace('lid:', '').replace('@lid', '');
+      return `Contact ${lidPart.slice(-8)}`;
+    }
+
+    // Final fallback: last 8 chars of whatever we have
+    const cleanJid = jid.replace('@s.whatsapp.net', '').replace('@lid', '');
+    return `Contact ${cleanJid.slice(-8)}`;
   }
 }
 
@@ -2428,12 +2438,31 @@ app.get("/wml/contacts.wml", (req, res) => {
   const list =
     items
       .map((c, idx) => {
-        const name = c.name || c.notify || c.verifiedName || "Sconosciuto";
         const jid = c.id;
+
+        // Get name with intelligent fallback - never "Sconosciuto"
+        let name = c.name || c.notify || c.verifiedName || c.pushName;
+
+        if (!name) {
+          // Try phone number
+          const number = jidFriendly(jid);
+          if (number && number !== jid) {
+            name = `+${number}`;
+          } else if (jid.startsWith('lid:')) {
+            // LID - show last 8 chars
+            const lidPart = jid.replace('lid:', '').replace('@lid', '');
+            name = `Contact ${lidPart.slice(-8)}`;
+          } else {
+            // Final fallback
+            const cleanJid = jid.replace('@s.whatsapp.net', '').replace('@lid', '');
+            name = `Contact ${cleanJid.slice(-8)}`;
+          }
+        }
+
         const number = jidFriendly(jid);
         return `<p>${start + idx + 1}. ${escWml(name)}<br/>
       <small>${escWml(number)}</small><br/>
-      <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}">[Dettagli]</a> 
+      <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}">[Dettagli]</a>
       <a href="/wml/chat.wml?jid=${encodeURIComponent(
         jid
       )}&amp;limit=10">[Chat]</a></p>`;
@@ -7023,9 +7052,25 @@ app.get("/wml/search.results.wml", (req, res) => {
         messages.length > 0 ? messages[messages.length - 1] : null;
       const timestamp = lastMessage ? Number(lastMessage.messageTimestamp) : 0;
 
+      // Get name with intelligent fallback - never "Unknown"
+      let name = c.name || c.notify || c.verifiedName || c.pushName;
+
+      if (!name) {
+        const number = jidFriendly(c.id);
+        if (number && number !== c.id) {
+          name = `+${number}`;
+        } else if (c.id.startsWith('lid:')) {
+          const lidPart = c.id.replace('lid:', '').replace('@lid', '');
+          name = `Contact ${lidPart.slice(-8)}`;
+        } else {
+          const cleanJid = c.id.replace('@s.whatsapp.net', '').replace('@lid', '');
+          name = `Contact ${cleanJid.slice(-8)}`;
+        }
+      }
+
       return {
         type: "contact",
-        name: c.name || c.notify || c.verifiedName || "Unknown",
+        name: name,
         number: jidFriendly(c.id),
         jid: c.id,
         timestamp: timestamp, // Timestamp numerico per ordinamento
@@ -8237,11 +8282,18 @@ app.get("/api/status-detailed", async (req, res) => {
           size: contactStore.size,
           sample: Array.from(contactStore.entries())
             .slice(0, 3)
-            .map(([key, value]) => ({
-              key,
-              name: value.name || value.notify || "Unknown",
-              hasName: !!value.name,
-            })),
+            .map(([key, value]) => {
+              let name = value.name || value.notify || value.verifiedName || value.pushName;
+              if (!name) {
+                const number = jidFriendly(key);
+                name = number && number !== key ? `+${number}` : `Contact ${key.slice(-8)}`;
+              }
+              return {
+                key,
+                name: name,
+                hasName: !!value.name,
+              };
+            }),
         },
         chatStore: {
           size: chatStore.size,
@@ -8494,13 +8546,20 @@ app.get("/api/debug-stores", (req, res) => {
       size: contactStore.size,
       sample: Array.from(contactStore.entries())
         .slice(0, 5)
-        .map(([key, value]) => ({
-          key,
-          name: value.name || value.notify || "Unknown",
-          hasName: !!value.name,
-          notify: value.notify,
-          verifiedName: value.verifiedName,
-        })),
+        .map(([key, value]) => {
+          let name = value.name || value.notify || value.verifiedName || value.pushName;
+          if (!name) {
+            const number = jidFriendly(key);
+            name = number && number !== key ? `+${number}` : `Contact ${key.slice(-8)}`;
+          }
+          return {
+            key,
+            name: name,
+            hasName: !!value.name,
+            notify: value.notify,
+            verifiedName: value.verifiedName,
+          };
+        }),
     },
     chatStore: {
       size: chatStore.size,
