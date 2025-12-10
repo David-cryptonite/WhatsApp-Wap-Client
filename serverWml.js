@@ -1093,14 +1093,36 @@ function truncate(s = "", max = 64) {
 
 
 
-// Update getContactName function for LID support
 async function getContactName(jid, sock) {
   if (!jid) return "Unknown";
 
   const isGroup = jid.endsWith("@g.us");
 
   // Try to get from contactStore first (cached)
-  const contact = contactStore.get(jid);
+  let contact = contactStore.get(jid);
+
+  // If not found and it's not a group, try alternative lookups
+  if (!contact && !isGroup) {
+    // Try with formatted JID
+    const formattedJid = formatJid(jid);
+    if (formattedJid !== jid) {
+      contact = contactStore.get(formattedJid);
+    }
+
+    // If still not found, try by phone number
+    if (!contact) {
+      const phoneNumber = jidFriendly(jid);
+      // Look through all contacts to find a match by phone number
+      for (const [key, value] of contactStore.entries()) {
+        if (value.phoneNumber === phoneNumber || 
+            (value.id && value.id.includes(phoneNumber)) ||
+            (key.includes(phoneNumber))) {
+          contact = value;
+          break;
+        }
+      }
+    }
+  }
 
   if (isGroup) {
     // For groups, try multiple sources
@@ -7555,7 +7577,20 @@ async function connectWithBetterSync() {
       phoneNumber: c.phoneNumber,
       lid: c.lid
     };
+    
+    // Store with both original ID and formatted JID as keys
     contactStore.set(c.id, contact);
+    
+    // Also store with formatted JID if different
+    const formattedJid = formatJid(c.id);
+    if (formattedJid !== c.id) {
+      contactStore.set(formattedJid, contact);
+    }
+    
+    // Store with phone number if available
+    if (c.phoneNumber) {
+      contactStore.set(c.phoneNumber, contact);
+    }
   }
   saveContacts();
 });
