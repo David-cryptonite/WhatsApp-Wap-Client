@@ -7754,7 +7754,22 @@ async function connectWithBetterSync() {
     newMessagesCount++;
     if (message.key?.id) {
       messageStore.set(message.key.id, message);
-      
+
+      // Extract pushName from message and update contact if available
+      if (message.pushName && message.key.remoteJid) {
+        const contactId = message.key.remoteJid;
+        const existing = contactStore.get(contactId);
+
+        // Only update if we don't have a name yet or if pushName is different
+        if (existing && !existing.name && !existing.notify) {
+          contactStore.set(contactId, {
+            ...existing,
+            pushName: message.pushName
+          });
+          logger.debug(`Updated contact ${contactId} with pushName: ${message.pushName}`);
+        }
+      }
+
       // Handle LID/PN in message keys
       const chatId = message.key.remoteJidAlt || message.key.remoteJid;
       const participant = message.key.participantAlt || message.key.participant;
@@ -7802,7 +7817,20 @@ async function connectWithBetterSync() {
 
  sock.ev.on("contacts.set", ({ contacts }) => {
   logger.info(`Contacts set: ${contacts.length}`);
+
+  let withoutName = 0;
+  let withName = 0;
+
   for (const c of contacts) {
+    // Log contacts without any name field for debugging
+    const hasName = c.name || c.notify || c.verifiedName || c.pushName;
+    if (!hasName) {
+      withoutName++;
+      logger.debug(`Contact without name: ${c.id} | Fields: name=${c.name}, notify=${c.notify}, verifiedName=${c.verifiedName}, pushName=${c.pushName}, lid=${c.lid}`);
+    } else {
+      withName++;
+    }
+
     // Transform to new structure if needed
     const contact = {
       id: c.id,
@@ -7810,42 +7838,56 @@ async function connectWithBetterSync() {
       name: c.name,
       notify: c.notify,
       verifiedName: c.verifiedName,
+      pushName: c.pushName, // Add pushName field
       phoneNumber: c.phoneNumber,
       lid: c.lid
     };
-    
+
     // Store with both original ID and formatted JID as keys
     contactStore.set(c.id, contact);
-    
+
     // Also store with formatted JID if different
     const formattedJid = formatJid(c.id);
     if (formattedJid !== c.id) {
       contactStore.set(formattedJid, contact);
     }
-    
+
     // Store with phone number if available
     if (c.phoneNumber) {
       contactStore.set(c.phoneNumber, contact);
     }
   }
+
+  logger.info(`Contacts summary: ${withName} with name, ${withoutName} without name`);
   saveContacts();
 });
 
 
  sock.ev.on("contacts.update", (contacts) => {
+  logger.debug(`Contacts update: ${contacts.length} contacts`);
+
   for (const c of contacts) {
     if (c.id) {
       const existing = contactStore.get(c.id) || {};
+
+      // Log if we're getting a name where there wasn't one before
+      if (!existing.name && !existing.notify && (c.name || c.notify)) {
+        logger.info(`Contact ${c.id} now has name: ${c.name || c.notify}`);
+      }
+
       const updated = {
         ...existing,
         ...c,
         id: c.id,
         jid: c.id, // Always preserve jid
-        lid: c.lid || existing.lid // Preserve lid from existing if not in update
+        lid: c.lid || existing.lid, // Preserve lid from existing if not in update
+        pushName: c.pushName || existing.pushName // Preserve pushName
       };
       contactStore.set(c.id, updated);
     }
   }
+
+  saveContacts();
 });
 
 // Add LID mapping event handler
