@@ -10,6 +10,9 @@ let delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 let saveMessageToDB = () => {};
 let performInitialSync = async () => {};
 
+// Flag to show warning only once
+let chatHistoryWarningShown = false;
+
 // Initialize dependencies from main server
 function initializeDependencies(deps) {
   logger = deps.logger || console;
@@ -46,7 +49,11 @@ async function loadChatHistory(jid, batchSize = 99999999999999) {
 
     // Check if the method exists in Baileys
     if (!currentSock.fetchMessagesFromWA && !currentSock.loadMessages) {
-      logger.warn('Chat history loading not available in this Baileys version');
+      // Show warning only once to avoid log spam
+      if (!chatHistoryWarningShown) {
+        logger.warn('Chat history loading not available in this Baileys version - messages will only load from local store');
+        chatHistoryWarningShown = true;
+      }
       return [];
     }
 
