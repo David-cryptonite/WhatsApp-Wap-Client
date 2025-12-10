@@ -43,19 +43,29 @@ async function loadChatHistory(jid, batchSize = 99999999999999) {
   }
 
   try {
-    logger.info(`Loading chat history for ${jid} (max ${batchSize} messages)`);
-
     const formattedJid = formatJid(jid);
 
-    // Check if the method exists in Baileys
+    // FIRST: Try to load from local chatStore (messages already synced by Baileys)
+    if (chatStore && chatStore.has(formattedJid)) {
+      const chatMessages = chatStore.get(formattedJid) || [];
+      if (chatMessages.length > 0) {
+        logger.info(`Loaded ${chatMessages.length} messages for ${jid} from local store`);
+        return chatMessages.slice(0, batchSize);
+      }
+    }
+
+    // SECOND: Try to fetch from WhatsApp if methods are available
     if (!currentSock.fetchMessagesFromWA && !currentSock.loadMessages) {
       // Show warning only once to avoid log spam
       if (!chatHistoryWarningShown) {
-        logger.warn('Chat history loading not available in this Baileys version - messages will only load from local store');
+        logger.info('Chat history will load automatically from WhatsApp sync (messaging-history.set event)');
         chatHistoryWarningShown = true;
       }
       return [];
     }
+
+    // THIRD: If Baileys has fetch methods, try to use them
+    logger.info(`Fetching chat history from WhatsApp for ${jid} (max ${batchSize} messages)`);
 
     let cursor = undefined;
     let keepFetching = true;
@@ -113,36 +123,22 @@ async function loadAllChatsHistory(maxChatsToLoad = 50, messagesPerChat = 100) {
   }
 
   try {
-    logger.info(`Starting bulk chat history load: ${maxChatsToLoad} chats, ${messagesPerChat} messages each (4GB RAM mode)`);
-
     if (!chatStore || !chatStore.keys) {
       logger.warn('chatStore not available');
       return false;
     }
 
     const chatIds = Array.from(chatStore.keys()).slice(0, maxChatsToLoad);
-    let successCount = 0;
-    let failCount = 0;
+    logger.info(`Chat history already available for ${chatIds.length} chats from local store`);
 
+    let totalMessages = 0;
     for (const chatId of chatIds) {
-      try {
-        const messages = await loadChatHistory(chatId, messagesPerChat);
-        if (messages.length > 0) {
-          successCount++;
-          logger.debug(`Loaded ${messages.length} messages for ${chatId}`);
-        }
-
-        // Optimized delay for 4GB system
-        await delay(1000);
-
-      } catch (chatError) {
-        failCount++;
-        logger.error(`Failed to load history for ${chatId}:`, chatError.message);
-      }
+      const chatMessages = chatStore.get(chatId) || [];
+      totalMessages += chatMessages.length;
     }
 
-    logger.info(`Bulk history load complete: ${successCount} success, ${failCount} failed`);
-    return successCount > 0;
+    logger.info(`Total messages in local store: ${totalMessages} across ${chatIds.length} chats`);
+    return true;
 
   } catch (error) {
     logger.error('Bulk chat history load failed:', error.message);
@@ -154,11 +150,24 @@ async function loadRecentMessages(jid, hours = 24) {
   const cutoffTime = Math.floor((Date.now() - (hours * 60 * 60 * 1000)) / 1000);
 
   try {
-    // Load 100 recent messages (4GB RAM optimized)
-    const messages = await loadChatHistory(jid, 100);
+    const formattedJid = formatJid(jid);
 
-    logger.info(`Found ${messages.length} messages for ${jid}`);
-    return messages;
+    // Load from local chatStore (already synced by Baileys)
+    if (chatStore && chatStore.has(formattedJid)) {
+      const allMessages = chatStore.get(formattedJid) || [];
+
+      // Filter by time if needed
+      const recentMessages = allMessages.filter(msg => {
+        const msgTime = Number(msg.messageTimestamp) || 0;
+        return msgTime >= cutoffTime;
+      });
+
+      logger.info(`Found ${recentMessages.length} recent messages for ${jid} (last ${hours} hours)`);
+      return recentMessages;
+    }
+
+    logger.info(`No messages found for ${jid} in local store`);
+    return [];
 
   } catch (error) {
     logger.error(`Failed to load recent messages for ${jid}:`, error.message);
@@ -171,8 +180,6 @@ async function preloadImportantChats() {
   if (!currentSock) return;
 
   try {
-    logger.info('Preloading important chats...');
-
     if (!chatStore || !chatStore.entries) {
       logger.warn('chatStore not available for preloading');
       return;
@@ -187,19 +194,14 @@ async function preloadImportantChats() {
           Math.max(...messages.map(m => Number(m.messageTimestamp))) : 0
       }))
       .sort((a, b) => b.lastActivity - a.lastActivity)
-      .slice(0, 9999999999999999); // Top 10 chat più attive (4GB RAM optimized)
+      .slice(0, 20); // Top 20 most active chats
 
+    let totalMessages = 0;
     for (const chat of importantChats) {
-      try {
-        // Load 100 messages per important chat (4GB RAM optimized)
-        await loadChatHistory(chat.jid, 9999999999999999);
-        await delay(1500); // Optimized delay for 4GB system
-      } catch (error) {
-        logger.warn(`Failed to preload important chat ${chat.jid}:`, error.message);
-      }
+      totalMessages += chat.messageCount;
     }
 
-    logger.info(`Preloaded ${importantChats.length} important chats`);
+    logger.info(`Important chats already loaded: ${importantChats.length} chats with ${totalMessages} messages`);
 
   } catch (error) {
     logger.error('Important chats preload failed:', error.message);
@@ -209,25 +211,30 @@ async function preloadImportantChats() {
 // Integrazione nel sistema esistente
 async function enhancedInitialSync() {
   try {
-    logger.info('Starting enhanced sync with message history loading (4GB RAM optimized)...');
+    logger.info('Starting enhanced sync...');
 
     // Prima esegui la sync base
     if (performInitialSync) {
       await performInitialSync();
     }
 
-    // Poi carica la cronologia dei messaggi - ottimizzato per 4GB RAM
+    // Chat histories are automatically loaded by Baileys via messaging-history.set event
     if (chatStore && chatStore.size > 0) {
-      logger.info('Loading chat histories (4GB RAM mode)...');
+      const totalChats = chatStore.size;
+      let totalMessages = 0;
 
-      // Carica cronologia per 30 chat con 100 messaggi ciascuna
-      // 4GB RAM può gestire molto più dati
-      await loadAllChatsHistory(999999999999999999, 999999999999999999999);
+      for (const [jid, messages] of chatStore.entries()) {
+        totalMessages += messages.length;
+      }
 
-      // Precarica le 10 chat più importanti
+      logger.info(`Chat history loaded: ${totalChats} chats with ${totalMessages} messages (from Baileys sync)`);
+
+      // Report on important chats
       await preloadImportantChats();
 
-      logger.info('Enhanced sync completed successfully (4GB RAM mode)');
+      logger.info('Enhanced sync completed successfully');
+    } else {
+      logger.info('No chat history available yet - waiting for Baileys messaging-history.set event');
     }
 
   } catch (error) {
