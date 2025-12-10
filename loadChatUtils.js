@@ -10,9 +10,6 @@ let delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 let saveMessageToDB = () => {};
 let performInitialSync = async () => {};
 
-// Flag to show warning only once
-let chatHistoryWarningShown = false;
-
 // Initialize dependencies from main server
 function initializeDependencies(deps) {
   logger = deps.logger || console;
@@ -56,11 +53,8 @@ async function loadChatHistory(jid, batchSize = 99999999999999) {
 
     // SECOND: Try to fetch from WhatsApp if methods are available
     if (!currentSock.fetchMessagesFromWA && !currentSock.loadMessages) {
-      // Show warning only once to avoid log spam
-      if (!chatHistoryWarningShown) {
-        logger.info('Chat history will load automatically from WhatsApp sync (messaging-history.set event)');
-        chatHistoryWarningShown = true;
-      }
+      // This is normal - Baileys loads via messaging-history.set event
+      // No warning needed, just return empty and let Baileys sync handle it
       return [];
     }
 
