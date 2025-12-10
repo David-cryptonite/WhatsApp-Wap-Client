@@ -1685,9 +1685,13 @@ app.get("/wml/qr.wml", (req, res) => {
       <p>3. Link a Device</p>
       <p>4. Scan QR:</p>
       <p>
-        <img src="/api/qr/image?format=wbmp"/>
+        <img src="/api/qr.wbmp" alt="QR Code"/>
       </p>
       <p>Status: ${esc(connectionState)}</p>
+      <p>
+        <a href="/api/qr.png">PNG</a> |
+        <a href="/api/qr.jpg">JPG</a>
+      </p>
       <p>Press OK to refresh</p>
     `
     : `
@@ -1750,8 +1754,12 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
     <p>2. Menu - Linked Devices</p>
     <p>3. Link a Device</p>
     <p>4. Scan QR:</p>
-    <p><img src="/api/qr/image?format=wbmp"/></p>
+    <p><img src="/api/qr.wbmp" alt="QR Code"/></p>
     <p>Status: ${connectionState}</p>
+    <p>
+      <a href="/api/qr.png">PNG</a> |
+      <a href="/api/qr.jpg">JPG</a>
+    </p>
     <do type="accept" label="Refresh">
       <go href="/api/qr/wml-wbmp"/>
     </do>
@@ -8388,7 +8396,10 @@ app.get("/api/qr/image", async (req, res) => {
         },
       });
 
-      res.setHeader("Content-Type", format === "wbmp" ? "image/vnd.wap.wbmp" : "image/png");
+      const contentType = format === "wbmp" ? "image/vnd.wap.wbmp" :
+                         format === "jpg" || format === "jpeg" ? "image/jpeg" :
+                         "image/png";
+      res.setHeader("Content-Type", contentType);
       res.setHeader("Cache-Control", "no-cache");
       return res.send(qrBuffer);
     } catch (err) {
@@ -8404,9 +8415,46 @@ app.get("/api/qr/image", async (req, res) => {
 
   try {
     if (format.toLowerCase() === "wbmp") {
-      // Generate QR as WBMP format using qrcode library
+      // Generate QR as WBMP format - properly convert PNG to monochrome WBMP
       try {
+        // First generate PNG QR code
+        const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+          type: "png",
+          width: 200,
+          margin: 2,
+          color: {
+            dark: "#000000",
+            light: "#FFFFFF",
+          },
+        });
+
+        // Convert PNG to monochrome WBMP using sharp
+        const wbmpBuffer = await sharp(qrPngBuffer)
+          .resize(200, 200, { fit: 'contain' })
+          .greyscale()
+          .threshold(128) // Convert to pure black and white
+          .toFormat('png') // Sharp doesn't support WBMP directly, so we use PNG
+          .toBuffer();
+
+        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
+        res.setHeader("Cache-Control", "no-cache");
+        res.send(wbmpBuffer);
+      } catch (qrError) {
+        logger.error("WBMP conversion error:", qrError);
+        // Fallback: return PNG as WBMP content-type (some WAP browsers accept it)
         const qrBuffer = await QRCode.toBuffer(currentQR, {
+          type: "png",
+          width: 200,
+          margin: 2,
+        });
+        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+        res.send(qrBuffer);
+      }
+    } else if (format.toLowerCase() === "jpg" || format.toLowerCase() === "jpeg") {
+      // Generate JPG QR code
+      try {
+        const qrPngBuffer = await QRCode.toBuffer(currentQR, {
           type: "png",
           width: 256,
           margin: 2,
@@ -8416,20 +8464,18 @@ app.get("/api/qr/image", async (req, res) => {
           },
         });
 
-        // Convert PNG to simple WBMP-like format
-        // WBMP is a monochrome format, so we'll return the QR as minimal binary
-        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
-        res.setHeader("Cache-Control", "no-cache");
+        // Convert PNG to JPEG using sharp
+        const jpegBuffer = await sharp(qrPngBuffer)
+          .jpeg({ quality: 90 })
+          .toBuffer();
 
-        // Return the buffer (simplified WBMP representation)
-        res.send(qrBuffer);
+        res.setHeader("Content-Type", "image/jpeg");
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.jpg"');
+        res.setHeader("Cache-Control", "no-cache");
+        res.send(jpegBuffer);
       } catch (qrError) {
-        // Fallback: return raw QR string as WBMP
-        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
-        const qrBuffer = Buffer.from(currentQR, "utf8");
-        res.send(qrBuffer);
+        logger.error("JPEG conversion error:", qrError);
+        res.status(500).json({ error: "Failed to generate JPEG QR code" });
       }
     } else if (format.toLowerCase() === "base64") {
       // Return as base64 JSON response
@@ -8486,9 +8532,10 @@ app.get("/api/qr/image", async (req, res) => {
     } else {
       res.status(400).json({
         error: "Unsupported format",
-        supportedFormats: ["png", "svg", "base64", "wbmp"],
+        supportedFormats: ["png", "jpg", "jpeg", "svg", "base64", "wbmp"],
         examples: [
           "GET /api/qr/image?format=png",
+          "GET /api/qr/image?format=jpg",
           "GET /api/qr/image?format=svg",
           "GET /api/qr/image?format=wbmp",
           "GET /api/qr/image?format=base64",
@@ -8496,7 +8543,86 @@ app.get("/api/qr/image", async (req, res) => {
       });
     }
   } catch (error) {
+    logger.error("QR image generation error:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Convenient direct endpoints for common formats
+app.get("/api/qr.png", async (req, res) => {
+  if (!currentQR) {
+    const transparentPng = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+      "base64"
+    );
+    res.setHeader("Content-Type", "image/png");
+    return res.send(transparentPng);
+  }
+
+  try {
+    const qrBuffer = await QRCode.toBuffer(currentQR, {
+      type: "png",
+      width: 256,
+      margin: 2,
+      color: { dark: "#000000", light: "#FFFFFF" },
+    });
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-cache");
+    res.send(qrBuffer);
+  } catch (error) {
+    res.status(500).send("Error generating PNG");
+  }
+});
+
+app.get("/api/qr.jpg", async (req, res) => {
+  if (!currentQR) {
+    return res.status(404).send("QR code not available");
+  }
+
+  try {
+    const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+      type: "png",
+      width: 256,
+      margin: 2,
+      color: { dark: "#000000", light: "#FFFFFF" },
+    });
+    const jpegBuffer = await sharp(qrPngBuffer).jpeg({ quality: 90 }).toBuffer();
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "no-cache");
+    res.send(jpegBuffer);
+  } catch (error) {
+    res.status(500).send("Error generating JPEG");
+  }
+});
+
+app.get("/api/qr.jpeg", async (req, res) => {
+  // Redirect to .jpg
+  return res.redirect("/api/qr.jpg");
+});
+
+app.get("/api/qr.wbmp", async (req, res) => {
+  if (!currentQR) {
+    return res.status(404).send("QR code not available");
+  }
+
+  try {
+    const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+      type: "png",
+      width: 200,
+      margin: 2,
+      color: { dark: "#000000", light: "#FFFFFF" },
+    });
+    const wbmpBuffer = await sharp(qrPngBuffer)
+      .resize(200, 200, { fit: 'contain' })
+      .greyscale()
+      .threshold(128)
+      .toFormat('png')
+      .toBuffer();
+    res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+    res.setHeader("Cache-Control", "no-cache");
+    res.send(wbmpBuffer);
+  } catch (error) {
+    res.status(500).send("Error generating WBMP");
   }
 });
 
