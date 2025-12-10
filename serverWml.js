@@ -1678,50 +1678,66 @@ app.get("/wml/qr.wml", (req, res) => {
     setTimeout(() => connectWithBetterSync(), 1000);
   }
 
+  const esc = (text) =>
+    (text || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
   const body = isConnected
-    ? `
-      <p>WhatsApp Connected</p>
-      <p>You are logged in</p>
-      <p>
-        <a href="/wml/home.wml">Go to Home</a>
-      </p>
-    `
+    ? `<p>WhatsApp Connected</p>
+<p>You are logged in</p>
+<p>
+  <a href="/wml/home.wml">Go to Home</a>
+</p>`
     : currentQR
-    ? `
-      <p>Scan QR Code</p>
-      <p>1. Open WhatsApp</p>
-      <p>2. Menu - Linked Devices</p>
-      <p>3. Link a Device</p>
-      <p>4. Scan QR:</p>
-      <p>
-        <img src="/api/qr.wbmp" alt="QR Code"/>
-      </p>
-      <p>Status: ${esc(connectionState)}</p>
-      <p>
-        <a href="/api/qr-tiny.wbmp">Tiny</a> |
-        <a href="/api/qr.png">PNG</a> |
-        <a href="/api/qr.jpg">JPG</a>
-      </p>
-      <p><small>96x96px - Use Tiny if crash</small></p>
-      <p>Press OK to refresh</p>
-    `
-    : `
-      <p>Connecting...</p>
-      <p>Status: ${esc(connectionState)}</p>
-      <p>QR code loading</p>
-      <p>Please wait and refresh</p>
-      <p><small>Debug: isConn=${isConnecting}</small></p>
-    `;
+    ? `<p>Scan QR Code</p>
+<p>1. Open WhatsApp</p>
+<p>2. Menu - Linked Devices</p>
+<p>3. Link a Device</p>
+<p>4. Scan QR:</p>
 
-  const body_full = `
-    ${body}
-    <p>Port ${port}</p>
-    <do type="accept" label="Refresh">
-      <go href="/wml/qr.wml"/>
-    </do>
-  `;
+<p align="center">
+  <img src="/api/qr.wbmp" alt="QR Code"/>
+</p>
 
-  sendWml(res, card("qr", "QR Code", body_full));
+<p>Status: ${esc(connectionState)}</p>
+<p>
+  <a href="/api/qr-tiny.wbmp">Tiny</a> |
+  <a href="/api/qr.png">PNG</a> |
+  <a href="/api/qr.jpg">JPG</a>
+</p>
+<p><small>96x96px - Use Tiny if crash</small></p>
+
+<do type="accept" label="Refresh">
+  <go href="/wml/qr.wml"/>
+</do>`
+    : `<p>Connecting...</p>
+<p>Status: ${esc(connectionState)}</p>
+<p>QR code loading</p>
+<p>Please wait and refresh</p>
+<p><small>Debug: isConn=${isConnecting}</small></p>
+
+<do type="accept" label="Refresh">
+  <go href="/wml/qr.wml"/>
+</do>`;
+
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+<wml>
+<head><meta http-equiv="Cache-Control" content="no-cache"/></head>
+<card id="qr" title="QR Code">
+${body}
+<p>Port ${port}</p>
+</card>
+</wml>`;
+
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Pragma", "no-cache");
+
+  const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+  res.send(encodedBuffer);
 });
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
@@ -1736,60 +1752,62 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
     setTimeout(() => connectWithBetterSync(), 1000);
   }
 
+  let body;
   if (isConnected) {
-    res.set("Content-Type", "text/vnd.wap.wml");
-    return res.send(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
-<wml>
-  <card id="connected" title="WhatsApp">
-    <p>WhatsApp Connected</p>
-    <p>You are logged in</p>
-    <p>
-      <a href="/wml/home.wml">Go to Home</a>
-    </p>
-  </card>
-</wml>`);
+    body = `<p>WhatsApp Connected</p>
+<p>You are logged in</p>
+<p>
+  <a href="/wml/home.wml">Go to Home</a>
+</p>`;
+  } else if (!currentQR) {
+    body = `<p>Connecting...</p>
+<p>State: ${connectionState}</p>
+<p>QR code loading</p>
+<p>Please wait and refresh</p>
+<p><small>isConn=${isConnecting}</small></p>
+
+<do type="accept" label="Refresh">
+  <go href="/api/qr/wml-wbmp"/>
+</do>`;
+  } else {
+    body = `<p>Scan QR Code</p>
+<p>1. Open WhatsApp</p>
+<p>2. Menu - Linked Devices</p>
+<p>3. Link a Device</p>
+<p>4. Scan QR:</p>
+
+<p align="center">
+  <img src="/api/qr.wbmp" alt="QR Code"/>
+</p>
+
+<p>Status: ${connectionState}</p>
+<p>
+  <a href="/api/qr-tiny.wbmp">Tiny</a> |
+  <a href="/api/qr.png">PNG</a> |
+  <a href="/api/qr.jpg">JPG</a>
+</p>
+<p><small>96x96px - Use Tiny if crash</small></p>
+
+<do type="accept" label="Refresh">
+  <go href="/api/qr/wml-wbmp"/>
+</do>`;
   }
 
-  if (!currentQR) {
-    res.set("Content-Type", "text/vnd.wap.wml");
-    return res.send(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
+  const wmlOutput = `<?xml version="1.0"?>
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>
-  <card id="noqr" title="QR">
-    <p>Connecting...</p>
-    <p>State: ${connectionState}</p>
-    <p>QR code loading</p>
-    <p>Please wait and refresh</p>
-    <p><small>isConn=${isConnecting}</small></p>
-  </card>
-</wml>`);
-  }
+<head><meta http-equiv="Cache-Control" content="no-cache"/></head>
+<card id="qr" title="WhatsApp QR">
+${body}
+</card>
+</wml>`;
 
-  // WAP 1.0 compatible page with WBMP QR code
-  res.set("Content-Type", "text/vnd.wap.wml");
-  res.send(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
-<wml>
-  <card id="qr" title="WhatsApp QR">
-    <p>Scan QR Code</p>
-    <p>1. Open WhatsApp</p>
-    <p>2. Menu - Linked Devices</p>
-    <p>3. Link a Device</p>
-    <p>4. Scan QR:</p>
-    <p><img src="/api/qr.wbmp" alt="QR Code"/></p>
-    <p>Status: ${connectionState}</p>
-    <p>
-      <a href="/api/qr-tiny.wbmp">Tiny</a> |
-      <a href="/api/qr.png">PNG</a> |
-      <a href="/api/qr.jpg">JPG</a>
-    </p>
-    <p><small>96x96px - Use Tiny if crash</small></p>
-    <do type="accept" label="Refresh">
-      <go href="/api/qr/wml-wbmp"/>
-    </do>
-  </card>
-</wml>`);
+  res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Pragma", "no-cache");
+
+  const encodedBuffer = iconv.encode(wmlOutput, "iso-8859-1");
+  res.send(encodedBuffer);
 });
 
 // ============ SETTINGS PAGE ============
