@@ -1134,6 +1134,13 @@ function ensureStoresLoaded() {
   return false;
 }
 
+// ============ MIDDLEWARE: AUTO-RELOAD STORES FROM DISK ============
+// Automatically ensure stores are loaded before every request
+app.use((req, res, next) => {
+  ensureStoresLoaded();
+  next();
+});
+
 function wmlDoc(cards, scripts = "") {
   const head = scripts
     ? `<head><meta http-equiv="Cache-Control" content="max-age=0"/>${scripts}</head>`
@@ -2374,9 +2381,6 @@ app.get("/wml/favorites-add.wml", (req, res) => {
 // Enhanced Contacts with search and pagination
 
 app.get("/wml/contacts.wml", (req, res) => {
-  // Ensure stores are loaded from disk if empty
-  ensureStoresLoaded();
-
   const userAgent = req.headers["user-agent"] || "";
 
   // Usa req.query per GET. Se il form usa POST, i dati sarebbero in req.body.
@@ -9059,9 +9063,6 @@ app.post("/api/presence", async (req, res) => {
 
 app.get("/api/contacts/all", async (req, res) => {
   try {
-    // Ensure stores are loaded from disk if empty
-    ensureStoresLoaded();
-
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
     // Auto-sync if no contacts and not synced yet
@@ -9516,9 +9517,6 @@ app.post("/api/chats/bulk-by-numbers", async (req, res) => {
 
 app.get("/api/contacts", async (req, res) => {
   try {
-    // Ensure stores are loaded from disk if empty
-    ensureStoresLoaded();
-
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
     const contacts = Array.from(contactStore.values());
@@ -9563,9 +9561,6 @@ app.get("/api/contacts", async (req, res) => {
 
 app.get("/api/chats", async (req, res) => {
   try {
-    // Ensure stores are loaded from disk if empty
-    ensureStoresLoaded();
-
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
     const chats = Array.from(chatStore.keys()).map((chatId) => {
@@ -9605,9 +9600,6 @@ app.get("/api/chats", async (req, res) => {
 
 app.get("/api/messages/:jid", async (req, res) => {
   try {
-    // Ensure stores are loaded from disk if empty
-    ensureStoresLoaded();
-
     const { jid } = req.params;
     const { limit = 50, offset = 0 } = req.query;
 
@@ -11362,9 +11354,6 @@ app.get("/wml/sync.contacts.wml", async (req, res) => {
 
 // Enhanced Chats page with search and pagination
 app.get("/wml/chats.wml", async (req, res) => {
-  // Ensure stores are loaded from disk if empty
-  ensureStoresLoaded();
-
   const userAgent = req.headers["user-agent"] || "";
 
   // Use req.query for GET requests, like in contacts
