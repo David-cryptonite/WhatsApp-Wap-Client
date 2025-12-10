@@ -139,6 +139,29 @@ class PersistentStorage {
     return this.saveToFile(type, data)
   }
 
+  // Force process save queue immediately (for shutdown)
+  async flushSaveQueue() {
+    if (this.saveQueue.size === 0) {
+      return
+    }
+
+    console.log(`💾 Flushing ${this.saveQueue.size} queued saves before shutdown...`)
+
+    const operations = Array.from(this.saveQueue.entries())
+    this.saveQueue.clear()
+    this.isProcessing = false
+
+    for (const [type, data] of operations) {
+      try {
+        await this.saveToFile(type, data)
+      } catch (error) {
+        console.error(`❌ Failed to flush ${type}:`, error.message)
+      }
+    }
+
+    console.log(`✅ All queued saves completed`)
+  }
+
   // Clean up old message data to prevent files from growing too large
   cleanupOldMessages(messageStore, chatStore, maxMessagesPerChat = 100) {
     let cleaned = 0

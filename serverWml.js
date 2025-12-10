@@ -7854,7 +7854,10 @@ async function getContactWithLidSupport(jid, sock) {
 const gracefulShutdown = async (signal) => {
   logger.info(`Received ${signal}. Shutting down gracefully...`);
   try {
-    // ADD THESE LINES:
+    // Flush any queued saves first
+    await storage.flushSaveQueue();
+
+    // Then save all current data immediately
     logger.info("Saving all data before shutdown...");
     await storage.saveImmediately("contacts", contactStore);
     await storage.saveImmediately("chats", chatStore);
@@ -7863,6 +7866,9 @@ const gracefulShutdown = async (signal) => {
       isFullySynced,
       syncAttempts,
       lastSync: new Date().toISOString(),
+      contactsCount: contactStore.size,
+      chatsCount: chatStore.size,
+      messagesCount: messageStore.size,
     });
     logger.info("Data saved successfully");
 
@@ -7874,11 +7880,13 @@ const gracefulShutdown = async (signal) => {
       logger.info("No WhatsApp connection to close");
     }
 
-    contactStore.clear();
-    chatStore.clear();
-    messageStore.clear();
+    // Don't clear stores - data already saved to disk
+    // If there was an error saving, clearing would lose data
+    // contactStore.clear();
+    // chatStore.clear();
+    // messageStore.clear();
 
-    logger.info("Graceful shutdown completed");
+    logger.info("Graceful shutdown completed - data preserved on disk");
     process.exit(0);
   } catch (error) {
     logger.error("Error during shutdown:", error);
@@ -8049,11 +8057,15 @@ if (cluster.isMaster || cluster.isPrimary) {
         }
       }, 10 * 60 * 1000); // Check every 10 minutes (less frequent for 4GB system)
 
-      // Periodic save - increased interval to reduce Raspberry Pi I/O load
-      setInterval(() => {
-        saveAll();
-        logger.info("Periodic save completed");
-      }, 15 * 60 * 1000); // Every 15 minutes instead of 10
+      // Periodic save - flush queued saves to ensure data persistence
+      setInterval(async () => {
+        try {
+          await storage.flushSaveQueue();
+          logger.info("✓ Periodic save completed (all queued data flushed to disk)");
+        } catch (error) {
+          logger.error("❌ Periodic save failed:", error);
+        }
+      }, 5 * 60 * 1000); // Every 5 minutes - balance between data safety and I/O load
     } else {
       // Other workers don't connect to WhatsApp, they just handle HTTP requests
       logger.info(`📡 Worker #${cluster.worker.id} - Handling HTTP requests only (WhatsApp handled by Worker #1)`);
@@ -8091,10 +8103,21 @@ if (cluster.isMaster || cluster.isPrimary) {
         sock.end();
       }
 
-      // Save all data
-      logger.info("Saving all data...");
+      // Flush any queued saves first, then save all data IMMEDIATELY
+      logger.info("Saving all data immediately...");
       try {
-        saveAll();
+        await storage.flushSaveQueue();
+        await storage.saveImmediately("contacts", contactStore);
+        await storage.saveImmediately("chats", chatStore);
+        await storage.saveImmediately("messages", messageStore);
+        await storage.saveImmediately("meta", {
+          isFullySynced,
+          syncAttempts,
+          lastSync: new Date().toISOString(),
+          contactsCount: contactStore.size,
+          chatsCount: chatStore.size,
+          messagesCount: messageStore.size,
+        });
         logger.info("✓ All data saved successfully");
       } catch (error) {
         logger.error("Error saving data during shutdown:", error);
