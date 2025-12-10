@@ -1209,23 +1209,27 @@ async function getContactName(jid, sock) {
       try {
         // Check if it's a LID or PN
         const isLid = jid.startsWith('lid:');
-        const queryJid = isLid ? jid : formatJid(jid);
-        
-        const [result] = await sock.onWhatsApp(queryJid);
-        if (result?.exists) {
-          const name = result.name || result.notify;
-          if (name) {
-            // Merge with existing contact to preserve data
-            const existing = contactStore.get(jid) || {};
-            contactStore.set(jid, {
-              ...existing,
-              id: queryJid,
-              jid: queryJid,
-              name: name,
-              phoneNumber: isLid ? jidFriendly(jid) : existing.phoneNumber,
-              lid: isLid ? jid : existing.lid
-            });
-            return name;
+
+        // IMPORTANT: onWhatsApp() does NOT support LIDs, only phone numbers
+        // Skip onWhatsApp() call for LIDs to avoid "LIDs are not supported with onWhatsApp" error
+        if (!isLid) {
+          const queryJid = formatJid(jid);
+          const [result] = await sock.onWhatsApp(queryJid);
+          if (result?.exists) {
+            const name = result.name || result.notify;
+            if (name) {
+              // Merge with existing contact to preserve data
+              const existing = contactStore.get(jid) || {};
+              contactStore.set(jid, {
+                ...existing,
+                id: queryJid,
+                jid: queryJid,
+                name: name,
+                phoneNumber: existing.phoneNumber,
+                lid: existing.lid
+              });
+              return name;
+            }
           }
         }
       } catch (error) {
