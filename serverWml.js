@@ -1173,12 +1173,15 @@ async function getContactName(jid, sock) {
         if (result?.exists) {
           const name = result.name || result.notify;
           if (name) {
-            // Cache it with new structure
-            contactStore.set(jid, { 
+            // Merge with existing contact to preserve data
+            const existing = contactStore.get(jid) || {};
+            contactStore.set(jid, {
+              ...existing,
               id: queryJid,
+              jid: queryJid,
               name: name,
-              phoneNumber: isLid ? jidFriendly(jid) : undefined,
-              lid: isLid ? jid : undefined
+              phoneNumber: isLid ? jidFriendly(jid) : existing.phoneNumber,
+              lid: isLid ? jid : existing.lid
             });
             return name;
           }
@@ -7453,10 +7456,11 @@ async function connectWithBetterSync() {
             const delay = Math.min(5000 * Math.pow(2, syncAttempts), 30000); // Exponential backoff
             setTimeout(connectWithBetterSync, delay);
           } else {
-            // Clear stores on logout
-            contactStore.clear();
-            chatStore.clear();
-            messageStore.clear();
+            // Don't clear stores on logout - keep persistent data
+            // contactStore.clear();
+            // chatStore.clear();
+            // messageStore.clear();
+            logger.info("Logout detected - keeping persistent data on disk");
             isFullySynced = false;
             syncAttempts = 0;
           }
@@ -7465,6 +7469,34 @@ async function connectWithBetterSync() {
           currentQR = null;
           isFullySynced = false;
           syncAttempts = 0;
+
+          // Reload persistent data from disk and merge with in-memory data
+          logger.info("Reloading persistent data from disk...");
+          const diskData = storage.loadAllData();
+
+          // Merge contacts: keep existing in-memory contacts + add from disk
+          for (const [key, value] of diskData.contacts) {
+            if (!contactStore.has(key)) {
+              contactStore.set(key, value);
+            }
+          }
+          logger.info(`📱 Merged ${diskData.contacts.size} contacts from disk, total: ${contactStore.size}`);
+
+          // Merge chats: keep existing in-memory chats + add from disk
+          for (const [key, value] of diskData.chats) {
+            if (!chatStore.has(key)) {
+              chatStore.set(key, value);
+            }
+          }
+          logger.info(`💬 Merged ${diskData.chats.size} chats from disk, total: ${chatStore.size}`);
+
+          // Merge messages: keep existing in-memory messages + add from disk
+          for (const [key, value] of diskData.messages) {
+            if (!messageStore.has(key)) {
+              messageStore.set(key, value);
+            }
+          }
+          logger.info(`📨 Merged ${diskData.messages.size} messages from disk, total: ${messageStore.size}`);
 
           // Start sync process
           setTimeout(enhancedInitialSync, 5000);
@@ -7487,7 +7519,16 @@ async function connectWithBetterSync() {
         }
 
         for (const contact of contacts) {
-          contactStore.set(contact.id, contact);
+          // Merge with existing contact to preserve jid/lid
+          const existing = contactStore.get(contact.id) || {};
+          const merged = {
+            ...existing,
+            ...contact,
+            id: contact.id,
+            jid: contact.id, // Always preserve jid
+            lid: contact.lid || existing.lid // Preserve lid from existing if not in update
+          };
+          contactStore.set(contact.id, merged);
         }
 
         for (const msg of messages) {
