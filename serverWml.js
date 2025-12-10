@@ -1669,6 +1669,15 @@ app.get("/wml/status.wml", (req, res) => {
 app.get("/wml/qr.wml", (req, res) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
+  // Debug info
+  logger.info(`QR page accessed - isConnected: ${isConnected}, connectionState: ${connectionState}, currentQR: ${currentQR ? 'exists' : 'null'}, isConnecting: ${isConnecting}`);
+
+  // Force reconnection if stuck
+  if (!isConnected && !currentQR && connectionState === 'close' && !isConnecting) {
+    logger.info('QR page: forcing reconnection...');
+    setTimeout(() => connectWithBetterSync(), 1000);
+  }
+
   const body = isConnected
     ? `
       <p>WhatsApp Connected</p>
@@ -1700,7 +1709,8 @@ app.get("/wml/qr.wml", (req, res) => {
       <p>Connecting...</p>
       <p>Status: ${esc(connectionState)}</p>
       <p>QR code loading</p>
-      <p>Please wait</p>
+      <p>Please wait and refresh</p>
+      <p><small>Debug: isConn=${isConnecting}</small></p>
     `;
 
   const body_full = `
@@ -1716,6 +1726,15 @@ app.get("/wml/qr.wml", (req, res) => {
 
 app.get("/api/qr/wml-wbmp", (req, res) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
+
+  // Debug info
+  logger.info(`QR WML page accessed - isConnected: ${isConnected}, connectionState: ${connectionState}, currentQR: ${currentQR ? 'exists' : 'null'}`);
+
+  // Force reconnection if stuck
+  if (!isConnected && !currentQR && connectionState === 'close' && !isConnecting) {
+    logger.info('QR WML page: forcing reconnection...');
+    setTimeout(() => connectWithBetterSync(), 1000);
+  }
 
   if (isConnected) {
     res.set("Content-Type", "text/vnd.wap.wml");
@@ -1739,8 +1758,10 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
 <wml>
   <card id="noqr" title="QR">
     <p>Connecting...</p>
+    <p>State: ${connectionState}</p>
     <p>QR code loading</p>
-    <p>Please wait</p>
+    <p>Please wait and refresh</p>
+    <p><small>isConn=${isConnecting}</small></p>
   </card>
 </wml>`);
   }
