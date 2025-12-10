@@ -7571,6 +7571,7 @@ async function connectWithBetterSync() {
     // Transform to new structure if needed
     const contact = {
       id: c.id,
+      jid: c.id, // Explicitly store jid to prevent "unknown" contacts
       name: c.name,
       notify: c.notify,
       verifiedName: c.verifiedName,
@@ -7603,7 +7604,9 @@ async function connectWithBetterSync() {
       const updated = {
         ...existing,
         ...c,
-        id: c.id
+        id: c.id,
+        jid: c.id, // Always preserve jid
+        lid: c.lid || existing.lid // Preserve lid from existing if not in update
       };
       contactStore.set(c.id, updated);
     }
@@ -7613,14 +7616,16 @@ async function connectWithBetterSync() {
 // Add LID mapping event handler
 sock.ev.on('lid-mapping.update', (update) => {
   console.log('New LID/PN mapping:', update);
-  
+
   // Update your contact store with this mapping
   if (update.lid && update.pn) {
     const existingContact = contactStore.get(update.lid);
     if (existingContact) {
       contactStore.set(update.lid, {
         ...existingContact,
-        phoneNumber: update.pn
+        phoneNumber: update.pn,
+        jid: existingContact.jid || existingContact.id, // Preserve jid
+        lid: update.lid // Explicitly preserve lid
       });
     }
   }
