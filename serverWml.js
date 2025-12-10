@@ -844,6 +844,48 @@ let isFullySynced = persistentData.meta.isFullySynced;
 let syncAttempts = persistentData.meta.syncAttempts;
 let isConnecting = false; // Prevent race conditions in connection logic
 
+// ============ QR CODE SHARING BETWEEN CLUSTER WORKERS ============
+// QR code file for sharing between cluster workers
+const QR_FILE = path.join(storage.dataDir, 'current_qr.json');
+
+// Save QR to file for cluster workers
+function saveQRToFile(qr) {
+  try {
+    fs.writeFileSync(QR_FILE, JSON.stringify({ qr, timestamp: Date.now() }));
+    logger.info('✓ QR code saved to file for cluster workers');
+  } catch (error) {
+    logger.error('Failed to save QR to file:', error);
+  }
+}
+
+// Load QR from file (for cluster workers)
+function loadQRFromFile() {
+  try {
+    if (fs.existsSync(QR_FILE)) {
+      const data = JSON.parse(fs.readFileSync(QR_FILE, 'utf8'));
+      // QR expires after 2 minutes
+      if (Date.now() - data.timestamp < 120000) {
+        return data.qr;
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to load QR from file:', error);
+  }
+  return null;
+}
+
+// Clear QR file when connected
+function clearQRFile() {
+  try {
+    if (fs.existsSync(QR_FILE)) {
+      fs.unlinkSync(QR_FILE);
+      logger.info('✓ QR file cleared');
+    }
+  } catch (error) {
+    logger.error('Failed to clear QR file:', error);
+  }
+}
+
 // ============ PRODUCTION-GRADE ADVANCED CACHING SYSTEM ============
 // Multi-layer LRU cache with automatic memory management
 class ProductionCache {
@@ -1669,11 +1711,14 @@ app.get("/wml/status.wml", (req, res) => {
 app.get("/wml/qr.wml", (req, res) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
+  // Load QR from file if not in memory (cluster worker support)
+  const qrCode = currentQR || loadQRFromFile();
+
   // Debug info
-  logger.info(`QR page accessed - isConnected: ${isConnected}, connectionState: ${connectionState}, currentQR: ${currentQR ? 'exists' : 'null'}, isConnecting: ${isConnecting}`);
+  logger.info(`QR page accessed - Worker #${cluster.worker?.id || 'master'}, isConnected: ${isConnected}, connectionState: ${connectionState}, currentQR: ${currentQR ? 'exists' : 'null'}, loadedFromFile: ${!currentQR && qrCode ? 'yes' : 'no'}`);
 
   // Force reconnection if stuck
-  if (!isConnected && !currentQR && connectionState === 'close' && !isConnecting) {
+  if (!isConnected && !qrCode && connectionState === 'close' && !isConnecting) {
     logger.info('QR page: forcing reconnection...');
     setTimeout(() => connectWithBetterSync(), 1000);
   }
@@ -1690,7 +1735,7 @@ app.get("/wml/qr.wml", (req, res) => {
 <p>
   <a href="/wml/home.wml">Go to Home</a>
 </p>`
-    : currentQR
+    : qrCode
     ? `<p>Scan QR Code</p>
 <p>1. Open WhatsApp</p>
 <p>2. Menu - Linked Devices</p>
@@ -1743,11 +1788,14 @@ ${body}
 app.get("/api/qr/wml-wbmp", (req, res) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
+  // Load QR from file if not in memory (cluster worker support)
+  const qrCode = currentQR || loadQRFromFile();
+
   // Debug info
-  logger.info(`QR WML page accessed - isConnected: ${isConnected}, connectionState: ${connectionState}, currentQR: ${currentQR ? 'exists' : 'null'}`);
+  logger.info(`QR WML page accessed - Worker #${cluster.worker?.id || 'master'}, isConnected: ${isConnected}, connectionState: ${connectionState}, currentQR: ${currentQR ? 'exists' : 'null'}, loadedFromFile: ${!currentQR && qrCode ? 'yes' : 'no'}`);
 
   // Force reconnection if stuck
-  if (!isConnected && !currentQR && connectionState === 'close' && !isConnecting) {
+  if (!isConnected && !qrCode && connectionState === 'close' && !isConnecting) {
     logger.info('QR WML page: forcing reconnection...');
     setTimeout(() => connectWithBetterSync(), 1000);
   }
@@ -1759,7 +1807,7 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
 <p>
   <a href="/wml/home.wml">Go to Home</a>
 </p>`;
-  } else if (!currentQR) {
+  } else if (!qrCode) {
     body = `<p>Connecting...</p>
 <p>State: ${connectionState}</p>
 <p>QR code loading</p>
@@ -7489,7 +7537,8 @@ async function connectWithBetterSync() {
 
         if (qr) {
           currentQR = qr;
-          logger.info("QR Code generated");
+          saveQRToFile(qr); // Save for cluster workers
+          logger.info("QR Code generated and saved for all workers");
           if (isDev) {
             qrcode.generate(qr, { small: true });
           }
@@ -7518,6 +7567,7 @@ async function connectWithBetterSync() {
         } else if (connection === "open") {
           logger.info("WhatsApp connected successfully!");
           currentQR = null;
+          clearQRFile(); // Clear QR file for all workers
           isFullySynced = false;
           syncAttempts = 0;
 
@@ -8423,7 +8473,10 @@ app.get("/api/qr", (req, res) => {
 app.get("/api/qr/image", async (req, res) => {
   const { format = "png" } = req.query;
 
-  if (!currentQR) {
+  // Load QR from file if not in memory (cluster worker support)
+  const qrCode = currentQR || loadQRFromFile();
+
+  if (!qrCode) {
     // Return a placeholder image instead of JSON to prevent "unknown response" errors
     const placeholderText = `No QR Code\nStatus: ${connectionState}\nPlease wait...`;
 
@@ -8460,7 +8513,7 @@ app.get("/api/qr/image", async (req, res) => {
     if (format.toLowerCase() === "wbmp") {
       // Generate QR as TRUE WBMP format (same as video frames - works perfectly!)
       try {
-        const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+        const qrPngBuffer = await QRCode.toBuffer(qrCode, {
           type: "png",
           width: 96,
           margin: 1,
@@ -8613,7 +8666,9 @@ app.get("/api/qr/image", async (req, res) => {
 
 // Convenient direct endpoints for common formats
 app.get("/api/qr.png", async (req, res) => {
-  if (!currentQR) {
+  const qrCode = currentQR || loadQRFromFile();
+
+  if (!qrCode) {
     const transparentPng = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
       "base64"
@@ -8623,7 +8678,7 @@ app.get("/api/qr.png", async (req, res) => {
   }
 
   try {
-    const qrBuffer = await QRCode.toBuffer(currentQR, {
+    const qrBuffer = await QRCode.toBuffer(qrCode, {
       type: "png",
       width: 256,
       margin: 2,
@@ -8638,12 +8693,14 @@ app.get("/api/qr.png", async (req, res) => {
 });
 
 app.get("/api/qr.jpg", async (req, res) => {
-  if (!currentQR) {
+  const qrCode = currentQR || loadQRFromFile();
+
+  if (!qrCode) {
     return res.status(404).send("QR code not available");
   }
 
   try {
-    const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+    const qrPngBuffer = await QRCode.toBuffer(qrCode, {
       type: "png",
       width: 256,
       margin: 2,
@@ -8664,13 +8721,15 @@ app.get("/api/qr.jpeg", async (req, res) => {
 });
 
 app.get("/api/qr.wbmp", async (req, res) => {
-  if (!currentQR) {
+  const qrCode = currentQR || loadQRFromFile();
+
+  if (!qrCode) {
     return res.status(404).send("QR code not available");
   }
 
   try {
     // Generate QR as PNG first
-    const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+    const qrPngBuffer = await QRCode.toBuffer(qrCode, {
       type: "png",
       width: 96,
       margin: 1,
@@ -8734,13 +8793,15 @@ app.get("/api/qr.wbmp", async (req, res) => {
 
 // Tiny QR for extremely limited WAP browsers
 app.get("/api/qr-tiny.wbmp", async (req, res) => {
-  if (!currentQR) {
+  const qrCode = currentQR || loadQRFromFile();
+
+  if (!qrCode) {
     return res.status(404).send("QR code not available");
   }
 
   try {
     // Generate tiny QR as PNG first
-    const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+    const qrPngBuffer = await QRCode.toBuffer(qrCode, {
       type: "png",
       width: 64,
       margin: 0,
@@ -8803,7 +8864,7 @@ app.get("/api/qr-tiny.wbmp", async (req, res) => {
 });
 
 app.get("/api/qr/text", (req, res) => {
-  if (!currentQR) {
+  const qrCode = currentQR || loadQRFromFile(); if (!qrCode) {
     res.set("Content-Type", "text/vnd.wap.wml");
     return res.send(`<?xml version="1.0"?>
 <!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN"
