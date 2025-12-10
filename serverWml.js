@@ -888,11 +888,12 @@ function clearQRFile() {
 
 // ============ PRODUCTION-GRADE ADVANCED CACHING SYSTEM ============
 // Multi-layer LRU cache with automatic memory management
+// TTL removed - use only size-based LRU eviction for better stability
 class ProductionCache {
-  constructor(maxSize = 999999999999, ttl = 60000) {
+  constructor(maxSize = 999999999999, ttl = null) {
     this.cache = new Map();
     this.maxSize = maxSize;
-    this.ttl = ttl;
+    this.ttl = ttl; // Kept for compatibility but not used
     this.hits = 0;
     this.misses = 0;
   }
@@ -906,13 +907,8 @@ class ProductionCache {
       return null;
     }
 
-    // Check TTL
-    if (Date.now() - item.timestamp > this.ttl) {
-      this.cache.delete(key);
-      this.misses++;
-      performanceMetrics.cache.misses++;
-      return null;
-    }
+    // TTL check removed - cache never expires by time
+    // Only evicted when maxSize reached (LRU)
 
     // LRU: Move to end (most recently used)
     this.cache.delete(key);
@@ -930,9 +926,9 @@ class ProductionCache {
       this.cache.delete(firstKey);
     }
 
+    // No timestamp needed - TTL removed for stability
     this.cache.set(key, {
-      data,
-      timestamp: Date.now()
+      data
     });
   }
 
@@ -959,10 +955,11 @@ class ProductionCache {
 }
 
 // Initialize caches optimized for 4GB Raspberry Pi 4
-const groupsCache = new ProductionCache(100, 120000); // 100 groups, 2min TTL (4GB RAM optimized)
-const contactsCache = new ProductionCache(1000, 600000); // 1000 contacts, 10min TTL (4GB RAM optimized)
-const chatsCache = new ProductionCache(200, 300000); // 200 chats, 5min TTL (4GB RAM optimized)
-const messagesCache = new ProductionCache(2000, 120000); // 2000 messages, 2min TTL (4GB RAM optimized)
+// TTL removed - using only LRU size-based eviction for stability
+const groupsCache = new ProductionCache(100); // 100 groups max, LRU eviction
+const contactsCache = new ProductionCache(1000); // 1000 contacts max, LRU eviction
+const chatsCache = new ProductionCache(200); // 200 chats max, LRU eviction
+const messagesCache = new ProductionCache(2000); // 2000 messages max, LRU eviction
 
 // ============ USER SETTINGS & FAVORITES ============
 // Load user settings with defaults
