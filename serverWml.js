@@ -1088,12 +1088,52 @@ function saveAll() {
   saveChats();
   saveMessages();
   saveMeta();
-  
+
   // Ensure new auth state keys are saved
   if (sock && sock.authState) {
     storage.queueSave("auth_state", sock.authState);
   }
 }
+
+// Ensure stores are loaded from disk if empty (auto-recovery)
+function ensureStoresLoaded() {
+  const needsLoad = contactStore.size === 0 || chatStore.size === 0;
+
+  if (needsLoad) {
+    logger.info("📂 Stores are empty - reloading from disk...");
+    const diskData = storage.loadAllData();
+
+    // Reload contacts if empty
+    if (contactStore.size === 0 && diskData.contacts.size > 0) {
+      for (const [key, value] of diskData.contacts) {
+        contactStore.set(key, value);
+      }
+      logger.info(`✓ Reloaded ${diskData.contacts.size} contacts from disk`);
+    }
+
+    // Reload chats if empty
+    if (chatStore.size === 0 && diskData.chats.size > 0) {
+      for (const [key, value] of diskData.chats) {
+        chatStore.set(key, value);
+      }
+      logger.info(`✓ Reloaded ${diskData.chats.size} chats from disk`);
+    }
+
+    // Reload messages if empty
+    if (messageStore.size === 0 && diskData.messages.size > 0) {
+      for (const [key, value] of diskData.messages) {
+        messageStore.set(key, value);
+      }
+      logger.info(`✓ Reloaded ${diskData.messages.size} messages from disk`);
+    }
+
+    logger.info("✅ Stores reloaded successfully from disk");
+    return true;
+  }
+
+  return false;
+}
+
 function wmlDoc(cards, scripts = "") {
   const head = scripts
     ? `<head><meta http-equiv="Cache-Control" content="max-age=0"/>${scripts}</head>`
@@ -2334,6 +2374,9 @@ app.get("/wml/favorites-add.wml", (req, res) => {
 // Enhanced Contacts with search and pagination
 
 app.get("/wml/contacts.wml", (req, res) => {
+  // Ensure stores are loaded from disk if empty
+  ensureStoresLoaded();
+
   const userAgent = req.headers["user-agent"] || "";
 
   // Usa req.query per GET. Se il form usa POST, i dati sarebbero in req.body.
@@ -9016,6 +9059,9 @@ app.post("/api/presence", async (req, res) => {
 
 app.get("/api/contacts/all", async (req, res) => {
   try {
+    // Ensure stores are loaded from disk if empty
+    ensureStoresLoaded();
+
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
     // Auto-sync if no contacts and not synced yet
@@ -9470,6 +9516,9 @@ app.post("/api/chats/bulk-by-numbers", async (req, res) => {
 
 app.get("/api/contacts", async (req, res) => {
   try {
+    // Ensure stores are loaded from disk if empty
+    ensureStoresLoaded();
+
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
     const contacts = Array.from(contactStore.values());
@@ -9514,6 +9563,9 @@ app.get("/api/contacts", async (req, res) => {
 
 app.get("/api/chats", async (req, res) => {
   try {
+    // Ensure stores are loaded from disk if empty
+    ensureStoresLoaded();
+
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
     const chats = Array.from(chatStore.keys()).map((chatId) => {
@@ -9553,6 +9605,9 @@ app.get("/api/chats", async (req, res) => {
 
 app.get("/api/messages/:jid", async (req, res) => {
   try {
+    // Ensure stores are loaded from disk if empty
+    ensureStoresLoaded();
+
     const { jid } = req.params;
     const { limit = 50, offset = 0 } = req.query;
 
@@ -11307,6 +11362,9 @@ app.get("/wml/sync.contacts.wml", async (req, res) => {
 
 // Enhanced Chats page with search and pagination
 app.get("/wml/chats.wml", async (req, res) => {
+  // Ensure stores are loaded from disk if empty
+  ensureStoresLoaded();
+
   const userAgent = req.headers["user-agent"] || "";
 
   // Use req.query for GET requests, like in contacts
