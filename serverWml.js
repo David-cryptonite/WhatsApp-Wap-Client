@@ -8419,42 +8419,61 @@ app.get("/api/qr/image", async (req, res) => {
 
   try {
     if (format.toLowerCase() === "wbmp") {
-      // Generate QR as WBMP format - ultra-light for old WAP browsers
+      // Generate QR as TRUE WBMP format (same as video frames - works perfectly!)
       try {
-        // Generate small PNG QR code to avoid crashes
         const qrPngBuffer = await QRCode.toBuffer(currentQR, {
-          type: "png",
-          width: 96,  // Small size for old WAP browsers
-          margin: 1,  // Minimal margin
-          color: {
-            dark: "#000000",
-            light: "#FFFFFF",
-          },
-        });
-
-        // Convert PNG to monochrome WBMP using sharp
-        const wbmpBuffer = await sharp(qrPngBuffer)
-          .resize(96, 96, { fit: 'contain' })
-          .greyscale()
-          .threshold(128) // Convert to pure black and white
-          .toFormat('png')
-          .toBuffer();
-
-        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Content-Length", wbmpBuffer.length);
-        res.send(wbmpBuffer);
-      } catch (qrError) {
-        logger.error("WBMP conversion error:", qrError);
-        // Fallback: return small PNG as WBMP content-type
-        const qrBuffer = await QRCode.toBuffer(currentQR, {
           type: "png",
           width: 96,
           margin: 1,
+          color: { dark: "#000000", light: "#FFFFFF" },
         });
+
+        // Convert to TRUE WBMP format (same as video frames)
+        const { data: pixels, info } = await sharp(qrPngBuffer)
+          .greyscale()
+          .resize(96, 96, {
+            kernel: sharp.kernel.lanczos3,
+            fit: "contain",
+            position: "center",
+            background: { r: 255, g: 255, b: 255, alpha: 1 },
+          })
+          .linear(1.3, -30)
+          .normalise({ lower: 1, upper: 99 })
+          .sharpen({ sigma: 1.5, flat: 2, jagged: 3 })
+          .threshold(128, { greyscale: true, grayscale: true })
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+
+        // Create WBMP header
+        const width = info.width;
+        const height = info.height;
+        const header = Buffer.from([0x00, 0x00, width, height]);
+
+        // Convert pixels to WBMP 1-bit format
+        const rowBytes = Math.ceil(width / 8);
+        const wbmpData = Buffer.alloc(rowBytes * height);
+
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const pixelIndex = y * width + x;
+            const pixel = pixels[pixelIndex];
+            if (pixel < 128) {
+              const byteIndex = y * rowBytes + Math.floor(x / 8);
+              const bitIndex = 7 - (x % 8);
+              wbmpData[byteIndex] |= 1 << bitIndex;
+            }
+          }
+        }
+
+        const wbmpBuffer = Buffer.concat([header, wbmpData]);
+
         res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-        res.send(qrBuffer);
+        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        res.send(wbmpBuffer);
+      } catch (qrError) {
+        logger.error("WBMP conversion error:", qrError);
+        res.status(500).json({ error: "Failed to generate WBMP QR code" });
       }
     } else if (format.toLowerCase() === "jpg" || format.toLowerCase() === "jpeg") {
       // Generate JPG QR code
@@ -8611,25 +8630,62 @@ app.get("/api/qr.wbmp", async (req, res) => {
   }
 
   try {
-    // Ultra-light QR for WAP browsers - very small size to avoid crashes
+    // Generate QR as PNG first
     const qrPngBuffer = await QRCode.toBuffer(currentQR, {
       type: "png",
-      width: 96,  // Reduced from 200 to 96 for old WAP browsers
-      margin: 1,  // Reduced from 2 to 1 to save space
+      width: 96,
+      margin: 1,
       color: { dark: "#000000", light: "#FFFFFF" },
     });
 
-    // Simple conversion to monochrome
-    const wbmpBuffer = await sharp(qrPngBuffer)
-      .resize(96, 96, { fit: 'contain' })
+    // Convert to TRUE WBMP format (same as video frames - works perfectly!)
+    const { data: pixels, info } = await sharp(qrPngBuffer)
       .greyscale()
-      .threshold(128)
-      .toFormat('png')
-      .toBuffer();
+      .resize(96, 96, {
+        kernel: sharp.kernel.lanczos3,
+        fit: "contain",
+        position: "center",
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .linear(1.3, -30)  // Contrast enhancement
+      .normalise({ lower: 1, upper: 99 })
+      .sharpen({ sigma: 1.5, flat: 2, jagged: 3 })
+      .threshold(128, { greyscale: true, grayscale: true })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    // Create WBMP header
+    const width = info.width;
+    const height = info.height;
+    const header = Buffer.from([
+      0x00, // Type 0
+      0x00, // FixHeaderField
+      width,
+      height,
+    ]);
+
+    // Convert pixels to WBMP 1-bit format
+    const rowBytes = Math.ceil(width / 8);
+    const wbmpData = Buffer.alloc(rowBytes * height);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const pixelIndex = y * width + x;
+        const pixel = pixels[pixelIndex];
+        const isBlack = pixel < 128;
+
+        if (isBlack) {
+          const byteIndex = y * rowBytes + Math.floor(x / 8);
+          const bitIndex = 7 - (x % 8);
+          wbmpData[byteIndex] |= 1 << bitIndex;
+        }
+      }
+    }
+
+    const wbmpBuffer = Buffer.concat([header, wbmpData]);
 
     res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Content-Length", wbmpBuffer.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
     res.send(wbmpBuffer);
   } catch (error) {
     logger.error("WBMP generation error:", error);
@@ -8644,24 +8700,62 @@ app.get("/api/qr-tiny.wbmp", async (req, res) => {
   }
 
   try {
-    // Extremely small QR for very old WAP browsers
+    // Generate tiny QR as PNG first
     const qrPngBuffer = await QRCode.toBuffer(currentQR, {
       type: "png",
-      width: 64,   // Ultra-small 64x64
-      margin: 0,   // No margin to maximize QR space
+      width: 64,
+      margin: 0,
       color: { dark: "#000000", light: "#FFFFFF" },
     });
 
-    const wbmpBuffer = await sharp(qrPngBuffer)
-      .resize(64, 64, { fit: 'contain' })
+    // Convert to TRUE WBMP format (same as video frames)
+    const { data: pixels, info } = await sharp(qrPngBuffer)
       .greyscale()
-      .threshold(128)
-      .toFormat('png')
-      .toBuffer();
+      .resize(64, 64, {
+        kernel: sharp.kernel.lanczos3,
+        fit: "contain",
+        position: "center",
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .linear(1.3, -30)
+      .normalise({ lower: 1, upper: 99 })
+      .sharpen({ sigma: 1.5, flat: 2, jagged: 3 })
+      .threshold(128, { greyscale: true, grayscale: true })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    // Create WBMP header
+    const width = info.width;
+    const height = info.height;
+    const header = Buffer.from([
+      0x00, // Type 0
+      0x00, // FixHeaderField
+      width,
+      height,
+    ]);
+
+    // Convert pixels to WBMP 1-bit format
+    const rowBytes = Math.ceil(width / 8);
+    const wbmpData = Buffer.alloc(rowBytes * height);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const pixelIndex = y * width + x;
+        const pixel = pixels[pixelIndex];
+        const isBlack = pixel < 128;
+
+        if (isBlack) {
+          const byteIndex = y * rowBytes + Math.floor(x / 8);
+          const bitIndex = 7 - (x % 8);
+          wbmpData[byteIndex] |= 1 << bitIndex;
+        }
+      }
+    }
+
+    const wbmpBuffer = Buffer.concat([header, wbmpData]);
 
     res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Content-Length", wbmpBuffer.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
     res.send(wbmpBuffer);
   } catch (error) {
     logger.error("Tiny WBMP generation error:", error);
