@@ -1689,9 +1689,11 @@ app.get("/wml/qr.wml", (req, res) => {
       </p>
       <p>Status: ${esc(connectionState)}</p>
       <p>
+        <a href="/api/qr-tiny.wbmp">Tiny</a> |
         <a href="/api/qr.png">PNG</a> |
         <a href="/api/qr.jpg">JPG</a>
       </p>
+      <p><small>96x96px - Use Tiny if crash</small></p>
       <p>Press OK to refresh</p>
     `
     : `
@@ -1757,9 +1759,11 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
     <p><img src="/api/qr.wbmp" alt="QR Code"/></p>
     <p>Status: ${connectionState}</p>
     <p>
+      <a href="/api/qr-tiny.wbmp">Tiny</a> |
       <a href="/api/qr.png">PNG</a> |
       <a href="/api/qr.jpg">JPG</a>
     </p>
+    <p><small>96x96px - Use Tiny if crash</small></p>
     <do type="accept" label="Refresh">
       <go href="/api/qr/wml-wbmp"/>
     </do>
@@ -8415,13 +8419,13 @@ app.get("/api/qr/image", async (req, res) => {
 
   try {
     if (format.toLowerCase() === "wbmp") {
-      // Generate QR as WBMP format - properly convert PNG to monochrome WBMP
+      // Generate QR as WBMP format - ultra-light for old WAP browsers
       try {
-        // First generate PNG QR code
+        // Generate small PNG QR code to avoid crashes
         const qrPngBuffer = await QRCode.toBuffer(currentQR, {
           type: "png",
-          width: 200,
-          margin: 2,
+          width: 96,  // Small size for old WAP browsers
+          margin: 1,  // Minimal margin
           color: {
             dark: "#000000",
             light: "#FFFFFF",
@@ -8430,23 +8434,24 @@ app.get("/api/qr/image", async (req, res) => {
 
         // Convert PNG to monochrome WBMP using sharp
         const wbmpBuffer = await sharp(qrPngBuffer)
-          .resize(200, 200, { fit: 'contain' })
+          .resize(96, 96, { fit: 'contain' })
           .greyscale()
           .threshold(128) // Convert to pure black and white
-          .toFormat('png') // Sharp doesn't support WBMP directly, so we use PNG
+          .toFormat('png')
           .toBuffer();
 
         res.setHeader("Content-Type", "image/vnd.wap.wbmp");
         res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
         res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Content-Length", wbmpBuffer.length);
         res.send(wbmpBuffer);
       } catch (qrError) {
         logger.error("WBMP conversion error:", qrError);
-        // Fallback: return PNG as WBMP content-type (some WAP browsers accept it)
+        // Fallback: return small PNG as WBMP content-type
         const qrBuffer = await QRCode.toBuffer(currentQR, {
           type: "png",
-          width: 200,
-          margin: 2,
+          width: 96,
+          margin: 1,
         });
         res.setHeader("Content-Type", "image/vnd.wap.wbmp");
         res.send(qrBuffer);
@@ -8606,23 +8611,61 @@ app.get("/api/qr.wbmp", async (req, res) => {
   }
 
   try {
+    // Ultra-light QR for WAP browsers - very small size to avoid crashes
     const qrPngBuffer = await QRCode.toBuffer(currentQR, {
       type: "png",
-      width: 200,
-      margin: 2,
+      width: 96,  // Reduced from 200 to 96 for old WAP browsers
+      margin: 1,  // Reduced from 2 to 1 to save space
       color: { dark: "#000000", light: "#FFFFFF" },
     });
+
+    // Simple conversion to monochrome
     const wbmpBuffer = await sharp(qrPngBuffer)
-      .resize(200, 200, { fit: 'contain' })
+      .resize(96, 96, { fit: 'contain' })
       .greyscale()
       .threshold(128)
       .toFormat('png')
       .toBuffer();
+
     res.setHeader("Content-Type", "image/vnd.wap.wbmp");
     res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Content-Length", wbmpBuffer.length);
     res.send(wbmpBuffer);
   } catch (error) {
+    logger.error("WBMP generation error:", error);
     res.status(500).send("Error generating WBMP");
+  }
+});
+
+// Tiny QR for extremely limited WAP browsers
+app.get("/api/qr-tiny.wbmp", async (req, res) => {
+  if (!currentQR) {
+    return res.status(404).send("QR code not available");
+  }
+
+  try {
+    // Extremely small QR for very old WAP browsers
+    const qrPngBuffer = await QRCode.toBuffer(currentQR, {
+      type: "png",
+      width: 64,   // Ultra-small 64x64
+      margin: 0,   // No margin to maximize QR space
+      color: { dark: "#000000", light: "#FFFFFF" },
+    });
+
+    const wbmpBuffer = await sharp(qrPngBuffer)
+      .resize(64, 64, { fit: 'contain' })
+      .greyscale()
+      .threshold(128)
+      .toFormat('png')
+      .toBuffer();
+
+    res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Content-Length", wbmpBuffer.length);
+    res.send(wbmpBuffer);
+  } catch (error) {
+    logger.error("Tiny WBMP generation error:", error);
+    res.status(500).send("Error");
   }
 });
 
