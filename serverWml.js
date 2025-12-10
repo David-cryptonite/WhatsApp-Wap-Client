@@ -7723,9 +7723,7 @@ const gracefulShutdown = async (signal) => {
       logger.info("No WhatsApp connection to close");
     }
 
-    contactStore.clear();
-    chatStore.clear();
-    messageStore.clear();
+    
 
     logger.info("Graceful shutdown completed");
     process.exit(0);
