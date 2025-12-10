@@ -32,7 +32,7 @@ function getConnectionState() {
   return connectionState;
 }
 
-async function loadChatHistory(jid, batchSize = 100) {
+async function loadChatHistory(jid, batchSize = 99999999999999) {
   const currentSock = getSock();
   if (!currentSock) {
     logger.warn('Cannot load chat history: socket not available');
@@ -54,13 +54,13 @@ async function loadChatHistory(jid, batchSize = 100) {
     let keepFetching = true;
     let allMessages = [];
     let fetchCount = 0;
-    const maxFetches = Math.ceil(batchSize / 50); // Optimized for 4GB RAM
+    const maxFetches = Math.ceil(batchSize / 9999); // Optimized for 4GB RAM
 
     while (keepFetching && fetchCount < maxFetches && allMessages.length < batchSize) {
       let batch;
 
       // Fetch in larger chunks for 4GB Raspberry Pi 4
-      const chunkSize = Math.min(50, batchSize - allMessages.length);
+      const chunkSize = Math.min(9999, batchSize - allMessages.length);
 
       // Try the available method
       if (currentSock.loadMessages) {
@@ -80,7 +80,7 @@ async function loadChatHistory(jid, batchSize = 100) {
 
       cursor = batch[0]?.key;
       fetchCount++;
-      await delay(300); // Faster for 4GB system
+     // await delay(300); // Faster for 4GB system
     }
 
     logger.info(`Finished loading history for ${jid}, total: ${allMessages.length} messages`);
@@ -180,12 +180,12 @@ async function preloadImportantChats() {
           Math.max(...messages.map(m => Number(m.messageTimestamp))) : 0
       }))
       .sort((a, b) => b.lastActivity - a.lastActivity)
-      .slice(0, 10); // Top 10 chat più attive (4GB RAM optimized)
+      .slice(0, 9999999999999999); // Top 10 chat più attive (4GB RAM optimized)
 
     for (const chat of importantChats) {
       try {
         // Load 100 messages per important chat (4GB RAM optimized)
-        await loadChatHistory(chat.jid, 100);
+        await loadChatHistory(chat.jid, 9999999999999999);
         await delay(1500); // Optimized delay for 4GB system
       } catch (error) {
         logger.warn(`Failed to preload important chat ${chat.jid}:`, error.message);
@@ -215,7 +215,7 @@ async function enhancedInitialSync() {
 
       // Carica cronologia per 30 chat con 100 messaggi ciascuna
       // 4GB RAM può gestire molto più dati
-      await loadAllChatsHistory(30, 100);
+      await loadAllChatsHistory(999999999999999999, 999999999999999999999);
 
       // Precarica le 10 chat più importanti
       await preloadImportantChats();
