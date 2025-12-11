@@ -36,15 +36,29 @@ class PersistentStorage {
       // Load contacts
       if (fs.existsSync(this.contactsFile)) {
         const contactsData = JSON.parse(fs.readFileSync(this.contactsFile, 'utf8'))
-        result.contacts = new Map(contactsData)
-        console.log(`📱 Loaded ${result.contacts.size} contacts from disk`)
+
+        // Separate JID and LID contacts
+        const jidContacts = contactsData.filter(([key]) => !key.startsWith('lid:'))
+        const lidContacts = contactsData.filter(([key]) => key.startsWith('lid:'))
+
+        // Load JID contacts first, then LID contacts
+        result.contacts = new Map([...jidContacts, ...lidContacts])
+
+        console.log(`📱 Loaded ${result.contacts.size} contacts from disk (${jidContacts.length} JID, ${lidContacts.length} LID)`)
       }
 
       // Load chats
       if (fs.existsSync(this.chatsFile)) {
         const chatsData = JSON.parse(fs.readFileSync(this.chatsFile, 'utf8'))
-        result.chats = new Map(chatsData.map(([key, messages]) => [key, messages]))
-        console.log(`💬 Loaded ${result.chats.size} chats from disk`)
+
+        // Separate JID and LID chats
+        const jidChats = chatsData.filter(([key]) => !key.startsWith('lid:'))
+        const lidChats = chatsData.filter(([key]) => key.startsWith('lid:'))
+
+        // Load JID chats first, then LID chats
+        result.chats = new Map([...jidChats, ...lidChats].map(([key, messages]) => [key, messages]))
+
+        console.log(`💬 Loaded ${result.chats.size} chats from disk (${jidChats.length} JID, ${lidChats.length} LID)`)
       }
 
       // Load messages

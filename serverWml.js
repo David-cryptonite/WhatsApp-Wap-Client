@@ -6,7 +6,9 @@ import { Worker } from 'worker_threads';
 import express from 'express';
 import compression from 'compression';
 import http from 'http';
-import makeWASocket, {
+import baileys from '@whiskeysockets/baileys';
+const {
+  makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -17,7 +19,7 @@ import makeWASocket, {
   jidNormalizedUser,
   areJidsSameUser,
   jidDecode,
-} from '@whiskeysockets/baileys';
+} = baileys;
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -2255,6 +2257,20 @@ app.get("/wml/contacts.wml", (req, res) => {
       return name.includes(searchLower) || number.includes(searchLower);
     });
   }
+
+  // Sort contacts by last message timestamp (most recent first)
+  contacts.sort((a, b) => {
+    const messagesA = chatStore.get(a.id) || [];
+    const messagesB = chatStore.get(b.id) || [];
+
+    const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
+    const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
+
+    const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
+    const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
+
+    return timestampB - timestampA; // Most recent first
+  });
 
   const total = contacts.length;
   const start = (page - 1) * limit;
@@ -7463,10 +7479,20 @@ async function connectWithBetterSync() {
         } else if (connection === "open") {
           logger.info("WhatsApp connected successfully!");
           currentQR = null;
-          isFullySynced = false;
+
+          // Only reset isFullySynced if we don't have data from disk
+          // This prevents "syncing..." state when reconnecting with persistent data
+          if (contactStore.size === 0 && chatStore.size === 0) {
+            isFullySynced = false;
+          } else {
+            logger.info(`Keeping data from disk: ${contactStore.size} contacts, ${chatStore.size} chats`);
+            // Mark as synced if we have data, will be updated by events
+            isFullySynced = true;
+          }
+
           syncAttempts = 0;
 
-          // Start sync process
+          // Start sync process to update with latest data
           setTimeout(enhancedInitialSync, 5000);
         }
       }
@@ -7480,13 +7506,21 @@ async function connectWithBetterSync() {
           `History batch - Chats: ${chats.length}, Contacts: ${contacts.length}, Messages: ${messages.length}`
         );
 
-        for (const chat of chats) {
+        // Separate JID and LID chats, process JID first
+        const jidChats = chats.filter(c => !c.id.startsWith('lid:'));
+        const lidChats = chats.filter(c => c.id.startsWith('lid:'));
+
+        for (const chat of [...jidChats, ...lidChats]) {
           if (!chatStore.has(chat.id)) {
             chatStore.set(chat.id, []);
           }
         }
 
-        for (const contact of contacts) {
+        // Separate JID and LID contacts, process JID first
+        const jidContacts = contacts.filter(c => !c.id.startsWith('lid:'));
+        const lidContacts = contacts.filter(c => c.id.startsWith('lid:'));
+
+        for (const contact of [...jidContacts, ...lidContacts]) {
           contactStore.set(contact.id, contact);
         }
 
@@ -7567,7 +7601,15 @@ async function connectWithBetterSync() {
 
  sock.ev.on("contacts.set", ({ contacts }) => {
   logger.info(`Contacts set: ${contacts.length}`);
-  for (const c of contacts) {
+
+  // First, process all JID contacts (non-LID)
+  const jidContacts = contacts.filter(c => !c.id.startsWith('lid:'));
+  const lidContacts = contacts.filter(c => c.id.startsWith('lid:'));
+
+  logger.info(`Processing ${jidContacts.length} JID contacts first, then ${lidContacts.length} LID contacts`);
+
+  // Process JID contacts first
+  for (const c of jidContacts) {
     // Transform to new structure if needed
     const contact = {
       id: c.id,
@@ -7577,21 +7619,49 @@ async function connectWithBetterSync() {
       phoneNumber: c.phoneNumber,
       lid: c.lid
     };
-    
+
     // Store with both original ID and formatted JID as keys
     contactStore.set(c.id, contact);
-    
+
     // Also store with formatted JID if different
     const formattedJid = formatJid(c.id);
     if (formattedJid !== c.id) {
       contactStore.set(formattedJid, contact);
     }
-    
+
     // Store with phone number if available
     if (c.phoneNumber) {
       contactStore.set(c.phoneNumber, contact);
     }
   }
+
+  // Then process LID contacts
+  for (const c of lidContacts) {
+    // Transform to new structure if needed
+    const contact = {
+      id: c.id,
+      name: c.name,
+      notify: c.notify,
+      verifiedName: c.verifiedName,
+      phoneNumber: c.phoneNumber,
+      lid: c.lid
+    };
+
+    // Store with both original ID and formatted JID as keys
+    contactStore.set(c.id, contact);
+
+    // Also store with formatted JID if different
+    const formattedJid = formatJid(c.id);
+    if (formattedJid !== c.id) {
+      contactStore.set(formattedJid, contact);
+    }
+
+    // Store with phone number if available
+    if (c.phoneNumber) {
+      contactStore.set(c.phoneNumber, contact);
+    }
+  }
+
   saveContacts();
 });
 
@@ -7628,7 +7698,22 @@ sock.ev.on('lid-mapping.update', (update) => {
 
     sock.ev.on("chats.set", ({ chats }) => {
       logger.info(`Chats set: ${chats.length}`);
-      for (const c of chats) {
+
+      // Separate JID and LID chats
+      const jidChats = chats.filter(c => !c.id.startsWith('lid:'));
+      const lidChats = chats.filter(c => c.id.startsWith('lid:'));
+
+      logger.info(`Processing ${jidChats.length} JID chats first, then ${lidChats.length} LID chats`);
+
+      // Process JID chats first
+      for (const c of jidChats) {
+        if (!chatStore.has(c.id)) {
+          chatStore.set(c.id, []);
+        }
+      }
+
+      // Then process LID chats
+      for (const c of lidChats) {
         if (!chatStore.has(c.id)) {
           chatStore.set(c.id, []);
         }
@@ -8589,7 +8674,21 @@ app.get("/api/contacts/all", async (req, res) => {
     }
 
     const { page = 1, limit = 100, enriched = false } = req.query;
-    const contacts = Array.from(contactStore.values());
+    let contacts = Array.from(contactStore.values());
+
+    // Sort contacts by last message timestamp (most recent first)
+    contacts.sort((a, b) => {
+      const messagesA = chatStore.get(a.id) || [];
+      const messagesB = chatStore.get(b.id) || [];
+
+      const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
+      const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
+
+      const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
+      const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
+
+      return timestampB - timestampA; // Most recent first
+    });
 
     // Pagination
     const startIndex = (parseInt(page) - 1) * parseInt(limit);
@@ -8699,7 +8798,21 @@ app.post("/api/contacts/search", async (req, res) => {
     }
 
     const searchQuery = query.toLowerCase();
-    const contacts = Array.from(contactStore.values());
+    let contacts = Array.from(contactStore.values());
+
+    // Sort contacts by last message timestamp (most recent first)
+    contacts.sort((a, b) => {
+      const messagesA = chatStore.get(a.id) || [];
+      const messagesB = chatStore.get(b.id) || [];
+
+      const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
+      const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
+
+      const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
+      const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
+
+      return timestampB - timestampA; // Most recent first
+    });
 
     const results = contacts
       .filter((contact) => {
@@ -9034,7 +9147,21 @@ app.get("/api/contacts", async (req, res) => {
   try {
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    const contacts = Array.from(contactStore.values());
+    let contacts = Array.from(contactStore.values());
+
+    // Sort contacts by last message timestamp (most recent first)
+    contacts.sort((a, b) => {
+      const messagesA = chatStore.get(a.id) || [];
+      const messagesB = chatStore.get(b.id) || [];
+
+      const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
+      const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
+
+      const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
+      const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
+
+      return timestampB - timestampA; // Most recent first
+    });
 
     const enrichedContacts = [];
     for (const contact of contacts.slice(0, 50)) {
