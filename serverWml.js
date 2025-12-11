@@ -1094,17 +1094,13 @@ function saveMeta() {
   storage.queueSave("meta", meta);
 }
 
-// Update saveAll function to include new auth state keys
+// Save all persistent data
 function saveAll() {
   saveContacts();
   saveChats();
   saveMessages();
   saveMeta();
-  
-  // Ensure new auth state keys are saved
-  if (sock && sock.authState) {
-    storage.queueSave("auth_state", sock.authState);
-  }
+  // Note: Auth state is automatically managed by Baileys via useMultiFileAuthState
 }
 function wmlDoc(cards, scripts = "") {
   const head = scripts
