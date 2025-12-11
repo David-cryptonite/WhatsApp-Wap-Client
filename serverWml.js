@@ -843,6 +843,58 @@ let chatStore = persistentData.chats;
 let connectionState = "disconnected";
 let currentQR ; // Store the current QR code
 let isFullySynced = persistentData.meta.isFullySynced;
+
+// ============ QR CODE PERSISTENCE ============
+const QR_FILE_PATH = path.join(__dirname, 'auth_info_baileys', 'currentQR.json');
+
+// Save QR code to file
+function saveQRToFile(qr) {
+  try {
+    const qrData = {
+      qr: qr,
+      timestamp: Date.now()
+    };
+    fs.writeFileSync(QR_FILE_PATH, JSON.stringify(qrData, null, 2));
+    logger.info('QR code saved to file');
+  } catch (error) {
+    logger.error('Failed to save QR code to file:', error);
+  }
+}
+
+// Load QR code from file
+function loadQRFromFile() {
+  try {
+    if (fs.existsSync(QR_FILE_PATH)) {
+      const data = fs.readFileSync(QR_FILE_PATH, 'utf8');
+      const qrData = JSON.parse(data);
+
+      // Check if QR is not older than 5 minutes (QR codes expire)
+      const fiveMinutes = 5 * 60 * 1000;
+      if (Date.now() - qrData.timestamp < fiveMinutes) {
+        logger.info('QR code loaded from file');
+        return qrData.qr;
+      } else {
+        logger.info('Stored QR code expired, removing file');
+        fs.unlinkSync(QR_FILE_PATH);
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to load QR code from file:', error);
+  }
+  return null;
+}
+
+// Clear QR file
+function clearQRFile() {
+  try {
+    if (fs.existsSync(QR_FILE_PATH)) {
+      fs.unlinkSync(QR_FILE_PATH);
+      logger.info('QR code file cleared');
+    }
+  } catch (error) {
+    logger.error('Failed to clear QR code file:', error);
+  }
+}
 let syncAttempts = persistentData.meta.syncAttempts;
 let isConnecting = false; // Prevent race conditions in connection logic
 
@@ -7427,6 +7479,15 @@ async function connectWithBetterSync() {
 
   isConnecting = true;
 
+  // Try to load saved QR code if available
+  if (!currentQR) {
+    const savedQR = loadQRFromFile();
+    if (savedQR) {
+      currentQR = savedQR;
+      logger.info('QR code restored from file');
+    }
+  }
+
   try {
   const { state, saveCreds } = await useMultiFileAuthState("./auth_info_baileys", {
   signalKeys: {
@@ -7477,7 +7538,8 @@ async function connectWithBetterSync() {
 
         if (qr) {
           currentQR = qr;
-          logger.info("QR Code generated");
+          saveQRToFile(qr); // Save QR to file
+          logger.info("QR Code generated and saved to file");
           if (isDev) {
             qrcode.generate(qr, { small: true });
           }
@@ -7501,10 +7563,12 @@ async function connectWithBetterSync() {
             messageStore.clear();
             isFullySynced = false;
             syncAttempts = 0;
+            clearQRFile(); // Clear QR file on logout
           }
         } else if (connection === "open") {
           logger.info("WhatsApp connected successfully!");
           currentQR = null;
+          clearQRFile(); // Clear QR file when connected
 
           // Only reset isFullySynced if we don't have data from disk
           // This prevents "syncing..." state when reconnecting with persistent data
