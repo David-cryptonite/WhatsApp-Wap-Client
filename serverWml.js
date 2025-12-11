@@ -6,7 +6,7 @@ import { Worker } from 'worker_threads';
 import express from 'express';
 import compression from 'compression';
 import http from 'http';
-import baileys from '@whiskeysockets/baileys';
+import baileys, { Browsers } from '@whiskeysockets/baileys';
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -1668,6 +1668,9 @@ app.get("/wml/status.wml", (req, res) => {
 app.get("/wml/qr.wml", (req, res) => {
   const isConnected = !!sock?.authState?.creds && connectionState === 'open';
 
+  // Debug log
+  logger.info(`QR page accessed - isConnected: ${isConnected}, hasQR: ${!!currentQR}, connectionState: ${connectionState}, QR length: ${currentQR?.length || 0}`);
+
   const body = isConnected
     ? `
       <p>WhatsApp Connected</p>
@@ -1675,30 +1678,53 @@ app.get("/wml/qr.wml", (req, res) => {
       <p>
         <a href="/wml/home.wml">Go to Home</a>
       </p>
+      <p>
+        <a href="/wml/logout.wml">Logout</a>
+      </p>
     `
     : currentQR
     ? `
-      <p>Scan QR Code</p>
-      <p>1. Open WhatsApp</p>
-      <p>2. Menu - Linked Devices</p>
-      <p>3. Link a Device</p>
-      <p>4. Scan QR:</p>
+      <p>QR Code Ready!</p>
+      <p>View QR on PC/Laptop:</p>
       <p>
-        <img src="/api/qr/image?format=wbmp"/>
+        <a href="http://localhost:${port}/api/qr/image?format=png">Open QR Image</a>
+      </p>
+      <p>Or scan with phone:</p>
+      <p>
+        <a href="/api/qr/image?format=png">View QR (may be slow)</a>
+      </p>
+      <p>
+        <a href="/wml/qr-text.wml">QR as Text</a>
       </p>
       <p>Status: ${esc(connectionState)}</p>
-      <p>Press OK to refresh</p>
+    `
+    : (connectionState === 'open' || sock?.authState?.creds)
+    ? `
+      <p>Already logged in!</p>
+      <p>No QR code needed</p>
+      <p>Status: ${esc(connectionState)}</p>
+      <p>
+        <a href="/wml/home.wml">Go to Home</a>
+      </p>
+      <p>To generate new QR:</p>
+      <p>
+        <a href="/wml/logout.wml">[Logout first]</a>
+      </p>
     `
     : `
       <p>Connecting...</p>
       <p>Status: ${esc(connectionState)}</p>
       <p>QR code loading</p>
-      <p>Please wait</p>
+      <p>Please wait...</p>
+      <p>
+        <a href="/wml/qr.wml">[Refresh]</a>
+      </p>
     `;
 
   const body_full = `
     ${body}
     <p>Port ${port}</p>
+    <p><small>Debug: QR=${currentQR ? 'YES' : 'NO'} State=${connectionState}</small></p>
     <do type="accept" label="Refresh">
       <go href="/wml/qr.wml"/>
     </do>
@@ -7421,11 +7447,11 @@ async function connectWithBetterSync() {
       getMessage: async (key) => messageStore.get(key.id) || null,
       shouldIgnoreJid: (jid) => false,
       shouldSyncHistoryMessage: (msg) => true,
-      browser: ["WhatsApp WML Gateway", "Chrome", "1.0.0"],
+      browser: Browsers.macOS("Safari"),
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 10000,
-      retryRequestDelayMs: 1000,
+      retryRequestDelayMs: 10000,
     });
 
     // Initialize loadChatUtils dependencies NOW that sock is created
@@ -8479,22 +8505,28 @@ app.get("/api/qr/image", async (req, res) => {
         )}`,
       });
     } else if (format.toLowerCase() === "png") {
-      // Generate proper PNG QR code
+      // Generate proper PNG QR code - small size for WAP devices
       try {
         const qrBuffer = await QRCode.toBuffer(currentQR, {
           type: "png",
-          width: 256,
-          margin: 2,
+          width: 128,  // Reduced from 256 to 128 for WAP compatibility
+          margin: 1,   // Reduced margin
           color: {
             dark: "#000000",
             light: "#FFFFFF",
           },
         });
 
+        // Further compress with sharp for WAP compatibility (like video frames)
+        const compressedBuffer = await sharp(qrBuffer)
+          .resize(96, 96, { fit: 'contain' })  // Even smaller for old phones
+          .png({ quality: 70, compressionLevel: 9 })
+          .toBuffer();
+
         res.setHeader("Content-Type", "image/png");
         res.setHeader("Content-Disposition", 'inline; filename="qr-code.png"');
         res.setHeader("Cache-Control", "no-cache");
-        res.send(qrBuffer);
+        res.send(compressedBuffer);
       } catch (qrError) {
         // Fallback to base64 if available
         res.setHeader("Content-Type", "image/png");
@@ -8535,6 +8567,124 @@ app.get("/api/qr/image", async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Generate QR code as true WBMP format (like video frames)
+app.get("/api/qr/wbmp", async (req, res) => {
+  if (!currentQR) {
+    // Return a 1x1 black WBMP
+    const header = Buffer.from([0x00, 0x00, 0x01, 0x01]);
+    const data = Buffer.from([0x00]);
+    return res
+      .setHeader("Content-Type", "image/vnd.wap.wbmp")
+      .setHeader("Cache-Control", "no-cache")
+      .send(Buffer.concat([header, data]));
+  }
+
+  try {
+    // Generate QR code as PNG first
+    const qrBuffer = await QRCode.toBuffer(currentQR, {
+      type: "png",
+      width: 200,
+      margin: 2,
+      color: {
+        dark: "#000000",
+        light: "#FFFFFF",
+      },
+    });
+
+    // Convert to WBMP - EXTREMELY small for very old phones (32x32 minimum)
+    const { data: pixels, info } = await sharp(qrBuffer)
+      .greyscale()
+      .resize(32, 32, {  // Tiny - 32x32 pixels (absolute minimum for old phones)
+        kernel: sharp.kernel.nearest,  // Preserves QR block patterns
+        fit: "contain",
+        position: "center",
+        background: { r: 255, g: 255, b: 255, alpha: 1 },
+      })
+      .threshold(128, { greyscale: true, grayscale: true })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    // Create WBMP header
+    const width = info.width;
+    const height = info.height;
+    const header = Buffer.from([
+      0x00, // Type 0
+      0x00, // FixHeaderField
+      width,
+      height,
+    ]);
+
+    // Convert pixels to WBMP 1-bit format
+    // WBMP spec: 0 = black, 1 = white (inverted from usual bitmap)
+    const rowBytes = Math.ceil(width / 8);
+    const wbmpData = Buffer.alloc(rowBytes * height);
+
+    // Initialize all bits to 1 (white)
+    wbmpData.fill(0xFF);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const pixelIndex = y * width + x;
+        const pixel = pixels[pixelIndex];
+        const isBlack = pixel < 128;
+
+        if (isBlack) {
+          // Set bit to 0 for black pixels
+          const byteIndex = y * rowBytes + Math.floor(x / 8);
+          const bitIndex = 7 - (x % 8);
+          wbmpData[byteIndex] &= ~(1 << bitIndex);
+        }
+      }
+    }
+
+    const wbmpBuffer = Buffer.concat([header, wbmpData]);
+
+    res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+    res.setHeader("Cache-Control", "no-cache");
+    res.send(wbmpBuffer);
+  } catch (error) {
+    console.error("QR WBMP generation error:", error);
+    // Fallback to 1x1 black WBMP
+    const header = Buffer.from([0x00, 0x00, 0x01, 0x01]);
+    const data = Buffer.from([0x00]);
+    res
+      .setHeader("Content-Type", "image/vnd.wap.wbmp")
+      .setHeader("Cache-Control", "no-cache")
+      .send(Buffer.concat([header, data]));
+  }
+});
+
+// QR as text page (WML friendly)
+app.get("/wml/qr-text.wml", (req, res) => {
+  if (!currentQR) {
+    const body = `
+      <p>QR code not available</p>
+      <p>
+        <a href="/wml/qr.wml">Back to QR page</a>
+      </p>
+    `;
+    return sendWml(res, card("qr-text", "QR Text", body));
+  }
+
+  // Split QR into chunks for better display
+  const chunkSize = 40;
+  const chunks = [];
+  for (let i = 0; i < currentQR.length; i += chunkSize) {
+    chunks.push(currentQR.substring(i, i + chunkSize));
+  }
+
+  const body = `
+    <p>QR Code as Text:</p>
+    <p><small>${chunks.map((chunk, i) => `${i + 1}. ${esc(chunk)}`).join('<br/>')}</small></p>
+    <p>Length: ${currentQR.length} chars</p>
+    <p>
+      <a href="/wml/qr.wml">Back</a>
+    </p>
+  `;
+
+  sendWml(res, card("qr-text", "QR Text", body));
 });
 
 app.get("/api/qr/text", (req, res) => {
