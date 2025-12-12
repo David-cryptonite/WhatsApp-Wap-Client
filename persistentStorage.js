@@ -86,11 +86,11 @@ class PersistentStorage {
   // Queue a save operation (debounced to avoid excessive writes)
   queueSave(type, data) {
     this.saveQueue.set(type, data)
-    
+
     // Process queue after a short delay (debounce multiple rapid saves)
     if (!this.isProcessing) {
       this.isProcessing = true
-      setTimeout(() => this.processSaveQueue(), 2000) // 2 second debounce
+      setTimeout(() => this.processSaveQueue(), 100) // 100ms debounce (ridotto da 2000ms per evitare perdita dati)
     }
   }
 
@@ -151,6 +151,14 @@ class PersistentStorage {
   // Immediate save (for critical data)
   saveImmediately(type, data) {
     return this.saveToFile(type, data)
+  }
+
+  // Force immediate save of all queued operations (for shutdown)
+  async flushQueue() {
+    if (this.saveQueue.size > 0) {
+      console.log(`🔄 Flushing ${this.saveQueue.size} queued save operations...`)
+      await this.processSaveQueue()
+    }
   }
 
   // Clean up old message data to prevent files from growing too large
