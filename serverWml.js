@@ -6,8 +6,7 @@ import { Worker } from 'worker_threads';
 import express from 'express';
 import compression from 'compression';
 import http from 'http';
-import baileys, { Browsers } from '@whiskeysockets/baileys';
-const {
+import {
   makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
@@ -19,7 +18,8 @@ const {
   jidNormalizedUser,
   areJidsSameUser,
   jidDecode,
-} = baileys;
+  Browsers
+} from '@whiskeysockets/baileys';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
