@@ -7519,9 +7519,26 @@ async function connectWithBetterSync() {
             const delay = Math.min(5000 * Math.pow(2, syncAttempts), 30000); // Exponential backoff
             setTimeout(connectWithBetterSync, delay);
           } else {
-            // Save data before clearing on logout
+            // Save data IMMEDIATELY before logout
             logger.info("Saving all data before logout...");
-            saveAll();
+            (async () => {
+              try {
+                await storage.saveImmediately("contacts", contactStore);
+                await storage.saveImmediately("chats", chatStore);
+                await storage.saveImmediately("messages", messageStore);
+                await storage.saveImmediately("meta", {
+                  isFullySynced,
+                  syncAttempts,
+                  lastSync: new Date().toISOString(),
+                  contactsCount: contactStore.size,
+                  chatsCount: chatStore.size,
+                  messagesCount: messageStore.size,
+                });
+                logger.info("✓ Data saved on logout");
+              } catch (error) {
+                logger.error("❌ Failed to save on logout:", error);
+              }
+            })();
 
             // DO NOT clear stores - keep data persistent
             // contactStore.clear();
@@ -8808,9 +8825,19 @@ app.get("/api/qr/text", (req, res) => {
 
 app.post("/api/logout", async (req, res) => {
   try {
-    // Save data before logout
+    // Save data IMMEDIATELY before logout
     logger.info("Saving all data before logout...");
-    saveAll();
+    await storage.saveImmediately("contacts", contactStore);
+    await storage.saveImmediately("chats", chatStore);
+    await storage.saveImmediately("messages", messageStore);
+    await storage.saveImmediately("meta", {
+      isFullySynced,
+      syncAttempts,
+      lastSync: new Date().toISOString(),
+      contactsCount: contactStore.size,
+      chatsCount: chatStore.size,
+      messagesCount: messageStore.size,
+    });
 
     if (sock) await sock.logout();
     if (fs.existsSync("./auth_info_baileys")) {
@@ -11114,9 +11141,19 @@ app.get("/wml/logout.wml", (req, res) => {
 // Logout execution
 app.get("/wml/logout.confirm.wml", async (req, res) => {
   try {
-    // Save data before logout
+    // Save data IMMEDIATELY before logout
     logger.info("Saving all data before logout...");
-    saveAll();
+    await storage.saveImmediately("contacts", contactStore);
+    await storage.saveImmediately("chats", chatStore);
+    await storage.saveImmediately("messages", messageStore);
+    await storage.saveImmediately("meta", {
+      isFullySynced,
+      syncAttempts,
+      lastSync: new Date().toISOString(),
+      contactsCount: contactStore.size,
+      chatsCount: chatStore.size,
+      messagesCount: messageStore.size,
+    });
 
     if (sock) {
       await sock.logout();
