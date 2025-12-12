@@ -1032,8 +1032,8 @@ function getUnreadCount() {
   return count;
 }
 
-// Get recent chats (last 5)
-function getRecentChats(limit = 5) {
+// Get recent chats (last 3)
+function getRecentChats(limit = 3) {
   const chatsWithTime = [];
   for (const [jid, messages] of chatStore.entries()) {
     if (messages.length > 0) {
@@ -1215,22 +1215,24 @@ async function getContactName(jid, sock) {
     // Try to get from WhatsApp if sock is available
     if (sock) {
       try {
-        // Check if it's a LID or PN
+        // Check if it's a LID - LIDs are NOT supported by onWhatsApp
         const isLid = jid.startsWith('lid:');
-        const queryJid = isLid ? jid : formatJid(jid);
-        
-        const [result] = await sock.onWhatsApp(queryJid);
-        if (result?.exists) {
-          const name = result.name || result.notify;
-          if (name) {
-            // Cache it with new structure
-            contactStore.set(jid, { 
-              id: queryJid,
-              name: name,
-              phoneNumber: isLid ? jidFriendly(jid) : undefined,
-              lid: isLid ? jid : undefined
-            });
-            return name;
+
+        // Skip onWhatsApp for LIDs to avoid warnings
+        if (!isLid) {
+          const queryJid = formatJid(jid);
+          const [result] = await sock.onWhatsApp(queryJid);
+          if (result?.exists) {
+            const name = result.name || result.notify;
+            if (name) {
+              // Cache it with new structure
+              contactStore.set(jid, {
+                id: queryJid,
+                name: name,
+                phoneNumber: jidFriendly(jid)
+              });
+              return name;
+            }
           }
         }
       } catch (error) {
@@ -1528,7 +1530,7 @@ app.get(["/wml", "/wml/home.wml"], (req, res) => {
 app.get('/wml/chat.wml', async (req, res) => {
   const raw = req.query.jid || ''
   const jid = formatJid(raw)
-  const limit = 5 // Messaggi per pagina
+  const limit = 3 // Messaggi per pagina
   const offset = Math.max(0, parseInt(req.query.offset || '0'))
   const search = (req.query.search || '').trim().toLowerCase()
 
@@ -2306,12 +2308,12 @@ app.get("/wml/contacts.wml", (req, res) => {
   const query = req.query;
 
   const page = Math.max(1, parseInt(query.page || "1"));
-  let limit = 5; // Fisso a 5 elementi per pagina
+  let limit = 3; // Fisso a 3 elementi per pagina
 
   // Limiti più restrittivi per dispositivi WAP 1.0
-  
-    limit = Math.min(5, limit); // Max 5 elementi per pagina
-  
+
+    limit = Math.min(3, limit); // Max 3 elementi per pagina
+
 
   const search = query.q || "";
 
@@ -2371,7 +2373,7 @@ app.get("/wml/contacts.wml", (req, res) => {
       <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}">[Dettagli]</a> 
       <a href="/wml/chat.wml?jid=${encodeURIComponent(
         jid
-      )}&amp;limit=5">[Chat]</a></p>`;
+      )}&amp;limit=3">[Chat]</a></p>`;
       })
       .join("") || "<p>Nessun contatto trovato.</p>";
 
@@ -2532,7 +2534,7 @@ app.get("/wml/contact.wml", async (req, res) => {
       <p>
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           jid
-        )}&amp;limit=5" accesskey="4">[4] Open Chat</a><br/>
+        )}&amp;limit=3" accesskey="4">[4] Open Chat</a><br/>
         <a href="/wml/send-quick.wml?to=${encodeURIComponent(
           jid
         )}" accesskey="5">[5] Send Message</a><br/>
@@ -2556,7 +2558,7 @@ app.get("/wml/contact.wml", async (req, res) => {
       ${navigationBar()}
       
       <do type="accept" label="Chat">
-        <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=5"/>
+        <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=3"/>
       </do>
       <do type="options" label="Call">
         <go href="wtai://wp/mc;${number}"/>
@@ -2586,7 +2588,7 @@ app.get('/wml/chat.wml', async (req, res) => {
   const search = (req.query.search || '').trim().toLowerCase()
   
   // Very small limits for Nokia 7210
-  const limit = 5
+  const limit = 3
   
   // Chat history is loaded from persistent storage on startup
   // No need to fetch from WhatsApp servers every time
@@ -2751,7 +2753,7 @@ app.get('/wml/chat.wml', async (req, res) => {
   const search = (req.query.search || '').trim().toLowerCase()
   
   // Very small limits for Nokia 7210
-  const limit = 5
+  const limit = 3
   
   // Chat history is loaded from persistent storage on startup
   // No need to fetch from WhatsApp servers every time
@@ -2914,8 +2916,8 @@ app.get("/wml/chat.wml", async (req, res) => {
   const offset = Math.max(0, parseInt(req.query.offset || "0"));
   const search = (req.query.search || "").trim().toLowerCase();
 
-  // Fixed limit to 5 elements per page
-  const limit = 5;
+  // Fixed limit to 3 elements per page
+  const limit = 3;
 
   // Chat history is loaded from persistent storage on startup
   // No need to fetch from WhatsApp servers every time
@@ -3489,7 +3491,7 @@ app.get("/wml/audio-transcription.wml", async (req, res) => {
         resultCard(
           "Errore",
           ["Messaggio non trovato"],
-          `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=5`
+          `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=3`
         )
       );
       return;
@@ -3502,7 +3504,7 @@ app.get("/wml/audio-transcription.wml", async (req, res) => {
         resultCard(
           "Errore",
           ["Questo messaggio non contiene un audio"],
-          `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=5`
+          `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=3`
         )
       );
       return;
@@ -3555,14 +3557,14 @@ app.get("/wml/audio-transcription.wml", async (req, res) => {
        
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           jid
-        )}&amp;limit=5" accesskey="0">[0] Torna alla Chat</a>
+        )}&amp;limit=3" accesskey="0">[0] Torna alla Chat</a>
       </p>
       
       <do type="accept" label="Ascolta">
         <go href="/wml/media/${encodeURIComponent(mid)}.wav"/>
       </do>
       <do type="options" label="Indietro">
-        <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=5"/>
+        <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=3"/>
       </do>
     `;
 
@@ -4577,7 +4579,7 @@ app.get('/wml/chat.wml', async (req, res) => {
   const search = (req.query.search || '').trim().toLowerCase()
   
   // Very small limits for Nokia 7210
-  const limit = 5
+  const limit = 3
   
   // Chat history is loaded from persistent storage on startup
   // No need to fetch from WhatsApp servers every time
@@ -4745,7 +4747,7 @@ app.get("/wml/msg.wml", (req, res) => {
       resultCard(
         "Message",
         ["Message not found"],
-        `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=5`
+        `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=3`
       )
     );
     return;
@@ -4882,7 +4884,7 @@ app.get("/wml/msg.wml", (req, res) => {
     
     <p><a href="/wml/chat.wml?jid=${encodeURIComponent(
       jid
-    )}&amp;limit=5" accesskey="0">[0] Back to Chat</a></p>
+    )}&amp;limit=3" accesskey="0">[0] Back to Chat</a></p>
     
     <do type="accept" label="Reply">
       <go href="/wml/msg.reply.wml?mid=${encodeURIComponent(
@@ -4906,7 +4908,7 @@ app.get("/wml/send-menu.wml", (req, res) => {
   const to = esc(req.query.to || "");
   const search = (req.query.search || "").toLowerCase();
   const page = parseInt(req.query.page || "1", 10);
-  const pageSize = 5;
+  const pageSize = 3;
   const contact = to
     ? contactStore.get?.(formatJid(to)) || contactStore[formatJid(to)]
     : null;
@@ -6032,7 +6034,7 @@ app.get("/wml/groups.search.wml", async (req, res) => {
 
     // Parametri di paginazione
     const page = parseInt(req.query.page) || 1;
-    const limit = 5;
+    const limit = 3;
     const offset = (page - 1) * limit;
 
     // Prendo tutti i gruppi e filtro per nome
@@ -6068,7 +6070,7 @@ app.get("/wml/groups.search.wml", async (req, res) => {
           )}...</small><br/>
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           g.id
-        )}&amp;limit=5">[Chat]</a>
+        )}&amp;limit=3">[Chat]</a>
       </p>`;
         })
         .join("") ||
@@ -6162,7 +6164,7 @@ app.get("/wml/groups.wml", async (req, res) => {
 
     // Parametri di paginazione
     const page = parseInt(req.query.page) || 1;
-    const limit = 5;
+    const limit = 3;
     const offset = (page - 1) * limit;
 
     // PRODUCTION-GRADE: Check cache first for better performance
@@ -6212,7 +6214,7 @@ app.get("/wml/groups.wml", async (req, res) => {
           )}] Open</a> |
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           g.id
-        )}&amp;limit=5">[Chat]</a>
+        )}&amp;limit=3">[Chat]</a>
       </p>`;
         })
         .join("") || "<p>No groups found.</p>";
@@ -6354,7 +6356,7 @@ app.get("/wml/group.view.wml", async (req, res) => {
 
     // Pagination for participants
     const page = parseInt(req.query.page) || 1;
-    const limit = 5; // 5 partecipanti per pagina
+    const limit = 3; // 3 partecipanti per pagina
     const offset = (page - 1) * limit;
     const totalPages = Math.ceil(participants.length / limit);
     const paginatedParticipants = participants.slice(offset, offset + limit);
@@ -6458,7 +6460,7 @@ app.post("/wml/group.create.action.wml", async (req, res) => {
 
       <p>
         <a href="/wml/group.view.wml?gid=${encodeURIComponent(group.id)}" accesskey="1">[1] View Group</a><br/>
-        <a href="/wml/chat.wml?jid=${encodeURIComponent(group.id)}&amp;limit=5" accesskey="2">[2] Open Chat</a><br/>
+        <a href="/wml/chat.wml?jid=${encodeURIComponent(group.id)}&amp;limit=3" accesskey="2">[2] Open Chat</a><br/>
         <a href="/wml/groups.wml" accesskey="0">[0] All Groups</a>
       </p>
     `;
@@ -6802,7 +6804,7 @@ app.get("/wml/search.results.wml", (req, res) => {
       ? Infinity
       : Math.max(1, Math.min(50, parseInt(limitParam)));
   const page = Math.max(1, parseInt(req.query.page || "1"));
-  const pageSize = 5;
+  const pageSize = 3;
   if (!q || q.length < 2) {
     sendWml(
       res,
@@ -7050,7 +7052,7 @@ app.get("/wml/search.results.wml", (req, res) => {
           }</small><br/>
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           r.chatId
-        )}&amp;limit=5">[Open Chat]</a> 
+        )}&amp;limit=3">[Open Chat]</a> 
         <a href="/wml/msg.wml?mid=${encodeURIComponent(
           r.messageId
         )}&amp;jid=${encodeURIComponent(r.chatId)}">[Message]</a>
@@ -7069,7 +7071,7 @@ app.get("/wml/search.results.wml", (req, res) => {
         <a href="/wml/contact.wml?jid=${encodeURIComponent(r.jid)}">[View]</a> |
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           r.jid
-        )}&amp;limit=5">[Chat]</a>
+        )}&amp;limit=3">[Chat]</a>
       </p>`;
         } else if (r.type === "chat") {
           const typeIcon = r.isGroup ? "[GROUP]" : "[CHAT]";
@@ -7080,7 +7082,7 @@ app.get("/wml/search.results.wml", (req, res) => {
           }${phoneInfo}</small><br/>
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           r.chatId
-        )}&amp;limit=5">[Open]</a> |
+        )}&amp;limit=3">[Open]</a> |
         <a href="/wml/send.text.wml?to=${encodeURIComponent(
           r.chatId
         )}">[Send]</a>
@@ -7099,7 +7101,7 @@ app.get("/wml/search.results.wml", (req, res) => {
           }${memberInfo}</small><br/>
         <a href="/wml/chat.wml?jid=${encodeURIComponent(
           r.chatId
-        )}&amp;limit=5">[Open]</a> |
+        )}&amp;limit=3">[Open]</a> |
         <a href="/wml/send.text.wml?to=${encodeURIComponent(
           r.chatId
         )}">[Send]</a>
@@ -7896,9 +7898,22 @@ process.on("beforeExit", async (code) => {
   logger.info("⚠️  Performing final emergency save...");
   try {
     await storage.flushQueue();
-    logger.info("✓ Final flush completed");
+
+    // Save everything immediately as final backup
+    await storage.saveImmediately("contacts", contactStore);
+    await storage.saveImmediately("chats", chatStore);
+    await storage.saveImmediately("messages", messageStore);
+    await storage.saveImmediately("meta", {
+      isFullySynced,
+      syncAttempts,
+      lastSync: new Date().toISOString(),
+      contactsCount: contactStore.size,
+      chatsCount: chatStore.size,
+      messagesCount: messageStore.size,
+    });
+    logger.info("✓ Final save completed");
   } catch (error) {
-    logger.error("❌ Final flush failed:", error);
+    logger.error("❌ Final save failed:", error);
   }
 });
 
@@ -8093,13 +8108,25 @@ if (cluster.isMaster || cluster.isPrimary) {
         sock.end();
       }
 
-      // Save all data
+      // Save all data IMMEDIATELY (not queued)
       logger.info("Saving all data...");
       try {
         // Flush any queued saves first
         logger.info("Flushing queued saves...");
         await storage.flushQueue();
-        saveAll();
+
+        // Use saveImmediately instead of queueSave to avoid delays
+        await storage.saveImmediately("contacts", contactStore);
+        await storage.saveImmediately("chats", chatStore);
+        await storage.saveImmediately("messages", messageStore);
+        await storage.saveImmediately("meta", {
+          isFullySynced,
+          syncAttempts,
+          lastSync: new Date().toISOString(),
+          contactsCount: contactStore.size,
+          chatsCount: chatStore.size,
+          messagesCount: messageStore.size,
+        });
         logger.info("✓ All data saved successfully");
       } catch (error) {
         logger.error("Error saving data during shutdown:", error);
@@ -8121,7 +8148,19 @@ if (cluster.isMaster || cluster.isPrimary) {
       logger.info("⚠️  Attempting emergency data save...");
       try {
         await storage.flushQueue();
-        saveAll();
+
+        // Use saveImmediately for emergency save
+        await storage.saveImmediately("contacts", contactStore);
+        await storage.saveImmediately("chats", chatStore);
+        await storage.saveImmediately("messages", messageStore);
+        await storage.saveImmediately("meta", {
+          isFullySynced,
+          syncAttempts,
+          lastSync: new Date().toISOString(),
+          contactsCount: contactStore.size,
+          chatsCount: chatStore.size,
+          messagesCount: messageStore.size,
+        });
         logger.info("✓ Emergency save completed");
       } catch (error) {
         logger.error("❌ Emergency save failed:", error);
@@ -11215,13 +11254,13 @@ app.get("/wml/chats.wml", async (req, res) => {
   const query = req.query;
 
   const page = Math.max(1, parseInt(query.page || "1"));
-  let limit = 5; // Fisso a 5 elementi per pagina
+  let limit = 3; // Fisso a 3 elementi per pagina
 
   // More restrictive limits for WAP 1.0 devices (like contacts)
   if (userAgent.includes("Nokia") || userAgent.includes("UP.Browser")) {
-    limit = Math.min(5, limit); // Max 5 items per page
+    limit = Math.min(3, limit); // Max 3 items per page
   }
-  limit = Math.min(3, limit); // Max 5 i
+  limit = Math.min(3, limit); // Max 3 items per page
   const search = query.q || "";
   const showGroups = query.groups !== "0"; // Default show groups
   const showDirect = query.direct !== "0"; // Default show direct chats
@@ -11375,7 +11414,7 @@ let chats = await Promise.all(
       <small>${escWml(timeStr)} | ${c.messageCount} msgs</small><br/>
       <a href="/wml/chat.wml?jid=${encodeURIComponent(
         c.id
-      )}&amp;limit=5">[Open Chat]</a> 
+      )}&amp;limit=3">[Open Chat]</a> 
       <a href="/wml/send.text.wml?to=${encodeURIComponent(
         c.id
       )}">[Send Message]</a>
@@ -11624,7 +11663,7 @@ app.get("/wml/chats.results.wml", async (req, res) => {
   const q = String(req.query.q || "").trim();
   const chatType = req.query.type || "all";
   const sortBy = req.query.sort || "recent";
-  const limit = 5; // Fisso a 5 elementi per pagina
+  const limit = 3; // Fisso a 3 elementi per pagina
 
   if (!q || q.length < 1) {
     sendWml(
@@ -11714,7 +11753,7 @@ app.get("/wml/chats.results.wml", async (req, res) => {
       <small>${lastActivity} | ${c.messageCount} msgs</small><br/>
       <a href="/wml/chat.wml?jid=${encodeURIComponent(
         c.id
-      )}&amp;limit=5">[Open]</a> |
+      )}&amp;limit=3">[Open]</a> |
       <a href="/wml/send.text.wml?to=${encodeURIComponent(c.id)}">[Send]</a>
     </p>`;
       })
