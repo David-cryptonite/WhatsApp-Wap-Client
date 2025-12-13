@@ -140,12 +140,33 @@ class PersistentStorage {
         return
     }
 
+    // Ensure data directory exists before saving
+    if (!fs.existsSync(this.dataDir)) {
+      fs.mkdirSync(this.dataDir, { recursive: true })
+      console.log(`📁 Created data directory: ${this.dataDir}`)
+    }
+
     // Write to temporary file first, then rename (atomic operation)
     const tempFile = `${filePath}.tmp`
-    fs.writeFileSync(tempFile, serializedData, 'utf8')
-    fs.renameSync(tempFile, filePath)
-    
-    console.log(`💾 Saved ${type} to disk`)
+    try {
+      fs.writeFileSync(tempFile, serializedData, 'utf8')
+      fs.renameSync(tempFile, filePath)
+      console.log(`💾 Saved ${type} to disk`)
+    } catch (error) {
+      // If atomic operation fails, try direct write as fallback
+      console.warn(`⚠️ Atomic save failed for ${type}, trying direct write:`, error.message)
+      fs.writeFileSync(filePath, serializedData, 'utf8')
+      console.log(`💾 Saved ${type} to disk (direct write)`)
+
+      // Clean up temp file if it exists
+      try {
+        if (fs.existsSync(tempFile)) {
+          fs.unlinkSync(tempFile)
+        }
+      } catch (cleanupError) {
+        // Ignore cleanup errors
+      }
+    }
   }
 
   // Immediate save (for critical data)

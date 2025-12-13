@@ -2317,35 +2317,36 @@ app.get("/wml/contacts.wml", (req, res) => {
 
   const search = query.q || "";
 
-  let contacts = Array.from(contactStore.values());
+  // OPTIMIZATION: Build contact list with cached timestamps
+  const contactsWithTimestamp = [];
+  for (const contact of contactStore.values()) {
+    // Pre-calculate timestamp for sorting (cache it)
+    const messages = chatStore.get(contact.id) || [];
+    const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+    const timestamp = lastMessage ? Number(lastMessage.messageTimestamp) : 0;
 
-  // Applica filtro di ricerca
-  if (search) {
-    const searchLower = search.toLowerCase();
-    contacts = contacts.filter((c) => {
-      const name = (c.name || c.notify || c.verifiedName || "").toLowerCase();
-      const number = c.id.replace("@s.whatsapp.net", "");
-      return name.includes(searchLower) || number.includes(searchLower);
+    contactsWithTimestamp.push({
+      contact,
+      timestamp,
+      searchText: `${contact.name || contact.notify || ''} ${contact.id}`.toLowerCase()
     });
   }
 
-  // Sort contacts by last message timestamp (most recent first)
-  contacts.sort((a, b) => {
-    const messagesA = chatStore.get(a.id) || [];
-    const messagesB = chatStore.get(b.id) || [];
+  // OPTIMIZATION: Filter BEFORE sorting (reduce sort workload)
+  let filteredContacts = contactsWithTimestamp;
+  if (search) {
+    const searchLower = search.toLowerCase();
+    filteredContacts = contactsWithTimestamp.filter(c =>
+      c.searchText.includes(searchLower)
+    );
+  }
 
-    const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
-    const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
+  // OPTIMIZATION: Simple numeric sort (very fast)
+  filteredContacts.sort((a, b) => b.timestamp - a.timestamp);
 
-    const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
-    const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
-
-    return timestampB - timestampA; // Most recent first
-  });
-
-  const total = contacts.length;
+  const total = filteredContacts.length;
   const start = (page - 1) * limit;
-  const items = contacts.slice(start, start + limit);
+  const items = filteredContacts.slice(start, start + limit).map(c => c.contact);
 
   // Funzione di escaping sicura per WML
   const escWml = (text) =>
@@ -2920,29 +2921,28 @@ app.get("/wml/chat.wml", async (req, res) => {
   const limit = 3;
 
   // Chat history is loaded from persistent storage on startup
-  // No need to fetch from WhatsApp servers every time
+  // Messages are already sorted when saved (most recent last)
+  const allMessages = chatStore.get(jid) || [];
 
-  let allMessages = (chatStore.get(jid) || []).slice();
-
-  // Sort by timestamp - MOST RECENT FIRST (descending order)
-  allMessages.sort((a, b) => {
-    const tsA = Number(a.messageTimestamp) || 0;
-    const tsB = Number(b.messageTimestamp) || 0;
-    return tsB - tsA; // Most recent first
-  });
-
-  // Apply search filter if present
+  // OPTIMIZATION: Filter first, then slice (avoid processing all messages)
+  let filteredMessages = allMessages;
   if (search) {
-    allMessages = allMessages.filter((m) =>
+    filteredMessages = allMessages.filter((m) =>
       (messageText(m) || "").toLowerCase().includes(search)
     );
   }
 
-  const totalMessages = allMessages.length;
-  const items = allMessages.slice(offset, offset + limit);
+  const totalMessages = filteredMessages.length;
 
-  // Use getContactName for better name resolution
-  const chatName = await getContactName(jid, sock);
+  // OPTIMIZATION: Get last N messages directly (reverse order for display)
+  // Messages are stored oldest->newest, we want to show newest->oldest
+  const startIdx = Math.max(0, totalMessages - offset - limit);
+  const endIdx = totalMessages - offset;
+  const items = filteredMessages.slice(startIdx, endIdx).reverse();
+
+  // OPTIMIZATION: Use cached contact name (no await, no API call)
+  const contact = contactStore.get(jid);
+  const chatName = contact?.name || contact?.notify || jidFriendly(jid);
   const number = jidFriendly(jid);
   const isGroup = jid.endsWith("@g.us");
 
@@ -7623,10 +7623,16 @@ async function connectWithBetterSync() {
   const MAX_MESSAGES_PER_CHAT = 1000;
 
   for (const message of messages) {
-    newMessagesCount++;
     if (message.key?.id) {
+      // OPTIMIZATION: Check if message already exists (avoid duplicates)
+      const existingMessage = messageStore.get(message.key.id);
+      if (existingMessage) {
+        continue; // Skip duplicates
+      }
+
+      newMessagesCount++;
       messageStore.set(message.key.id, message);
-      
+
       // Handle LID/PN in message keys
       const chatId = message.key.remoteJidAlt || message.key.remoteJid;
       const participant = message.key.participantAlt || message.key.participant;
@@ -7635,7 +7641,42 @@ async function connectWithBetterSync() {
         chatStore.set(chatId, []);
       }
       const chatMessages = chatStore.get(chatId);
-      chatMessages.push(message);
+
+      // OPTIMIZATION: Check if message already in chat (avoid duplicates in array)
+      const isDuplicate = chatMessages.some(m => m.key.id === message.key.id);
+      if (!isDuplicate) {
+        // OPTIMIZATION: Insert message in correct position (binary search)
+        // Messages are kept sorted oldest->newest for consistent display
+        const msgTimestamp = Number(message.messageTimestamp) || 0;
+
+        // Find insertion point (binary search for large arrays, linear for small)
+        let insertIdx = chatMessages.length;
+        if (chatMessages.length > 20) {
+          // Binary search for large arrays
+          let left = 0, right = chatMessages.length;
+          while (left < right) {
+            const mid = Math.floor((left + right) / 2);
+            const midTs = Number(chatMessages[mid].messageTimestamp) || 0;
+            if (midTs < msgTimestamp) {
+              left = mid + 1;
+            } else {
+              right = mid;
+            }
+          }
+          insertIdx = left;
+        } else {
+          // Linear search for small arrays (faster for small n)
+          for (let i = chatMessages.length - 1; i >= 0; i--) {
+            const ts = Number(chatMessages[i].messageTimestamp) || 0;
+            if (ts <= msgTimestamp) {
+              insertIdx = i + 1;
+              break;
+            }
+          }
+        }
+
+        chatMessages.splice(insertIdx, 0, message);
+      }
 
       // Prevent memory exhaustion
       if (chatMessages.length > MAX_MESSAGES_PER_CHAT) {
