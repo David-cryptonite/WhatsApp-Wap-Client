@@ -2997,15 +2997,32 @@ app.get("/wml/chat.wml", async (req, res) => {
   } else {
     messageList = items
       .map((m, idx) => {
-        const who = m.key.fromMe
-          ? "Me"
-          : isOldNokia
-          ? chatName.length > 10
+        // For group messages, show sender name and number
+        let who = "Unknown";
+        if (m.key.fromMe) {
+          who = "Me";
+        } else if (isGroup) {
+          // Get participant JID (sender in group)
+          const participantJid = m.key.participant || m.key.participantAlt;
+          if (participantJid) {
+            // Get contact name from store
+            const participantContact = contactStore.get(participantJid);
+            const senderName = participantContact?.name || m.pushName || "Unknown";
+            const senderNumber = jidFriendly(participantJid);
+
+            // Show name + number for groups
+            who = isOldNokia
+              ? `${senderName.substring(0, 10)} (${senderNumber.substring(0, 10)})`
+              : `${senderName} (${senderNumber})`;
+          } else {
+            who = m.pushName || "Unknown";
+          }
+        } else {
+          // Direct chat - use chat name
+          who = isOldNokia && chatName.length > 10
             ? chatName.substring(0, 10)
-            : chatName
-          : isGroup
-          ? m.pushName || "Unknown"
-          : chatName;
+            : chatName;
+        }
         const time = formatMessageTimestamp(m.messageTimestamp);
         const msgNumber = idx + 1; // 1 = most recent
         const mid = m.key.id;
@@ -7491,12 +7508,22 @@ async function connectWithBetterSync() {
     });
     logger.info('✓ loadChatUtils dependencies initialized with active socket');
 
+    // Check if already connected (when restarting with saved credentials)
+    if (state?.creds?.registered) {
+      connectionState = "connecting";
+      logger.info("Detected existing credentials - setting state to 'connecting'");
+    }
+
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on(
       "connection.update",
       async ({ connection, lastDisconnect, qr }) => {
-        connectionState = connection;
+        // Update connection state
+        if (connection) {
+          connectionState = connection;
+          logger.info(`Connection state updated: ${connectionState}`);
+        }
 
         if (qr) {
           currentQR = qr;
