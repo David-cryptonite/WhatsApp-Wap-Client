@@ -709,6 +709,30 @@ const performanceMetrics = {
 
 // ============ PRODUCTION-GRADE MIDDLEWARE STACK ============
 
+// 0. PERFORMANCE MONITORING - Track response times
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const originalSend = res.send;
+
+  res.send = function(data) {
+    const duration = Date.now() - startTime;
+
+    // Log slow requests (>500ms)
+    if (duration > 500) {
+      logger.warn(`⚠️  SLOW REQUEST: ${req.method} ${req.path} took ${duration}ms`);
+    } else if (duration > 100) {
+      logger.info(`⏱️  ${req.method} ${req.path} took ${duration}ms`);
+    }
+
+    // Add performance header
+    res.setHeader('X-Response-Time', `${duration}ms`);
+
+    return originalSend.call(this, data);
+  };
+
+  next();
+});
+
 // 1. COMPRESSION - Gzip/Brotli for 70-90% size reduction
 app.use(compression({
   level: 6, // Balance between speed and compression
@@ -843,6 +867,194 @@ let chatStore = persistentData.chats;
 let connectionState = "disconnected";
 let currentQR ; // Store the current QR code
 let isFullySynced = persistentData.meta.isFullySynced;
+
+// ============ ULTRA-PERFORMANCE CACHE SYSTEM ============
+// Pre-sorted indexes for instant page responses
+class PerformanceCache {
+  constructor() {
+    // Sorted contact list with timestamps (updated only when data changes)
+    this.sortedContacts = [];
+    this.sortedContactsTimestamp = 0;
+
+    // Sorted chat list with timestamps
+    this.sortedChats = [];
+    this.sortedChatsTimestamp = 0;
+
+    // Message count per chat (for quick lookups)
+    this.chatMessageCounts = new Map();
+
+    // Last message timestamp per chat (for sorting)
+    this.chatLastMessageTimestamp = new Map();
+
+    // Contact search index (lowercase names and numbers)
+    this.contactSearchIndex = new Map();
+
+    // Cached WML fragments (for pagination)
+    this.wmlFragmentCache = new Map();
+    this.wmlFragmentCacheTTL = 30000; // 30 seconds
+
+    // Dirty flags
+    this.contactsDirty = true;
+    this.chatsDirty = true;
+  }
+
+  // Mark contacts as dirty (needs re-sort)
+  invalidateContacts() {
+    this.contactsDirty = true;
+    this.sortedContactsTimestamp = Date.now();
+  }
+
+  // Mark chats as dirty
+  invalidateChats() {
+    this.chatsDirty = true;
+    this.sortedChatsTimestamp = Date.now();
+  }
+
+  // Mark specific chat messages as dirty
+  invalidateChatMessages(chatId) {
+    const cacheKey = `chat_${chatId}`;
+    this.wmlFragmentCache.delete(cacheKey);
+  }
+
+  // Clear all WML fragment cache
+  clearWMLCache() {
+    this.wmlFragmentCache.clear();
+  }
+
+  // Get sorted contacts (instant if cache valid)
+  getSortedContacts(contactStore, chatStore) {
+    if (!this.contactsDirty && this.sortedContacts.length > 0) {
+      return this.sortedContacts;
+    }
+
+    // Rebuild sorted contacts index
+    const contactsWithTimestamp = [];
+    for (const contact of contactStore.values()) {
+      const messages = chatStore.get(contact.id) || [];
+      const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+      const timestamp = lastMessage ? Number(lastMessage.messageTimestamp) : 0;
+
+      contactsWithTimestamp.push({
+        contact,
+        timestamp,
+        searchText: `${contact.name || contact.notify || ''} ${contact.id}`.toLowerCase()
+      });
+
+      // Update search index
+      this.contactSearchIndex.set(contact.id, contactsWithTimestamp[contactsWithTimestamp.length - 1].searchText);
+    }
+
+    // Sort once
+    contactsWithTimestamp.sort((a, b) => b.timestamp - a.timestamp);
+
+    this.sortedContacts = contactsWithTimestamp;
+    this.contactsDirty = false;
+
+    return this.sortedContacts;
+  }
+
+  // Get sorted chats (instant if cache valid)
+  getSortedChats(chatStore) {
+    if (!this.chatsDirty && this.sortedChats.length > 0) {
+      return this.sortedChats;
+    }
+
+    // Rebuild sorted chats index
+    const chatsWithTimestamp = [];
+    for (const [chatId, messages] of chatStore.entries()) {
+      const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+      const timestamp = lastMessage ? Number(lastMessage.messageTimestamp) : 0;
+
+      chatsWithTimestamp.push({
+        chatId,
+        messages,
+        timestamp,
+        messageCount: messages.length
+      });
+
+      // Update quick lookup maps
+      this.chatMessageCounts.set(chatId, messages.length);
+      this.chatLastMessageTimestamp.set(chatId, timestamp);
+    }
+
+    // Sort once
+    chatsWithTimestamp.sort((a, b) => b.timestamp - a.timestamp);
+
+    this.sortedChats = chatsWithTimestamp;
+    this.chatsDirty = false;
+
+    return this.sortedChats;
+  }
+
+  // Quick pagination (instant - no sorting needed)
+  paginateContacts(page, limit, searchFilter = null) {
+    const sorted = this.sortedContacts;
+
+    // Filter if needed
+    let filtered = sorted;
+    if (searchFilter) {
+      const searchLower = searchFilter.toLowerCase();
+      filtered = sorted.filter(c => c.searchText.includes(searchLower));
+    }
+
+    const total = filtered.length;
+    const start = (page - 1) * limit;
+    const items = filtered.slice(start, start + limit);
+
+    return { items, total, totalPages: Math.ceil(total / limit) };
+  }
+
+  // Quick chat pagination
+  paginateChats(page, limit, searchFilter = null) {
+    const sorted = this.sortedChats;
+
+    // Filter if needed
+    let filtered = sorted;
+    if (searchFilter) {
+      const searchLower = searchFilter.toLowerCase();
+      filtered = sorted.filter(c => c.chatId.toLowerCase().includes(searchLower));
+    }
+
+    const total = filtered.length;
+    const start = (page - 1) * limit;
+    const items = filtered.slice(start, start + limit);
+
+    return { items, total, totalPages: Math.ceil(total / limit) };
+  }
+
+  // Get cached WML fragment
+  getWMLFragment(key) {
+    const cached = this.wmlFragmentCache.get(key);
+    if (!cached) return null;
+
+    // Check TTL
+    if (Date.now() - cached.timestamp > this.wmlFragmentCacheTTL) {
+      this.wmlFragmentCache.delete(key);
+      return null;
+    }
+
+    return cached.html;
+  }
+
+  // Set cached WML fragment
+  setWMLFragment(key, html) {
+    this.wmlFragmentCache.set(key, {
+      html,
+      timestamp: Date.now()
+    });
+  }
+}
+
+const perfCache = new PerformanceCache();
+
+// Build initial cache on startup for instant first page load
+logger.info('🚀 Building performance cache on startup...');
+const cacheStart = Date.now();
+perfCache.getSortedContacts(contactStore, chatStore);
+perfCache.getSortedChats(chatStore);
+const cacheTime = Date.now() - cacheStart;
+logger.info(`✅ Performance cache built in ${cacheTime}ms - ${contactStore.size} contacts, ${chatStore.size} chats`);
+logger.info(`📊 Cache ready: ${perfCache.sortedContacts.length} contacts sorted, ${perfCache.sortedChats.length} chats sorted`);
 
 // ============ QR CODE PERSISTENCE ============
 const QR_FILE_PATH = path.join(__dirname, 'auth_info_baileys', 'currentQR.json');
@@ -1147,12 +1359,13 @@ async function getContactName(jid, sock) {
   if (!jid) return "Unknown";
 
   const isGroup = jid.endsWith("@g.us");
+  const isLid = jid.startsWith('lid:'); // Check LID early
 
   // Try to get from contactStore first (cached)
   let contact = contactStore.get(jid);
 
-  // If not found and it's not a group, try alternative lookups
-  if (!contact && !isGroup) {
+  // If not found and it's not a group and NOT a LID, try alternative lookups
+  if (!contact && !isGroup && !isLid) {
     // Try with formatted JID
     const formattedJid = formatJid(jid);
     if (formattedJid !== jid) {
@@ -1164,7 +1377,7 @@ async function getContactName(jid, sock) {
       const phoneNumber = jidFriendly(jid);
       // Look through all contacts to find a match by phone number
       for (const [key, value] of contactStore.entries()) {
-        if (value.phoneNumber === phoneNumber || 
+        if (value.phoneNumber === phoneNumber ||
             (value.id && value.id.includes(phoneNumber)) ||
             (key.includes(phoneNumber))) {
           contact = value;
@@ -1196,43 +1409,41 @@ async function getContactName(jid, sock) {
     // Fallback for groups
     const groupId = jid.replace("@g.us", "");
     return `Group ${groupId.slice(-8)}`;
-  } else {
-    // For individual contacts - handle LID vs PN
-    if (contact?.id) {
-      // If we have a contact with id field
-      if (contact.phoneNumber) {
-        return contact.phoneNumber; // Show phone number if available
-      } else if (contact.lid) {
-        return `LID:${contact.lid.substring(4)}`; // Show LID
-      }
+  } else if (isLid) {
+    // Handle LID contacts - DO NOT call onWhatsApp
+    if (contact?.phoneNumber) {
+      return contact.phoneNumber; // Show phone number if available
     }
-    
-    // Fallback to traditional fields
     if (contact?.name) return contact.name;
     if (contact?.notify) return contact.notify;
     if (contact?.verifiedName) return contact.verifiedName;
 
-    // Try to get from WhatsApp if sock is available
+    // Fallback: show truncated LID
+    return `LID:${jid.substring(4, 12)}...`;
+  } else {
+    // For individual contacts (phone number based)
+    if (contact?.phoneNumber) {
+      return contact.phoneNumber; // Show phone number if available
+    }
+    if (contact?.name) return contact.name;
+    if (contact?.notify) return contact.notify;
+    if (contact?.verifiedName) return contact.verifiedName;
+
+    // Try to get from WhatsApp ONLY for phone numbers (NOT LIDs)
     if (sock) {
       try {
-        // Check if it's a LID - LIDs are NOT supported by onWhatsApp
-        const isLid = jid.startsWith('lid:');
-
-        // Skip onWhatsApp for LIDs to avoid warnings
-        if (!isLid) {
-          const queryJid = formatJid(jid);
-          const [result] = await sock.onWhatsApp(queryJid);
-          if (result?.exists) {
-            const name = result.name || result.notify;
-            if (name) {
-              // Cache it with new structure
-              contactStore.set(jid, {
-                id: queryJid,
-                name: name,
-                phoneNumber: jidFriendly(jid)
-              });
-              return name;
-            }
+        const queryJid = formatJid(jid);
+        const [result] = await sock.onWhatsApp(queryJid);
+        if (result?.exists) {
+          const name = result.name || result.notify;
+          if (name) {
+            // Cache it with new structure
+            contactStore.set(jid, {
+              id: queryJid,
+              name: name,
+              phoneNumber: jidFriendly(jid)
+            });
+            return name;
           }
         }
       } catch (error) {
@@ -2317,36 +2528,16 @@ app.get("/wml/contacts.wml", (req, res) => {
 
   const search = query.q || "";
 
-  // OPTIMIZATION: Build contact list with cached timestamps
-  const contactsWithTimestamp = [];
-  for (const contact of contactStore.values()) {
-    // Pre-calculate timestamp for sorting (cache it)
-    const messages = chatStore.get(contact.id) || [];
-    const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
-    const timestamp = lastMessage ? Number(lastMessage.messageTimestamp) : 0;
+  // ULTRA-PERFORMANCE: Use pre-sorted cache (instant response)
+  // Build sorted index only once or when data changes
+  perfCache.getSortedContacts(contactStore, chatStore);
 
-    contactsWithTimestamp.push({
-      contact,
-      timestamp,
-      searchText: `${contact.name || contact.notify || ''} ${contact.id}`.toLowerCase()
-    });
-  }
+  // Get paginated results instantly (no sorting needed!)
+  const { items: paginatedItems, total } =
+    perfCache.paginateContacts(page, limit, search);
 
-  // OPTIMIZATION: Filter BEFORE sorting (reduce sort workload)
-  let filteredContacts = contactsWithTimestamp;
-  if (search) {
-    const searchLower = search.toLowerCase();
-    filteredContacts = contactsWithTimestamp.filter(c =>
-      c.searchText.includes(searchLower)
-    );
-  }
-
-  // OPTIMIZATION: Simple numeric sort (very fast)
-  filteredContacts.sort((a, b) => b.timestamp - a.timestamp);
-
-  const total = filteredContacts.length;
   const start = (page - 1) * limit;
-  const items = filteredContacts.slice(start, start + limit).map(c => c.contact);
+  const items = paginatedItems.map(c => c.contact);
 
   // Funzione di escaping sicura per WML
   const escWml = (text) =>
@@ -7735,6 +7926,10 @@ async function connectWithBetterSync() {
   }
 
   if (newMessagesCount > 0) {
+    // PERFORMANCE: Invalidate cache when new messages arrive
+    perfCache.invalidateChats();
+    perfCache.invalidateContacts();
+
     saveMessages();
     saveChats();
   }
@@ -7819,6 +8014,11 @@ async function connectWithBetterSync() {
       contactStore.set(c.id, updated);
     }
   }
+
+  // PERFORMANCE: Invalidate contacts cache when contacts change
+  if (contacts.length > 0) {
+    perfCache.invalidateContacts();
+  }
 });
 
 // Add LID mapping event handler
@@ -7866,6 +8066,11 @@ sock.ev.on('lid-mapping.update', (update) => {
         if (!chatStore.has(c.id)) {
           chatStore.set(c.id, []);
         }
+      }
+
+      // PERFORMANCE: Invalidate chats cache when chats change
+      if (chats.length > 0) {
+        perfCache.invalidateChats();
       }
     });
   } catch (error) {
@@ -9017,71 +9222,62 @@ app.get("/api/contacts/all", async (req, res) => {
     }
 
     const { page = 1, limit = 100, enriched = false } = req.query;
-    let contacts = Array.from(contactStore.values());
 
-    // Sort contacts by last message timestamp (most recent first)
-    contacts.sort((a, b) => {
-      const messagesA = chatStore.get(a.id) || [];
-      const messagesB = chatStore.get(b.id) || [];
+    // ULTRA-PERFORMANCE: Use pre-sorted cache (instant response)
+    perfCache.getSortedContacts(contactStore, chatStore);
 
-      const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
-      const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
-
-      const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
-      const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
-
-      return timestampB - timestampA; // Most recent first
-    });
-
-    // Pagination
+    // Get paginated contacts instantly (no sorting needed!)
     const startIndex = (parseInt(page) - 1) * parseInt(limit);
     const endIndex = startIndex + parseInt(limit);
-    const paginatedContacts = contacts.slice(startIndex, endIndex);
+    const paginatedContacts = perfCache.sortedContacts
+      .slice(startIndex, endIndex)
+      .map(c => c.contact);
+    const totalContacts = perfCache.sortedContacts.length;
 
     if (enriched === "true") {
-      const enrichedContacts = [];
+      // ULTRA-PERFORMANCE: Parallelize API calls for all contacts at once
+      // Instead of sequential (contact1 -> contact2 -> contact3)
+      // Do parallel: (contact1 + contact2 + contact3) all at once
+      const enrichedContacts = await Promise.all(
+        paginatedContacts.map(async (contact) => {
+          try {
+            // Run all 3 API calls in parallel for this contact
+            const [profilePic, status, businessProfile] = await Promise.all([
+              sock.profilePictureUrl(contact.id, "image").catch(() => null),
+              sock.fetchStatus(contact.id).catch(() => null),
+              sock.getBusinessProfile(contact.id).catch(() => null),
+            ]);
 
-      for (const contact of paginatedContacts) {
-        try {
-          const profilePic = await sock
-            .profilePictureUrl(contact.id, "image")
-            .catch(() => null);
-          const status = await sock.fetchStatus(contact.id).catch(() => null);
-          const businessProfile = await sock
-            .getBusinessProfile(contact.id)
-            .catch(() => null);
-
-          enrichedContacts.push({
-            id: contact.id,
-            name: contact.name || contact.notify || contact.verifiedName,
-            profilePicture: profilePic,
-            status: status?.status,
-            lastSeen: status?.setAt,
-            isMyContact: contact.name ? true : false,
-            isBusiness: !!businessProfile,
-            businessProfile: businessProfile,
-            notify: contact.notify,
-            verifiedName: contact.verifiedName,
-          });
-
-          await delay(150);
-        } catch (error) {
-          enrichedContacts.push({
-            id: contact.id,
-            name: contact.name || contact.notify || contact.verifiedName,
-            error: error.message,
-          });
-        }
-      }
+            return {
+              id: contact.id,
+              name: contact.name || contact.notify || contact.verifiedName,
+              profilePicture: profilePic,
+              status: status?.status,
+              lastSeen: status?.setAt,
+              isMyContact: contact.name ? true : false,
+              isBusiness: !!businessProfile,
+              businessProfile: businessProfile,
+              notify: contact.notify,
+              verifiedName: contact.verifiedName,
+            };
+          } catch (error) {
+            return {
+              id: contact.id,
+              name: contact.name || contact.notify || contact.verifiedName,
+              error: error.message,
+            };
+          }
+        })
+      );
 
       res.json({
         contacts: enrichedContacts,
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
-          total: contacts.length,
-          totalPages: Math.ceil(contacts.length / parseInt(limit)),
-          hasNext: endIndex < contacts.length,
+          total: totalContacts,
+          totalPages: Math.ceil(totalContacts / parseInt(limit)),
+          hasNext: endIndex < totalContacts,
           hasPrev: parseInt(page) > 1,
         },
         syncInfo: { isFullySynced, syncAttempts },
@@ -9100,9 +9296,9 @@ app.get("/api/contacts/all", async (req, res) => {
         pagination: {
           page: parseInt(page),
           limit: parseInt(limit),
-          total: contacts.length,
-          totalPages: Math.ceil(contacts.length / parseInt(limit)),
-          hasNext: endIndex < contacts.length,
+          total: totalContacts,
+          totalPages: Math.ceil(totalContacts / parseInt(limit)),
+          hasNext: endIndex < totalContacts,
           hasPrev: parseInt(page) > 1,
         },
         syncInfo: { isFullySynced, syncAttempts },
@@ -9141,35 +9337,16 @@ app.post("/api/contacts/search", async (req, res) => {
     }
 
     const searchQuery = query.toLowerCase();
-    let contacts = Array.from(contactStore.values());
 
-    // Sort contacts by last message timestamp (most recent first)
-    contacts.sort((a, b) => {
-      const messagesA = chatStore.get(a.id) || [];
-      const messagesB = chatStore.get(b.id) || [];
+    // ULTRA-PERFORMANCE: Use pre-sorted cache (instant response)
+    perfCache.getSortedContacts(contactStore, chatStore);
 
-      const lastMessageA = messagesA.length > 0 ? messagesA[messagesA.length - 1] : null;
-      const lastMessageB = messagesB.length > 0 ? messagesB[messagesB.length - 1] : null;
+    // Filter using pre-built search index (instant)
+    const filtered = perfCache.sortedContacts.filter((c) =>
+      c.searchText.includes(searchQuery)
+    );
 
-      const timestampA = lastMessageA ? Number(lastMessageA.messageTimestamp) : 0;
-      const timestampB = lastMessageB ? Number(lastMessageB.messageTimestamp) : 0;
-
-      return timestampB - timestampA; // Most recent first
-    });
-
-    const results = contacts
-      .filter((contact) => {
-        const name = (
-          contact.name ||
-          contact.notify ||
-          contact.verifiedName ||
-          ""
-        ).toLowerCase();
-        const number = contact.id.replace("@s.whatsapp.net", "");
-
-        return name.includes(searchQuery) || number.includes(searchQuery);
-      })
-      .slice(0, parseInt(limit));
+    const results = filtered.slice(0, parseInt(limit)).map(c => c.contact);
 
     res.json({
       query: query,
@@ -9745,18 +9922,30 @@ app.post("/api/check-numbers", async (req, res) => {
     const results = [];
     for (const number of numbers) {
       try {
-        // Clean the number - remove non-digits and plus
-        const cleanedNumber = number.replace(/\D/g, '');
-        
-        // Use cleaned number directly (no domain)
-        const exists = await sock.onWhatsApp([cleanedNumber]);
-        
-        results.push({
-          number,
-          cleanedNumber,
-          exists: exists.length > 0,
-          details: exists[0] || null,
-        });
+        // Check if it's a LID - skip onWhatsApp for LIDs
+        const isLid = number.startsWith('lid:');
+
+        if (isLid) {
+          // LIDs cannot be checked with onWhatsApp
+          results.push({
+            number,
+            exists: false,
+            error: "LID identifiers cannot be checked with onWhatsApp",
+          });
+        } else {
+          // Clean the number - remove non-digits and plus
+          const cleanedNumber = number.replace(/\D/g, '');
+
+          // Use cleaned number directly (no domain)
+          const exists = await sock.onWhatsApp([cleanedNumber]);
+
+          results.push({
+            number,
+            cleanedNumber,
+            exists: exists.length > 0,
+            details: exists[0] || null,
+          });
+        }
       } catch (error) {
         results.push({
           number,
